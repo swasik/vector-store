@@ -494,6 +494,13 @@ impl From<SocketAddr> for HttpServerConfig {
 pub struct AsyncInProgress(mpsc::Sender<()>);
 
 pub fn block_on<Output>(threads: Option<usize>, f: impl AsyncFnOnce() -> Output) -> Output {
+    if let Some(threads @ 1..) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .unwrap();
+    }
+
     let mut builder = match threads {
         Some(0) | None => Builder::new_multi_thread(),
         Some(1) => Builder::new_current_thread(),

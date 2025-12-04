@@ -57,6 +57,7 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true
 uuid.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 mockall.workspace = true

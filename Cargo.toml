@@ -66,6 +66,7 @@ vector-search-validator-tests = { path = "crates/validator-tests" }
 vector-search-validator-vector-store = { path = "crates/validator-vector-store" }
 vector-store = { path = "crates/vector-store" }
 secrecy = "0.10.3"
+rayon = "1.11.0"
 
 [patch.'https://github.com/scylladb/vector-store']
 vector-search-validator-tests = { path = "crates/validator-tests" }
