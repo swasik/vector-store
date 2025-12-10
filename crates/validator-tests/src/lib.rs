@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future;
 use std::net::Ipv4Addr;
+use std::panic;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -155,7 +157,12 @@ impl TestCase {
 
     #[framed]
     /// Run initialization, all tests, and cleanup functions in the test case.
-    async fn run(&self, actors: TestActors, test_cases: &HashSet<String>) -> Statistics {
+    async fn run(
+        &self,
+        actors: TestActors,
+        test_cases: &HashSet<String>,
+        backtrace: Backtrace,
+    ) -> Statistics {
         let total = if test_cases.is_empty() {
             // Run all tests
             self.tests.len()
@@ -167,7 +174,14 @@ impl TestCase {
 
         if let Some((timeout, init)) = &self.init {
             stats.launched += 1;
-            if !run_single(error_span!("init"), *timeout, init(actors.clone())).await {
+            if !run_single(
+                error_span!("init"),
+                *timeout,
+                init(actors.clone()),
+                backtrace.clone(),
+            )
+            .await
+            {
                 stats.failed += 1;
                 return stats;
             }
@@ -181,7 +195,10 @@ impl TestCase {
             .then(|(name, timeout, test)| {
                 let actors = actors.clone();
                 stats.launched += 1;
-                async move { run_single(error_span!("test", name), *timeout, test(actors)).await }
+                let backtrace = backtrace.clone();
+                async move {
+                    run_single(error_span!("test", name), *timeout, test(actors), backtrace).await
+                }
             })
             .for_each(|ok| {
                 if ok {
@@ -195,7 +212,14 @@ impl TestCase {
 
         if let Some((timeout, cleanup)) = &self.cleanup {
             stats.launched += 1;
-            if !run_single(error_span!("cleanup"), *timeout, cleanup(actors.clone())).await {
+            if !run_single(
+                error_span!("cleanup"),
+                *timeout,
+                cleanup(actors.clone()),
+                backtrace.clone(),
+            )
+            .await
+            {
                 stats.failed += 1;
             } else {
                 stats.ok += 1;
@@ -221,7 +245,12 @@ where
 
 #[framed]
 /// Runs a single test with a timeout, logging the result in the provided span.
-async fn run_single(span: Span, timeout: Duration, future: TestFuture) -> bool {
+async fn run_single(
+    span: Span,
+    timeout: Duration,
+    future: TestFuture,
+    backtrace: Backtrace,
+) -> bool {
     let task = tokio::spawn(frame!(
         async move {
             time::timeout(timeout, future)
@@ -231,7 +260,8 @@ async fn run_single(span: Span, timeout: Duration, future: TestFuture) -> bool {
         .instrument(span.clone())
     ));
     if let Err(err) = task.await {
-        error!(parent: &span, "test failed: {err}");
+        let backtrace = backtrace.get();
+        error!(parent: &span, "test failed: {err}\n{backtrace}");
         false
     } else {
         info!(parent: &span, "test ok");
@@ -246,6 +276,8 @@ pub async fn run(
     test_cases: Vec<(String, TestCase)>,
     filter_map: Arc<HashMap<String, HashSet<String>>>,
 ) -> bool {
+    let backtrace = setup_panic_hook();
+
     let stats = stream::iter(test_cases.into_iter())
         .filter(|(file_name, _)| {
             let process = filter_map.is_empty() || filter_map.contains_key(file_name);
@@ -255,9 +287,14 @@ pub async fn run(
             let actors = actors.clone();
             let filter = filter_map.clone();
             let file_name = name.clone();
+            let backtrace = backtrace.clone();
             async move {
                 let stats = test_case
-                    .run(actors, filter.get(&file_name).unwrap_or(&HashSet::new()))
+                    .run(
+                        actors,
+                        filter.get(&file_name).unwrap_or(&HashSet::new()),
+                        backtrace,
+                    )
                     .instrument(error_span!("test-case", name))
                     .await;
                 if stats.failed > 0 {
@@ -273,10 +310,43 @@ pub async fn run(
             acc
         })
         .await;
+
+    clear_panic_hook();
+
     if stats.failed > 0 {
         error!("test run failed: {stats:?}");
         return false;
     }
     info!("test run ok: {stats:?}");
     true
+}
+
+#[derive(Clone, Debug)]
+struct Backtrace(Arc<RwLock<String>>);
+
+impl Backtrace {
+    fn new() -> Self {
+        Self(Arc::new(RwLock::new(String::new())))
+    }
+
+    fn get(&self) -> String {
+        self.0.read().unwrap().clone()
+    }
+}
+
+fn setup_panic_hook() -> Backtrace {
+    let backtrace = Backtrace::new();
+    let old_hook = panic::take_hook();
+    panic::set_hook(Box::new({
+        let backtrace = backtrace.clone();
+        move |info| {
+            *backtrace.0.write().unwrap() = async_backtrace::taskdump_tree(true);
+            old_hook(info);
+        }
+    }));
+    backtrace
+}
+
+fn clear_panic_hook() {
+    _ = panic::take_hook();
 }
