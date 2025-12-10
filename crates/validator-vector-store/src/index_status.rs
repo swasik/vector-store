@@ -3,12 +3,14 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use tracing::info;
 use vector_search_validator_tests::common::IndexName;
 use vector_search_validator_tests::common::KeyspaceName;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
 
+#[framed]
 pub(crate) async fn new() -> TestCase {
     let timeout = DEFAULT_TEST_TIMEOUT;
     TestCase::empty()
@@ -26,6 +28,7 @@ pub(crate) async fn new() -> TestCase {
         )
 }
 
+#[framed]
 async fn status_returned_correctly(actors: TestActors) {
     info!("started");
 
@@ -70,6 +73,7 @@ async fn status_returned_correctly(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn status_returns_404_for_non_existent_index(actors: TestActors) {
     info!("started");
 

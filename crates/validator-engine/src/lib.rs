@@ -7,6 +7,8 @@ mod dns;
 mod scylla_cluster;
 mod vector_store_cluster;
 
+use async_backtrace::frame;
+use async_backtrace::framed;
 use clap::Parser;
 use clap::Subcommand;
 use std::collections::HashMap;
@@ -92,6 +94,7 @@ enum Command {
     },
 }
 
+#[framed]
 async fn file_exists(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path).await else {
         return false;
@@ -99,6 +102,7 @@ async fn file_exists(path: &Path) -> bool {
     metadata.is_file()
 }
 
+#[framed]
 async fn executable_exists(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path).await else {
         return false;
@@ -188,6 +192,7 @@ fn parse_test_filters(
     filter_map
 }
 
+#[framed]
 /// Returns a vector of all known test cases to be run. Each test case is registered with a name
 async fn register() -> Vec<(String, TestCase)> {
     vector_search_validator_vector_store::test_cases()
@@ -196,6 +201,7 @@ async fn register() -> Vec<(String, TestCase)> {
         .collect()
 }
 
+#[framed]
 pub fn run() -> Result<(), &'static str> {
     let args = Args::parse();
 
@@ -256,7 +262,7 @@ pub fn run() -> Result<(), &'static str> {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async move {
+        .block_on(frame!(async move {
             let test_cases = register().await;
             if let Command::List = &args.command {
                 test_cases
@@ -325,7 +331,7 @@ pub fn run() -> Result<(), &'static str> {
             .await
             .then_some(())
             .ok_or("Some vector-search-validator tests failed")
-        })
+        }))
 }
 
 #[cfg(test)]

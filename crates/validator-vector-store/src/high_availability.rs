@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use tracing::info;
 use vector_search_validator_tests::ScyllaNodeConfig;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
 
+#[framed]
 pub(crate) async fn new() -> TestCase {
     let timeout = DEFAULT_TEST_TIMEOUT;
     TestCase::empty().with_cleanup(timeout, cleanup).with_test(
@@ -17,6 +19,7 @@ pub(crate) async fn new() -> TestCase {
     )
 }
 
+#[framed]
 async fn test_secondary_uri_works_correctly(actors: TestActors) {
     info!("started");
 

@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use sysinfo::System;
 use tracing::info;
 use vector_search_validator_tests::common::IndexStatus;
 use vector_search_validator_tests::*;
 
+#[framed]
 pub(crate) async fn new() -> TestCase {
     let timeout = common::DEFAULT_TEST_TIMEOUT;
     TestCase::empty()
@@ -20,6 +22,7 @@ pub(crate) async fn new() -> TestCase {
         )
 }
 
+#[framed]
 /// The test case scenario:
 /// - start scylla cluster
 /// - create a keyspace and a table with 100_0000 vectors

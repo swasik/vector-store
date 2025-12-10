@@ -9,6 +9,7 @@ use crate::ScyllaNodeConfig;
 use crate::TestActors;
 use crate::VectorStoreClusterExt;
 use crate::VectorStoreNodeConfig;
+use async_backtrace::framed;
 use httpclient::HttpClient;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -39,6 +40,7 @@ pub const VS_OCTET_1: u8 = 128;
 pub const VS_OCTET_2: u8 = 129;
 pub const VS_OCTET_3: u8 = 130;
 
+#[framed]
 pub async fn get_default_vs_urls(actors: &TestActors) -> Vec<String> {
     let domain = actors.dns.domain().await;
     VS_NAMES
@@ -47,6 +49,7 @@ pub async fn get_default_vs_urls(actors: &TestActors) -> Vec<String> {
         .collect()
 }
 
+#[framed]
 pub fn get_default_vs_ips(actors: &TestActors) -> Vec<Ipv4Addr> {
     vec![
         actors.services_subnet.ip(VS_OCTET_1),
@@ -55,6 +58,7 @@ pub fn get_default_vs_ips(actors: &TestActors) -> Vec<Ipv4Addr> {
     ]
 }
 
+#[framed]
 pub fn get_default_db_ips(actors: &TestActors) -> Vec<Ipv4Addr> {
     vec![
         actors.services_subnet.ip(DB_OCTET_1),
@@ -63,6 +67,7 @@ pub fn get_default_db_ips(actors: &TestActors) -> Vec<Ipv4Addr> {
     ]
 }
 
+#[framed]
 pub async fn get_default_scylla_node_configs(actors: &TestActors) -> Vec<ScyllaNodeConfig> {
     let default_vs_urls = get_default_vs_urls(actors).await;
     get_default_db_ips(actors)
@@ -79,6 +84,7 @@ pub async fn get_default_scylla_node_configs(actors: &TestActors) -> Vec<ScyllaN
         .collect()
 }
 
+#[framed]
 pub fn get_default_vs_node_configs(actors: &TestActors) -> Vec<VectorStoreNodeConfig> {
     let db_ips = get_default_db_ips(actors);
     get_default_vs_ips(actors)
@@ -92,6 +98,7 @@ pub fn get_default_vs_node_configs(actors: &TestActors) -> Vec<VectorStoreNodeCo
         .collect()
 }
 
+#[framed]
 pub async fn init(actors: TestActors) {
     info!("started");
 
@@ -102,6 +109,7 @@ pub async fn init(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 pub async fn init_with_config(
     actors: TestActors,
     scylla_configs: Vec<ScyllaNodeConfig>,
@@ -118,6 +126,7 @@ pub async fn init_with_config(
     assert!(actors.vs.wait_for_ready().await);
 }
 
+#[framed]
 pub async fn cleanup(actors: TestActors) {
     info!("started");
     for name in VS_NAMES.iter() {
@@ -128,6 +137,7 @@ pub async fn cleanup(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 pub async fn prepare_connection_with_custom_vs_ips(
     actors: &TestActors,
     vs_ips: Vec<Ipv4Addr>,
@@ -146,10 +156,12 @@ pub async fn prepare_connection_with_custom_vs_ips(
     (session, clients)
 }
 
+#[framed]
 pub async fn prepare_connection(actors: &TestActors) -> (Arc<Session>, Vec<HttpClient>) {
     prepare_connection_with_custom_vs_ips(actors, get_default_vs_ips(actors)).await
 }
 
+#[framed]
 pub async fn wait_for<F, Fut>(mut condition: F, msg: &str, timeout: Duration)
 where
     F: FnMut() -> Fut,
@@ -164,6 +176,7 @@ where
     .unwrap_or_else(|_| panic!("Timeout on: {msg}"))
 }
 
+#[framed]
 pub async fn wait_for_value<F, Fut, T>(mut poll_fn: F, msg: &str, timeout: Duration) -> T
 where
     F: FnMut() -> Fut,
@@ -181,6 +194,7 @@ where
     .unwrap_or_else(|_| panic!("Timeout on: {msg}"))
 }
 
+#[framed]
 pub async fn wait_for_index(
     client: &HttpClient,
     index: &IndexInfo,
@@ -198,6 +212,7 @@ pub async fn wait_for_index(
     .await
 }
 
+#[framed]
 pub async fn get_query_results(query: String, session: &Session) -> QueryRowsResult {
     session
         .query_unpaged(query, ())
@@ -207,6 +222,7 @@ pub async fn get_query_results(query: String, session: &Session) -> QueryRowsRes
         .expect("failed to get rows")
 }
 
+#[framed]
 pub async fn get_opt_query_results(query: String, session: &Session) -> Option<QueryRowsResult> {
     session
         .query_unpaged(query, ())
@@ -216,6 +232,7 @@ pub async fn get_opt_query_results(query: String, session: &Session) -> Option<Q
         .ok()
 }
 
+#[framed]
 pub async fn create_keyspace(session: &Session) -> String {
     let keyspace = format!("ks_{}", Uuid::new_v4().simple());
 
@@ -234,6 +251,7 @@ pub async fn create_keyspace(session: &Session) -> String {
     keyspace
 }
 
+#[framed]
 pub async fn create_table(session: &Session, columns: &str, options: Option<&str>) -> String {
     let table = format!("tbl_{}", Uuid::new_v4().simple());
 
@@ -252,6 +270,7 @@ pub async fn create_table(session: &Session, columns: &str, options: Option<&str
     table
 }
 
+#[framed]
 pub async fn create_index(
     session: &Session,
     clients: &[HttpClient],

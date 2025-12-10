@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use std::net::Ipv4Addr;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -29,6 +30,7 @@ pub trait DnsExt {
 }
 
 impl DnsExt for mpsc::Sender<Dns> {
+    #[framed]
     async fn version(&self) -> String {
         let (tx, rx) = oneshot::channel();
         self.send(Dns::Version { tx })
@@ -38,6 +40,7 @@ impl DnsExt for mpsc::Sender<Dns> {
             .expect("DnsExt::version: internal actor should send response")
     }
 
+    #[framed]
     async fn domain(&self) -> String {
         let (tx, rx) = oneshot::channel();
         self.send(Dns::Domain { tx })
@@ -47,12 +50,14 @@ impl DnsExt for mpsc::Sender<Dns> {
             .expect("DnsExt::domain: internal actor should send response")
     }
 
+    #[framed]
     async fn remove(&self, name: String) {
         self.send(Dns::Remove { name })
             .await
             .expect("DnsExt::remove: internal actor should receive request");
     }
 
+    #[framed]
     async fn upsert(&self, name: String, ip: Ipv4Addr) {
         self.send(Dns::Upsert { name, ip })
             .await

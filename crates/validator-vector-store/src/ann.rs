@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use tracing::info;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
 
+#[framed]
 pub(crate) async fn new() -> TestCase {
     let timeout = DEFAULT_TEST_TIMEOUT;
     TestCase::empty()
@@ -42,6 +44,7 @@ pub(crate) async fn new() -> TestCase {
         )
 }
 
+#[framed]
 async fn ann_query_returns_expected_results(actors: TestActors) {
     info!("started");
 
@@ -112,6 +115,7 @@ async fn ann_query_returns_expected_results(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn ann_query_returns_expected_results_multicolumn_pk(actors: TestActors) {
     info!("started");
 
@@ -176,6 +180,7 @@ async fn ann_query_returns_expected_results_multicolumn_pk(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn ann_query_respects_limit(actors: TestActors) {
     info!("started");
 
@@ -243,6 +248,7 @@ async fn ann_query_respects_limit(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn ann_query_respects_limit_over_1000_vectors(actors: TestActors) {
     info!("started");
 
@@ -312,6 +318,7 @@ async fn ann_query_respects_limit_over_1000_vectors(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn ann_query_returns_rows_identified_by_composite_primary_key(actors: TestActors) {
     info!("started");
 

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::info;
@@ -10,6 +11,7 @@ use vector_search_validator_tests::ScyllaClusterExt;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
 
+#[framed]
 pub(crate) async fn new() -> TestCase {
     let timeout = DEFAULT_TEST_TIMEOUT;
     TestCase::empty()
@@ -37,6 +39,7 @@ pub(crate) async fn new() -> TestCase {
         )
 }
 
+#[framed]
 async fn reconnect_doesnt_break_fullscan(actors: TestActors) {
     info!("started");
 
@@ -124,6 +127,7 @@ async fn reconnect_doesnt_break_fullscan(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn restarting_one_node_doesnt_break_fullscan(actors: TestActors) {
     info!("started");
 
@@ -198,6 +202,7 @@ async fn restarting_one_node_doesnt_break_fullscan(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn restarting_all_nodes_doesnt_break_fullscan(actors: TestActors) {
     info!("started");
 
@@ -276,6 +281,7 @@ async fn restarting_all_nodes_doesnt_break_fullscan(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn test_restarting_vs_cluster_does_not_break_setup(actors: TestActors) {
     info!("started");
 

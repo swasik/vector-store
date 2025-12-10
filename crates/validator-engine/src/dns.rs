@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::frame;
+use async_backtrace::framed;
 use hickory_server::authority::Catalog;
 use hickory_server::authority::ZoneType;
 use hickory_server::proto::rr::DNSClass;
@@ -26,6 +28,7 @@ use tracing::debug;
 use tracing::debug_span;
 use vector_search_validator_tests::Dns;
 
+#[framed]
 /// Starts the DNS server on the given IP address.
 pub(crate) async fn new(ip: Ipv4Addr) -> mpsc::Sender<Dns> {
     assert!(ip.is_loopback(), "DNS server should listen on a localhost");
@@ -47,7 +50,7 @@ pub(crate) async fn new(ip: Ipv4Addr) -> mpsc::Sender<Dns> {
     server.register_socket(socket);
 
     tokio::spawn(
-        async move {
+        frame!(async move {
             debug!("starting");
 
             while let Some(msg) = rx.recv().await {
@@ -60,7 +63,7 @@ pub(crate) async fn new(ip: Ipv4Addr) -> mpsc::Sender<Dns> {
                 .expect("stop: failed to shutdown server gracefully");
 
             debug!("stopped");
-        }
+        })
         .instrument(debug_span!("dns")),
     );
 
@@ -77,6 +80,7 @@ const ZONE: &str = "validator.test.";
 const TTL: u32 = 60;
 
 impl State {
+    #[framed]
     async fn new() -> Self {
         let version = format!("hicory-server-{}", hickory_server::version());
 
@@ -109,6 +113,7 @@ impl State {
     }
 }
 
+#[framed]
 async fn process(msg: Dns, state: &mut State) {
     match msg {
         Dns::Version { tx } => {
@@ -131,6 +136,7 @@ async fn process(msg: Dns, state: &mut State) {
     }
 }
 
+#[framed]
 async fn remove(name: String, state: &mut State) {
     state.authority.records_mut().await.remove(&RrKey::new(
         LowerName::from_str(&format!("{name}.{ZONE}")).expect("remove: failed to parse name"),
@@ -138,6 +144,7 @@ async fn remove(name: String, state: &mut State) {
     ));
 }
 
+#[framed]
 async fn upsert(name: String, ip: Ipv4Addr, state: &mut State) {
     let name = Name::from_str(&format!("{name}.{ZONE}")).expect("upsert: failed to parse name");
 

@@ -8,6 +8,8 @@ mod dns;
 mod scylla_cluster;
 mod vector_store_cluster;
 
+use async_backtrace::frame;
+use async_backtrace::framed;
 pub use dns::Dns;
 pub use dns::DnsExt;
 use futures::FutureExt;
@@ -151,6 +153,7 @@ impl TestCase {
         self
     }
 
+    #[framed]
     /// Run initialization, all tests, and cleanup functions in the test case.
     async fn run(&self, actors: TestActors, test_cases: &HashSet<String>) -> Statistics {
         let total = if test_cases.is_empty() {
@@ -216,16 +219,17 @@ where
     })
 }
 
+#[framed]
 /// Runs a single test with a timeout, logging the result in the provided span.
 async fn run_single(span: Span, timeout: Duration, future: TestFuture) -> bool {
-    let task = tokio::spawn({
+    let task = tokio::spawn(frame!(
         async move {
             time::timeout(timeout, future)
                 .await
                 .expect("test timed out");
         }
         .instrument(span.clone())
-    });
+    ));
     if let Err(err) = task.await {
         error!(parent: &span, "test failed: {err}");
         false
@@ -235,6 +239,7 @@ async fn run_single(span: Span, timeout: Duration, future: TestFuture) -> bool {
     }
 }
 
+#[framed]
 /// Runs all test cases, filtering them based on the provided filter map.
 pub async fn run(
     actors: TestActors,

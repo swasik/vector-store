@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
@@ -76,6 +77,7 @@ pub trait VectorStoreClusterExt {
 }
 
 impl VectorStoreClusterExt for mpsc::Sender<VectorStoreCluster> {
+    #[framed]
     async fn version(&self) -> String {
         let (tx, rx) = oneshot::channel();
         self.send(VectorStoreCluster::Version { tx })
@@ -85,18 +87,21 @@ impl VectorStoreClusterExt for mpsc::Sender<VectorStoreCluster> {
             .expect("VectorStoreClusterExt::version: internal actor should send response")
     }
 
+    #[framed]
     async fn start(&self, node_configs: Vec<VectorStoreNodeConfig>) {
         self.send(VectorStoreCluster::Start { node_configs })
             .await
             .expect("VectorStoreClusterExt::start: internal actor should receive request");
     }
 
+    #[framed]
     async fn start_node(&self, node_config: VectorStoreNodeConfig) {
         self.send(VectorStoreCluster::StartNode { node_config })
             .await
             .expect("VectorStoreClusterExt::start_node: internal actor should receive request");
     }
 
+    #[framed]
     async fn stop(&self) {
         let (tx, rx) = oneshot::channel();
         self.send(VectorStoreCluster::Stop { tx })
@@ -106,6 +111,7 @@ impl VectorStoreClusterExt for mpsc::Sender<VectorStoreCluster> {
             .expect("VectorStoreClusterExt::stop: internal actor should send response");
     }
 
+    #[framed]
     async fn stop_node(&self, vs_ip: Ipv4Addr) {
         let (tx, rx) = oneshot::channel();
         self.send(VectorStoreCluster::StopNode { vs_ip, tx })
@@ -115,6 +121,7 @@ impl VectorStoreClusterExt for mpsc::Sender<VectorStoreCluster> {
             .expect("VectorStoreClusterExt::stop_node: internal actor should send response");
     }
 
+    #[framed]
     async fn wait_for_ready(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         self.send(VectorStoreCluster::WaitForReady { tx })
@@ -124,6 +131,7 @@ impl VectorStoreClusterExt for mpsc::Sender<VectorStoreCluster> {
             .expect("VectorStoreClusterExt::wait_for_ready: internal actor should send response")
     }
 
+    #[framed]
     async fn restart(&self, node_config: &VectorStoreNodeConfig) {
         self.stop_node(node_config.vs_ip).await;
         self.start_node(node_config.clone()).await;

@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::frame;
+use async_backtrace::framed;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,6 +25,7 @@ use vector_search_validator_tests::ScyllaNodeConfig;
 
 const DEFAULT_SCYLLA_CQL_PORT: u16 = 9042;
 
+#[framed]
 pub(crate) async fn new(
     path: PathBuf,
     default_conf: PathBuf,
@@ -43,7 +46,7 @@ pub(crate) async fn new(
     let mut state = State::new(path, default_conf, tempdir, verbose).await;
 
     tokio::spawn(
-        async move {
+        frame!(async move {
             debug!("starting");
 
             while let Some(msg) = rx.recv().await {
@@ -51,7 +54,7 @@ pub(crate) async fn new(
             }
 
             debug!("finished");
-        }
+        })
         .instrument(debug_span!("db")),
     );
 
@@ -74,6 +77,7 @@ struct State {
 }
 
 impl State {
+    #[framed]
     async fn new(path: PathBuf, default_conf: PathBuf, tempdir: PathBuf, verbose: bool) -> Self {
         let version = String::from_utf8_lossy(
             &Command::new(&path)
@@ -97,6 +101,7 @@ impl State {
     }
 }
 
+#[framed]
 async fn process(msg: ScyllaCluster, state: &mut State) {
     match msg {
         ScyllaCluster::Version { tx } => {
@@ -147,6 +152,7 @@ async fn process(msg: ScyllaCluster, state: &mut State) {
     }
 }
 
+#[framed]
 async fn run_node(
     node_config: &ScyllaNodeConfig,
     seeds: &str,
@@ -232,6 +238,7 @@ async fn run_node(
         .expect("start: failed to spawn scylladb")
 }
 
+#[framed]
 async fn start(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state: &mut State) {
     if node_configs.is_empty() {
         return;
@@ -275,6 +282,7 @@ async fn start(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state
     );
 }
 
+#[framed]
 async fn stop(state: &mut State) {
     for node in &mut state.nodes {
         if let Some(mut child) = node.child.take() {
@@ -291,6 +299,7 @@ async fn stop(state: &mut State) {
     state.nodes.clear();
 }
 
+#[framed]
 async fn down(state: &mut State) {
     for node in &mut state.nodes {
         if let Some(mut child) = node.child.take() {
@@ -305,6 +314,7 @@ async fn down(state: &mut State) {
     }
 }
 
+#[framed]
 async fn down_node(state: &mut State, db_ip: Ipv4Addr) {
     if let Some(node) = state.nodes.iter_mut().find(|n| n.db_ip == db_ip)
         && let Some(mut child) = node.child.take()
@@ -319,6 +329,7 @@ async fn down_node(state: &mut State, db_ip: Ipv4Addr) {
     }
 }
 
+#[framed]
 async fn wait_for_node(state: &State, ip: Ipv4Addr) -> bool {
     let mut cmd = Command::new(&state.path);
     cmd.arg("nodetool")
@@ -347,6 +358,7 @@ async fn wait_for_node(state: &State, ip: Ipv4Addr) -> bool {
     }
 }
 
+#[framed]
 async fn is_cql_port_ready(ip: Ipv4Addr) -> bool {
     use std::net::SocketAddr;
     use tokio::net::TcpStream;
@@ -368,6 +380,7 @@ async fn is_cql_port_ready(ip: Ipv4Addr) -> bool {
     }
 }
 
+#[framed]
 /// Waits for ScyllaDB to be ready by checking the nodetool status.
 async fn wait_for_ready(state: &State) -> bool {
     if state.nodes.is_empty() {
@@ -387,6 +400,7 @@ async fn wait_for_ready(state: &State) -> bool {
     true
 }
 
+#[framed]
 async fn up(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state: &mut State) {
     if state.nodes.is_empty() {
         return;
@@ -409,6 +423,7 @@ async fn up(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state: &
     }
 }
 
+#[framed]
 async fn up_node(node_config: ScyllaNodeConfig, conf: Option<Vec<u8>>, state: &mut State) {
     if state.nodes.is_empty() {
         return;
@@ -430,6 +445,7 @@ async fn up_node(node_config: ScyllaNodeConfig, conf: Option<Vec<u8>>, state: &m
     }
 }
 
+#[framed]
 async fn flush(state: &State) {
     for node in &state.nodes {
         info!("Flushing node {}", node.db_ip);

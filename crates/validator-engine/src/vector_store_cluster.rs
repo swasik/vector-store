@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::frame;
+use async_backtrace::framed;
 use httpclient::HttpClient;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -20,6 +22,7 @@ use vector_search_validator_tests::VectorStoreCluster;
 use vector_search_validator_tests::VectorStoreNodeConfig;
 use vector_store::httproutes::NodeStatus;
 
+#[framed]
 pub(crate) async fn new(
     path: PathBuf,
     verbose: bool,
@@ -35,7 +38,7 @@ pub(crate) async fn new(
     let mut state = State::new(path, verbose, disable_colors).await;
 
     tokio::spawn(
-        async move {
+        frame!(async move {
             debug!("starting");
 
             while let Some(msg) = rx.recv().await {
@@ -43,7 +46,7 @@ pub(crate) async fn new(
             }
 
             debug!("finished");
-        }
+        })
         .instrument(debug_span!("vs")),
     );
 
@@ -65,6 +68,7 @@ struct State {
 }
 
 impl State {
+    #[framed]
     async fn new(path: PathBuf, verbose: bool, disable_colors: bool) -> Self {
         let version = String::from_utf8_lossy(
             &Command::new(&path)
@@ -87,6 +91,7 @@ impl State {
     }
 }
 
+#[framed]
 async fn process(msg: VectorStoreCluster, state: &mut State) {
     match msg {
         VectorStoreCluster::Version { tx } => {
@@ -121,6 +126,7 @@ async fn process(msg: VectorStoreCluster, state: &mut State) {
     }
 }
 
+#[framed]
 async fn run_node(node_config: &VectorStoreNodeConfig, state: &State) -> Child {
     let mut cmd = Command::new(&state.path);
     if !state.verbose {
@@ -145,6 +151,7 @@ async fn run_node(node_config: &VectorStoreNodeConfig, state: &State) -> Child {
     cmd.spawn().expect("start: failed to spawn vector-store")
 }
 
+#[framed]
 async fn start(node_configs: Vec<VectorStoreNodeConfig>, state: &mut State) {
     if node_configs.is_empty() {
         return;
@@ -177,6 +184,7 @@ async fn start(node_configs: Vec<VectorStoreNodeConfig>, state: &mut State) {
     );
 }
 
+#[framed]
 async fn start_node(node_config: VectorStoreNodeConfig, state: &mut State) {
     if state.nodes.is_empty() {
         return;
@@ -199,6 +207,7 @@ async fn start_node(node_config: VectorStoreNodeConfig, state: &mut State) {
     }
 }
 
+#[framed]
 async fn stop(state: &mut State) {
     for node in &mut state.nodes {
         if let Some(mut child) = node.child.take() {
@@ -215,6 +224,7 @@ async fn stop(state: &mut State) {
     state.nodes.clear();
 }
 
+#[framed]
 async fn stop_node(state: &mut State, vs_ip: Ipv4Addr) {
     if let Some(node) = state.nodes.iter_mut().find(|n| n.vs_ip == vs_ip) {
         if let Some(mut child) = node.child.take() {
@@ -230,6 +240,7 @@ async fn stop_node(state: &mut State, vs_ip: Ipv4Addr) {
     }
 }
 
+#[framed]
 async fn wait_for_node(client: &HttpClient) -> bool {
     time::timeout(Duration::from_secs(30), async {
         loop {
@@ -243,6 +254,7 @@ async fn wait_for_node(client: &HttpClient) -> bool {
     .unwrap_or(false)
 }
 
+#[framed]
 /// Waits for all Vector Store nodes to be ready by checking the status of each node.
 async fn wait_for_ready(state: &State) -> bool {
     if state.nodes.is_empty() {

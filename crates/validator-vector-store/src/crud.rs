@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use std::time::Duration;
 use tracing::info;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
 
+#[framed]
 pub(crate) async fn new() -> TestCase {
     let timeout = DEFAULT_TEST_TIMEOUT;
     TestCase::empty()
@@ -30,6 +32,7 @@ pub(crate) async fn new() -> TestCase {
         )
 }
 
+#[framed]
 async fn simple_create_drop_index(actors: TestActors) {
     info!("started");
 
@@ -69,6 +72,7 @@ async fn simple_create_drop_index(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn simple_create_drop_multiple_indexes(actors: TestActors) {
     info!("started");
 
@@ -199,6 +203,7 @@ async fn simple_create_drop_multiple_indexes(actors: TestActors) {
     info!("finished");
 }
 
+#[framed]
 async fn drop_table_removes_index(actors: TestActors) {
     info!("started");
 

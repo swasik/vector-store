@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use std::time::Duration;
 use tracing::info;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
 
+#[framed]
 pub(crate) async fn new() -> TestCase {
     let timeout = DEFAULT_TEST_TIMEOUT;
     TestCase::empty()
@@ -20,6 +22,7 @@ pub(crate) async fn new() -> TestCase {
         )
 }
 
+#[framed]
 async fn full_scan_is_completed_when_responding_to_messages_concurrently(actors: TestActors) {
     info!("started");
 

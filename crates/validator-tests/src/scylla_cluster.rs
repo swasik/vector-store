@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use async_backtrace::framed;
 use std::net::Ipv4Addr;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -97,6 +98,7 @@ pub trait ScyllaClusterExt {
 }
 
 impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
+    #[framed]
     async fn version(&self) -> String {
         let (tx, rx) = oneshot::channel();
         self.send(ScyllaCluster::Version { tx })
@@ -106,12 +108,14 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
             .expect("ScyllaClusterExt::version: internal actor should send response")
     }
 
+    #[framed]
     async fn start(&self, node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>) {
         self.send(ScyllaCluster::Start { node_configs, conf })
             .await
             .expect("ScyllaClusterExt::start: internal actor should receive request");
     }
 
+    #[framed]
     async fn stop(&self) {
         let (tx, rx) = oneshot::channel();
         self.send(ScyllaCluster::Stop { tx })
@@ -121,6 +125,7 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
             .expect("ScyllaClusterExt::stop: internal actor should send response");
     }
 
+    #[framed]
     async fn wait_for_ready(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         self.send(ScyllaCluster::WaitForReady { tx })
@@ -130,18 +135,21 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
             .expect("ScyllaClusterExt::wait_for_ready: internal actor should send response")
     }
 
+    #[framed]
     async fn up(&self, node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>) {
         self.send(ScyllaCluster::Up { node_configs, conf })
             .await
             .expect("ScyllaClusterExt::up: internal actor should receive request")
     }
 
+    #[framed]
     async fn up_node(&self, node_config: ScyllaNodeConfig, conf: Option<Vec<u8>>) {
         self.send(ScyllaCluster::UpNode { node_config, conf })
             .await
             .expect("ScyllaClusterExt::up_node: internal actor should receive request")
     }
 
+    #[framed]
     async fn down(&self) {
         let (tx, rx) = oneshot::channel();
         self.send(ScyllaCluster::Down { tx })
@@ -151,6 +159,7 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
             .expect("ScyllaClusterExt::down: internal actor should send response");
     }
 
+    #[framed]
     async fn down_node(&self, db_ip: Ipv4Addr) {
         let (tx, rx) = oneshot::channel();
         self.send(ScyllaCluster::DownNode { db_ip, tx })
@@ -160,12 +169,14 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
             .expect("ScyllaClusterExt::down_node: internal actor should send response");
     }
 
+    #[framed]
     async fn restart(&self, node_config: &ScyllaNodeConfig) {
         self.down_node(node_config.db_ip).await;
         self.up_node(node_config.clone(), None).await;
         assert!(self.wait_for_ready().await);
     }
 
+    #[framed]
     async fn flush(&self) {
         let (tx, rx) = oneshot::channel();
         self.send(ScyllaCluster::Flush { tx })
