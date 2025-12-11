@@ -6,6 +6,7 @@
 mod db_basic;
 mod https;
 mod info;
+mod memory_limit;
 mod mock_opensearch;
 mod openapi;
 mod opensearch;

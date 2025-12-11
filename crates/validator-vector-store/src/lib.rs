@@ -8,7 +8,6 @@ mod crud;
 mod full_scan;
 mod high_availability;
 mod index_status;
-mod memory_limit;
 mod reconnect;
 mod serde;
 
@@ -25,7 +24,6 @@ pub async fn test_cases() -> impl Iterator<Item = (String, TestCase)> {
         ("index_status", index_status::new().await),
         ("reconnect", reconnect::new().await),
         ("serde", serde::new().await),
-        ("memory_limit", memory_limit::new().await),
     ]
     .into_iter()
     .map(|(name, test_case)| (name.to_string(), test_case))

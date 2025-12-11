@@ -10,7 +10,6 @@ license.workspace = true
 [dependencies]
 async-backtrace.workspace = true
 scylla.workspace = true
-sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 vector-search-validator-tests.workspace = true
