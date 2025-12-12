@@ -409,7 +409,7 @@ async fn http_server_is_responsive_when_index_add_hangs() {
         ..Default::default()
     };
     let (run, index, db, _node_state) = setup_store(config).await;
-    // Insert a value before starting the vector store. The mock DB does not support
+    // Insert a value before starting the vector store. The DbBasic test implementation does not support
     // adding embeddings while it's running, so it must be populated beforehand.
     db.insert_values(
         &index.keyspace_name,

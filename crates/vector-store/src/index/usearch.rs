@@ -31,7 +31,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Notify;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -47,7 +47,8 @@ use usearch::MetricKind;
 use usearch::ScalarKind;
 
 pub struct UsearchIndexFactory {
-    semaphore: Arc<Semaphore>,
+    tokio_semaphore: Arc<Semaphore>,
+    rayon_semaphore: Arc<Semaphore>,
     mode: Mode,
 }
 
@@ -69,12 +70,13 @@ impl IndexFactory for UsearchIndexFactory {
                     ..Default::default()
                 };
 
-                let idx = Arc::new(RwLock::new(usearch::Index::new(&options)?));
+                let idx = Arc::new(usearch::Index::new(&options)?);
                 new(
                     idx,
                     index.id,
                     index.dimensions,
-                    Arc::clone(&self.semaphore),
+                    Arc::clone(&self.tokio_semaphore),
+                    Arc::clone(&self.rayon_semaphore),
                     memory,
                 )
             }
@@ -84,7 +86,8 @@ impl IndexFactory for UsearchIndexFactory {
                     sim,
                     index.id,
                     index.dimensions,
-                    Arc::clone(&self.semaphore),
+                    Arc::clone(&self.tokio_semaphore),
+                    Arc::clone(&self.rayon_semaphore),
                     memory,
                 )
             }
@@ -100,12 +103,14 @@ impl IndexFactory for UsearchIndexFactory {
 }
 
 pub fn new_usearch(
-    semaphore: Arc<Semaphore>,
+    tokio_semaphore: Arc<Semaphore>,
+    rayon_semaphore: Arc<Semaphore>,
     mut config_rx: watch::Receiver<Arc<Config>>,
 ) -> anyhow::Result<UsearchIndexFactory> {
     let config = config_rx.borrow_and_update().clone();
     Ok(UsearchIndexFactory {
-        semaphore,
+        tokio_semaphore,
+        rayon_semaphore,
         mode: if config.usearch_simulator.is_none() {
             Mode::Usearch
         } else {
@@ -137,25 +142,25 @@ trait UsearchIndex {
     fn stop(&self);
 }
 
-impl UsearchIndex for RwLock<usearch::Index> {
+impl UsearchIndex for usearch::Index {
     fn reserve(&self, size: usize) -> anyhow::Result<()> {
-        Ok(self.write().unwrap().reserve(size)?)
+        Ok(self.reserve(size)?)
     }
 
     fn capacity(&self) -> usize {
-        self.read().unwrap().capacity()
+        self.capacity()
     }
 
     fn size(&self) -> usize {
-        self.read().unwrap().size()
+        self.size()
     }
 
     fn add(&self, key: Key, vector: &Vector) -> anyhow::Result<()> {
-        Ok(self.read().unwrap().add(key.0, &vector.0)?)
+        Ok(self.add(key.0, &vector.0)?)
     }
 
     fn remove(&self, key: Key) -> anyhow::Result<()> {
-        Ok(self.read().unwrap().remove(key.0).map(|_| ())?)
+        Ok(self.remove(key.0).map(|_| ())?)
     }
 
     fn search(
@@ -163,7 +168,7 @@ impl UsearchIndex for RwLock<usearch::Index> {
         vector: &Vector,
         limit: Limit,
     ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>> {
-        let matches = self.read().unwrap().search(&vector.0, limit.0.get())?;
+        let matches = self.search(&vector.0, limit.0.get())?;
         Ok(matches
             .keys
             .into_iter()
@@ -377,11 +382,34 @@ impl From<SpaceType> for MetricKind {
     }
 }
 
-fn new(
-    idx: Arc<impl UsearchIndex + Send + Sync + 'static>,
+struct IndexState<I: UsearchIndex + Send + Sync + 'static> {
+    idx: Arc<I>,
+    keys: RwLock<BiMap<PrimaryKey, Key>>,
+    dimensions: Dimensions,
+    usearch_key: AtomicU64,
+}
+
+impl<I: UsearchIndex + Send + Sync + 'static> IndexState<I> {
+    fn new(idx: Arc<I>, dimensions: Dimensions) -> Self {
+        Self {
+            idx,
+            keys: RwLock::new(BiMap::new()),
+            dimensions,
+            usearch_key: AtomicU64::new(0),
+        }
+    }
+
+    fn stop(&self) {
+        self.idx.stop();
+    }
+}
+
+fn new<I: UsearchIndex + Send + Sync + 'static>(
+    idx: Arc<I>,
     id: IndexId,
     dimensions: Dimensions,
-    semaphore: Arc<Semaphore>,
+    tokio_semaphore: Arc<Semaphore>,
+    rayon_semaphore: Arc<Semaphore>,
     memory: mpsc::Sender<Memory>,
 ) -> anyhow::Result<mpsc::Sender<Index>> {
     idx.reserve(RESERVE_INCREMENT)?;
@@ -396,41 +424,22 @@ fn new(
             async move {
                 debug!("starting");
 
-                // bimap between PrimaryKey and Key for an usearch index
-                let keys = Arc::new(RwLock::new(BiMap::new()));
-
-                // Incremental key for a usearch index
-                let usearch_key = Arc::new(AtomicU64::new(0));
+                let idx = Arc::new(TokioRwLock::new(IndexState::new(
+                    Arc::clone(&idx),
+                    dimensions,
+                )));
 
                 let mut allocate_prev = Allocate::Can;
 
                 while let Some(msg) = rx.recv().await {
-                    let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
-                    if matches!(msg, Index::AddOrReplace { .. }) {
-                        let allocate = memory.can_allocate().await;
-                        if allocate == Allocate::Cannot {
-                            if allocate_prev == Allocate::Can {
-                                error!(
-                                    "Unable to add vector for index {id}: not enough memory to reserve more space"
-                                );
-                            }
-                            allocate_prev = allocate;
-                            continue;
-                        }
-                        allocate_prev = allocate;
+                    if !check_memory_allocation(&msg, &memory, &mut allocate_prev, &id).await {
+                        continue;
                     }
-                    tokio::spawn({
-                        let idx = Arc::clone(&idx);
-                        let keys = Arc::clone(&keys);
-                        let usearch_key = Arc::clone(&usearch_key);
-                        async move {
-                            crate::move_to_the_end_of_async_runtime_queue().await;
-                            process(msg, dimensions, idx, keys, usearch_key, permit);
-                        }
-                    });
+
+                    dispatch_task(msg, Arc::clone(&idx), &tokio_semaphore, &rayon_semaphore).await;
                 }
 
-                idx.stop();
+                idx.write().await.stop();
 
                 debug!("finished");
             }
@@ -441,55 +450,132 @@ fn new(
     Ok(tx)
 }
 
-fn process(
+async fn dispatch_task(
     msg: Index,
-    dimensions: Dimensions,
-    idx: Arc<impl UsearchIndex + Send + Sync + 'static>,
-    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
-    usearch_key: Arc<AtomicU64>,
-    permit: OwnedSemaphorePermit,
+    idx: Arc<TokioRwLock<IndexState<impl UsearchIndex + Send + Sync + 'static>>>,
+    tokio_semaphore: &Arc<Semaphore>,
+    rayon_semaphore: &Arc<Semaphore>,
 ) {
+    if let Index::AddOrReplace { .. } = &msg
+        && let Err(err) = reserve(Arc::clone(rayon_semaphore), Arc::clone(&idx)).await
+    {
+        error!("unable to reserve space for index: {err}");
+        return;
+    }
+    let lock = idx.read_owned().await;
+    if should_run_on_tokio(&msg) {
+        let permit = Arc::clone(tokio_semaphore).acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            crate::move_to_the_end_of_async_runtime_queue().await;
+            process(msg, &lock);
+            drop(permit);
+            drop(lock);
+        });
+    } else {
+        let permit = Arc::clone(rayon_semaphore).acquire_owned().await.unwrap();
+        rayon::spawn(move || {
+            process(msg, &lock);
+            drop(permit);
+            drop(lock);
+        });
+    }
+}
+
+fn should_run_on_tokio(msg: &Index) -> bool {
+    matches!(msg, Index::Ann { .. } | Index::Count { .. })
+}
+
+fn process<I: UsearchIndex + Send + Sync + 'static>(msg: Index, index: &IndexState<I>) {
     match msg {
         Index::AddOrReplace {
             primary_key,
             embedding,
-            in_progress,
+            in_progress: _in_progress,
         } => {
-            rayon::spawn(move || {
-                add_or_replace(idx, keys, usearch_key, primary_key, embedding);
-                drop(in_progress);
-                drop(permit);
-            });
+            add_or_replace(
+                Arc::clone(&index.idx),
+                &index.keys,
+                &index.usearch_key,
+                primary_key,
+                embedding,
+            );
         }
-
         Index::Remove {
             primary_key,
             in_progress: _in_progress,
         } => {
-            rayon::spawn(move || {
-                remove(idx, keys, primary_key);
-                drop(permit);
-            });
+            remove(Arc::clone(&index.idx), &index.keys, primary_key);
         }
-
         Index::Ann {
             embedding,
             limit,
             tx,
         } => {
-            ann(idx, tx, keys, embedding, dimensions, limit);
+            ann(
+                Arc::clone(&index.idx),
+                tx,
+                &index.keys,
+                embedding,
+                index.dimensions,
+                limit,
+            );
         }
-
         Index::Count { tx } => {
-            count(idx, tx);
+            count(Arc::clone(&index.idx), tx);
         }
+    }
+}
+
+async fn reserve(
+    rayon_semaphore: Arc<Semaphore>,
+    idx: Arc<TokioRwLock<IndexState<impl UsearchIndex + Send + Sync + 'static>>>,
+) -> anyhow::Result<()> {
+    // Check for capacity needs with a read lock first to avoid taking a write lock unnecessarily.
+    let needed_capacity = {
+        let lock = idx.read().await;
+        needs_more_capacity(&lock.idx)
+    };
+
+    if needed_capacity.is_some() {
+        let lock = idx.write_owned().await;
+        // Re-check capacity after acquiring the write lock to avoid a race condition
+        // where another thread might have already performed the reservation.
+        if let Some(new_capacity) = needs_more_capacity(&lock.idx) {
+            let permit = rayon_semaphore.acquire_owned().await.unwrap();
+            let (tx, rx) = oneshot::channel::<anyhow::Result<()>>();
+            rayon::spawn(move || {
+                let result = lock.idx.reserve(new_capacity);
+                if let Err(err) = &result {
+                    error!("unable to reserve index capacity for {new_capacity} in usearch: {err}");
+                } else {
+                    debug!("reserve: reserved index capacity for {new_capacity}");
+                }
+                drop(permit);
+                let _ = tx.send(result);
+            });
+            return rx
+                .await
+                .expect("reserve: unable to receive result from reserve task");
+        }
+    }
+    Ok(())
+}
+
+fn needs_more_capacity(idx: &Arc<impl UsearchIndex>) -> Option<usize> {
+    let capacity = idx.capacity();
+    let free_space = capacity - idx.size();
+
+    if free_space < RESERVE_THRESHOLD {
+        Some(capacity + RESERVE_INCREMENT)
+    } else {
+        None
     }
 }
 
 fn add_or_replace(
     idx: Arc<impl UsearchIndex>,
-    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
-    usearch_key: Arc<AtomicU64>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
+    usearch_key: &AtomicU64,
     primary_key: PrimaryKey,
     embedding: Vector,
 ) {
@@ -514,19 +600,6 @@ fn add_or_replace(
         keys.write().unwrap().remove_by_right(key);
     };
 
-    let capacity = idx.capacity();
-    let free_space = capacity - idx.size();
-    if free_space < RESERVE_THRESHOLD {
-        // free space below threshold, reserve more space
-        let capacity = capacity + RESERVE_INCREMENT;
-        if let Err(err) = idx.reserve(capacity) {
-            error!("unable to reserve index capacity for {capacity} in usearch: {err}");
-            remove_key_from_bimap(&key);
-            return;
-        }
-        debug!("add_or_replace: reserved index capacity for {capacity}");
-    }
-
     if remove && let Err(err) = idx.remove(key) {
         debug!("add_or_replace: unable to remove embedding for key {key}: {err}");
         return;
@@ -539,7 +612,7 @@ fn add_or_replace(
 
 fn remove(
     idx: Arc<impl UsearchIndex>,
-    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
     primary_key: PrimaryKey,
 ) {
     let Some((_, key)) = keys.write().unwrap().remove_by_left(&primary_key) else {
@@ -554,7 +627,7 @@ fn remove(
 fn ann(
     idx: Arc<impl UsearchIndex>,
     tx_ann: oneshot::Sender<AnnR>,
-    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
     embedding: Vector,
     dimensions: Dimensions,
     limit: Limit,
@@ -591,6 +664,28 @@ fn count(idx: Arc<impl UsearchIndex>, tx: oneshot::Sender<CountR>) {
         .unwrap_or_else(|_| trace!("count: unable to send response"));
 }
 
+async fn check_memory_allocation(
+    msg: &Index,
+    memory: &mpsc::Sender<Memory>,
+    allocate_prev: &mut Allocate,
+    id: &IndexId,
+) -> bool {
+    if !matches!(msg, Index::AddOrReplace { .. }) {
+        return true;
+    }
+
+    let allocate = memory.can_allocate().await;
+    if allocate == Allocate::Cannot {
+        if *allocate_prev == Allocate::Can {
+            error!("Unable to add vector for index {id}: not enough memory to reserve more space");
+        }
+        *allocate_prev = allocate;
+        return false;
+    }
+    *allocate_prev = allocate;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,7 +708,8 @@ mod tests {
         let (_, config_rx) = watch::channel(Arc::new(Config::default()));
 
         let factory = UsearchIndexFactory {
-            semaphore: Arc::new(Semaphore::new(4)),
+            tokio_semaphore: Arc::new(Semaphore::new(4)),
+            rayon_semaphore: Arc::new(Semaphore::new(4)),
             mode: Mode::Usearch,
         };
         let actor = factory
@@ -736,7 +832,8 @@ mod tests {
         let (memory_tx, mut memory_rx) = mpsc::channel(1);
 
         let factory = UsearchIndexFactory {
-            semaphore: Arc::new(Semaphore::new(4)),
+            tokio_semaphore: Arc::new(Semaphore::new(4)),
+            rayon_semaphore: Arc::new(Semaphore::new(4)),
             mode: Mode::Usearch,
         };
         let actor = factory
