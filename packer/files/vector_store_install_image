@@ -14,7 +14,7 @@ USER='ubuntu'
 COPY_OR_MOVE='mv'
 
 def run(template_cmd, shell=False):
-    cmd = template_cmd.format(_HOME=HOME_DIR, _USER=USER, _COPY_OR_MOVE=COPY_OR_MOVE)
+    cmd = template_cmd.format(_HOME=HOME_DIR, _USER=USER)
     if dry_run:
         print(cmd)
         return
