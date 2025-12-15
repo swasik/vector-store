@@ -6,7 +6,6 @@
 use async_backtrace::framed;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::time::Duration;
 use tracing::info;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
@@ -154,7 +153,7 @@ async fn ann_query_returns_expected_results_multicolumn_pk(actors: TestActors) {
             result.filter(|r| r.rows_num() == 2)
         },
         "Waiting for ANN query to return 2 rows",
-        Duration::from_secs(5),
+        DEFAULT_OPERATION_TIMEOUT,
     )
     .await;
     let rows: HashSet<String> = result
@@ -357,7 +356,7 @@ async fn ann_query_returns_rows_identified_by_composite_primary_key(actors: Test
             result.filter(|r| r.rows_num() == 2)
         },
         "Waiting for ANN query to return 2 rows",
-        Duration::from_secs(5),
+        DEFAULT_OPERATION_TIMEOUT,
     )
     .await;
     let rows: HashSet<(String, String)> = result

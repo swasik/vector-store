@@ -4,7 +4,6 @@
  */
 
 use async_backtrace::framed;
-use std::time::Duration;
 use tracing::info;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
@@ -59,7 +58,7 @@ async fn simple_create_drop_index(actors: TestActors) {
         wait_for(
             || async { client.indexes().await.is_empty() },
             "Waiting for index deletion",
-            Duration::from_secs(20),
+            DEFAULT_OPERATION_TIMEOUT,
         )
         .await;
     }
@@ -101,7 +100,7 @@ async fn simple_create_drop_multiple_indexes(actors: TestActors) {
                 .is_ok()
         },
         "Waiting for full scan to complete. ANN query should succeed",
-        Duration::from_secs(5),
+        DEFAULT_OPERATION_TIMEOUT,
     )
     .await;
 
@@ -138,7 +137,7 @@ async fn simple_create_drop_multiple_indexes(actors: TestActors) {
                 .is_ok()
         },
         "Waiting for full scan to complete. ANN query should succeed",
-        Duration::from_secs(5),
+        DEFAULT_OPERATION_TIMEOUT,
     )
     .await;
 
@@ -155,7 +154,7 @@ async fn simple_create_drop_multiple_indexes(actors: TestActors) {
         wait_for(
             || async { client.indexes().await.len() == 1 },
             "Waiting for the first index to be dropped",
-            Duration::from_secs(5),
+            DEFAULT_OPERATION_TIMEOUT,
         )
         .await;
     }
@@ -189,7 +188,7 @@ async fn simple_create_drop_multiple_indexes(actors: TestActors) {
         wait_for(
             || async { client.indexes().await.is_empty() },
             "Waiting for all indexes to be dropped",
-            Duration::from_secs(5),
+            DEFAULT_OPERATION_TIMEOUT,
         )
         .await;
     }
@@ -246,7 +245,7 @@ async fn drop_table_removes_index(actors: TestActors) {
         wait_for(
             || async { client.indexes().await.is_empty() },
             "Waiting for index deletion",
-            Duration::from_secs(20),
+            DEFAULT_OPERATION_TIMEOUT,
         )
         .await;
     }
