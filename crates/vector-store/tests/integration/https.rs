@@ -111,6 +111,7 @@ async fn test_https_server_responds() {
         .post(format!("http://{addr}/api/v1/indexes/table/index/ann"))
         .json(&PostIndexAnnRequest {
             vector: vec![1.0].into(),
+            filter: None,
             limit: NonZeroUsize::new(1).unwrap().into(),
         })
         .send()
@@ -122,6 +123,7 @@ async fn test_https_server_responds() {
         .post(format!("https://{addr}/api/v1/indexes/table/index/ann"))
         .json(&PostIndexAnnRequest {
             vector: vec![1.0].into(),
+            filter: None,
             limit: NonZeroUsize::new(1).unwrap().into(),
         })
         .send()

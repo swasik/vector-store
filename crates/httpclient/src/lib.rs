@@ -19,6 +19,7 @@ pub use vector_store::httproutes::IndexStatus;
 use vector_store::httproutes::IndexStatusResponse;
 use vector_store::httproutes::InfoResponse;
 use vector_store::httproutes::NodeStatus;
+use vector_store::httproutes::PostIndexAnnFilter;
 use vector_store::httproutes::PostIndexAnnRequest;
 use vector_store::httproutes::PostIndexAnnResponse;
 
@@ -55,10 +56,11 @@ impl HttpClient {
         keyspace_name: &KeyspaceName,
         index_name: &IndexName,
         vector: Vector,
+        filter: Option<PostIndexAnnFilter>,
         limit: Limit,
     ) -> (HashMap<ColumnName, Vec<Value>>, Vec<Distance>) {
         let resp = self
-            .post_ann(keyspace_name, index_name, vector, limit)
+            .post_ann(keyspace_name, index_name, vector, filter, limit)
             .await
             .json::<PostIndexAnnResponse>()
             .await
@@ -71,9 +73,14 @@ impl HttpClient {
         keyspace_name: &KeyspaceName,
         index_name: &IndexName,
         vector: Vector,
+        filter: Option<PostIndexAnnFilter>,
         limit: Limit,
     ) -> reqwest::Response {
-        let request = PostIndexAnnRequest { vector, limit };
+        let request = PostIndexAnnRequest {
+            vector,
+            filter,
+            limit,
+        };
         self.post_ann_data(keyspace_name, index_name, &request)
             .await
     }

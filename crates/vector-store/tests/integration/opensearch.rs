@@ -133,6 +133,7 @@ async fn simple_create_search_delete_index() {
             &index.keyspace_name,
             &index.index_name,
             vec![2.1, -2., 2.].into(),
+            None,
             NonZeroUsize::new(1).unwrap().into(),
         )
         .await;

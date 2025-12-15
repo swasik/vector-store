@@ -244,6 +244,10 @@
   },
   "components": {
     "schemas": {
+      "ColumnName": {
+        "type": "string",
+        "description": "Name of the column in a db table."
+      },
       "DataType": {
         "type": "string",
         "description": "Data type and precision used for storing and processing vectors in the index.",
@@ -360,12 +364,42 @@
           "The node has completed the initial database scan and built the indexes defined at that time. It is now monitoring the database for changes."
         ]
       },
+      "PostIndexAnnFilter": {
+        "type": "object",
+        "description": "A filter used in ANN search requests.",
+        "required": [
+          "restrictions"
+        ],
+        "properties": {
+          "allow_filtering": {
+            "type": "boolean",
+            "description": "Indicates whether 'ALLOW FILTERING' was specified in the Cql query."
+          },
+          "restrictions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PostIndexAnnRestriction"
+            },
+            "description": "A list of filter restrictions."
+          }
+        }
+      },
       "PostIndexAnnRequest": {
         "type": "object",
         "required": [
           "vector"
         ],
         "properties": {
+          "filter": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PostIndexAnnFilter"
+              }
+            ]
+          },
           "limit": {
             "$ref": "#/components/schemas/Limit"
           },
@@ -399,6 +433,293 @@
             }
           }
         }
+      },
+      "PostIndexAnnRestriction": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "$ref": "#/components/schemas/ColumnName"
+              },
+              "rhs": {},
+              "type": {
+                "type": "string",
+                "enum": [
+                  "=="
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "$ref": "#/components/schemas/ColumnName"
+              },
+              "rhs": {
+                "type": "array",
+                "items": {}
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "IN"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "$ref": "#/components/schemas/ColumnName"
+              },
+              "rhs": {},
+              "type": {
+                "type": "string",
+                "enum": [
+                  "<"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "$ref": "#/components/schemas/ColumnName"
+              },
+              "rhs": {},
+              "type": {
+                "type": "string",
+                "enum": [
+                  "<="
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "$ref": "#/components/schemas/ColumnName"
+              },
+              "rhs": {},
+              "type": {
+                "type": "string",
+                "enum": [
+                  ">"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "$ref": "#/components/schemas/ColumnName"
+              },
+              "rhs": {},
+              "type": {
+                "type": "string",
+                "enum": [
+                  ">="
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ColumnName"
+                }
+              },
+              "rhs": {
+                "type": "array",
+                "items": {}
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "()==()"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ColumnName"
+                }
+              },
+              "rhs": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {}
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "()IN()"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ColumnName"
+                }
+              },
+              "rhs": {
+                "type": "array",
+                "items": {}
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "()<()"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ColumnName"
+                }
+              },
+              "rhs": {
+                "type": "array",
+                "items": {}
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "()<=()"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ColumnName"
+                }
+              },
+              "rhs": {
+                "type": "array",
+                "items": {}
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "()>()"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "lhs",
+              "rhs",
+              "type"
+            ],
+            "properties": {
+              "lhs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ColumnName"
+                }
+              },
+              "rhs": {
+                "type": "array",
+                "items": {}
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "()>=()"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A filter restriction used in ANN search requests."
       },
       "Vector": {
         "type": "array",

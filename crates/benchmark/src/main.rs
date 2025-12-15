@@ -444,6 +444,7 @@ async fn main() {
                                         &keyspace,
                                         &index,
                                         query.query.clone().into(),
+                                        None,
                                         NonZeroUsize::new(query.neighbors.len()).unwrap().into(),
                                     )
                                     .await
