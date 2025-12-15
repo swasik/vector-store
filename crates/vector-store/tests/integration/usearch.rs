@@ -9,11 +9,13 @@ use crate::db_basic::DbBasic;
 use crate::db_basic::Index;
 use crate::db_basic::Table;
 use crate::wait_for;
+use crate::wait_for_value;
 use ::time::OffsetDateTime;
 use httpclient::HttpClient;
 use reqwest::StatusCode;
 use scylla::cluster::metadata::NativeType;
 use scylla::value::CqlValue;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -31,6 +33,8 @@ use vector_store::PrimaryKey;
 use vector_store::SpaceType;
 use vector_store::Timestamp;
 use vector_store::Vector;
+use vector_store::httproutes::PostIndexAnnFilter;
+use vector_store::httproutes::PostIndexAnnRestriction;
 use vector_store::node_state::NodeState;
 
 pub(crate) async fn setup_store(
@@ -57,7 +61,7 @@ pub(crate) async fn setup_store(
         connectivity: Connectivity::default(),
         expansion_add: ExpansionAdd::default(),
         expansion_search: ExpansionSearch::default(),
-        space_type: SpaceType::default(),
+        space_type: SpaceType::Euclidean,
         version: Uuid::new_v4().into(),
     };
 
@@ -485,6 +489,402 @@ async fn ann_failed_when_wrong_number_of_primary_keys() {
         .await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+#[ntest::timeout(10_000)]
+async fn ann_filter_partition_key_int_eq() {
+    crate::enable_tracing();
+
+    let pk_column: ColumnName = "pk".into();
+    let ck_column: ColumnName = "ck".into();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        [pk_column.clone(), ck_column.clone()],
+        [
+            (pk_column.clone(), NativeType::Int),
+            (ck_column.clone(), NativeType::Int),
+        ],
+        (0..30).map(|i| {
+            (
+                vec![CqlValue::Int(i / 10), CqlValue::Int(i % 10)].into(),
+                Some(vec![i as f32, i as f32, i as f32].into()),
+                OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
+            )
+        }),
+    )
+    .await;
+
+    // Search for nearest neighbors with a filter on primary key "pk" = 1
+    let pk_ck_values = wait_for_value(
+        || async {
+            let (primary_keys, _) = client
+                .ann(
+                    &index.keyspace_name,
+                    &index.index_name,
+                    vec![1.0, 2.0, 3.0].into(),
+                    Some(PostIndexAnnFilter {
+                        restrictions: vec![PostIndexAnnRestriction::Eq {
+                            lhs: pk_column.clone(),
+                            rhs: 1.into(),
+                        }],
+                        allow_filtering: false,
+                    }),
+                    NonZeroUsize::new(100).unwrap().into(),
+                )
+                .await;
+            let pk_ck_values: HashSet<_> = primary_keys
+                .get(&pk_column)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as usize)
+                .zip(
+                    primary_keys
+                        .get(&ck_column)
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_i64().unwrap() as usize),
+                )
+                .collect();
+            (pk_ck_values.len() == 10).then_some(pk_ck_values)
+        },
+        "Waiting for ANN to return 10 results",
+    )
+    .await;
+    (0..10).for_each(|i| {
+        assert!(
+            pk_ck_values.contains(&(1, i)),
+            "Expected ck_values to contain value (1, {i})"
+        );
+    });
+}
+
+#[tokio::test]
+#[ntest::timeout(10_000)]
+async fn ann_filter_clustering_key_int_eq() {
+    crate::enable_tracing();
+
+    let pk_column: ColumnName = "pk".into();
+    let ck_column: ColumnName = "ck".into();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        [pk_column.clone(), ck_column.clone()],
+        [
+            (pk_column.clone(), NativeType::Int),
+            (ck_column.clone(), NativeType::Int),
+        ],
+        (0..30).map(|i| {
+            (
+                vec![CqlValue::Int(i / 10), CqlValue::Int(i % 10)].into(),
+                Some(vec![i as f32, i as f32, i as f32].into()),
+                OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
+            )
+        }),
+    )
+    .await;
+
+    // Search for nearest neighbors with a filter on primary key "ck" = 1
+    let pk_ck_values = wait_for_value(
+        || async {
+            let (primary_keys, _) = client
+                .ann(
+                    &index.keyspace_name,
+                    &index.index_name,
+                    vec![1.0, 2.0, 3.0].into(),
+                    Some(PostIndexAnnFilter {
+                        restrictions: vec![PostIndexAnnRestriction::Eq {
+                            lhs: ck_column.clone(),
+                            rhs: 1.into(),
+                        }],
+                        allow_filtering: false,
+                    }),
+                    NonZeroUsize::new(100).unwrap().into(),
+                )
+                .await;
+            let pk_ck_values: HashSet<_> = primary_keys
+                .get(&pk_column)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as usize)
+                .zip(
+                    primary_keys
+                        .get(&ck_column)
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_i64().unwrap() as usize),
+                )
+                .collect();
+            (pk_ck_values.len() == 3).then_some(pk_ck_values)
+        },
+        "Waiting for ANN to return 3 results",
+    )
+    .await;
+    (0..3).for_each(|i| {
+        assert!(
+            pk_ck_values.contains(&(i, 1)),
+            "Expected pk_values to contain value ({i}, 1)"
+        );
+    });
+}
+
+#[tokio::test]
+#[ntest::timeout(10_000)]
+async fn ann_filter_partition_key_int_in() {
+    crate::enable_tracing();
+
+    let pk_column: ColumnName = "pk".into();
+    let ck_column: ColumnName = "ck".into();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        [pk_column.clone(), ck_column.clone()],
+        [
+            (pk_column.clone(), NativeType::Int),
+            (ck_column.clone(), NativeType::Int),
+        ],
+        (0..30).map(|i| {
+            (
+                vec![CqlValue::Int(i / 10), CqlValue::Int(i % 10)].into(),
+                Some(vec![i as f32, i as f32, i as f32].into()),
+                OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
+            )
+        }),
+    )
+    .await;
+
+    // Search for nearest neighbors with a filter on primary key "pk" IN (1, 2)
+    let pk_ck_values = wait_for_value(
+        || async {
+            let (primary_keys, _) = client
+                .ann(
+                    &index.keyspace_name,
+                    &index.index_name,
+                    vec![1.0, 2.0, 3.0].into(),
+                    Some(PostIndexAnnFilter {
+                        restrictions: vec![PostIndexAnnRestriction::In {
+                            lhs: pk_column.clone(),
+                            rhs: vec![1.into(), 2.into()],
+                        }],
+                        allow_filtering: false,
+                    }),
+                    NonZeroUsize::new(100).unwrap().into(),
+                )
+                .await;
+            let pk_ck_values: HashSet<_> = primary_keys
+                .get(&pk_column)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as usize)
+                .zip(
+                    primary_keys
+                        .get(&ck_column)
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_i64().unwrap() as usize),
+                )
+                .collect();
+            (pk_ck_values.len() == 20).then_some(pk_ck_values)
+        },
+        "Waiting for ANN to return 20 results",
+    )
+    .await;
+    (0..10).for_each(|i| {
+        assert!(
+            pk_ck_values.contains(&(1, i)),
+            "Expected pk_ck_values to contain value (1, {i})"
+        );
+        assert!(
+            pk_ck_values.contains(&(2, i)),
+            "Expected pk_ck_values to contain value (2, {i})"
+        );
+    });
+}
+
+#[tokio::test]
+#[ntest::timeout(10_000)]
+async fn ann_filter_clustering_key_int_in() {
+    crate::enable_tracing();
+
+    let pk_column: ColumnName = "pk".into();
+    let ck_column: ColumnName = "ck".into();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        [pk_column.clone(), ck_column.clone()],
+        [
+            (pk_column.clone(), NativeType::Int),
+            (ck_column.clone(), NativeType::Int),
+        ],
+        (0..30).map(|i| {
+            (
+                vec![CqlValue::Int(i / 10), CqlValue::Int(i % 10)].into(),
+                Some(vec![i as f32, i as f32, i as f32].into()),
+                OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
+            )
+        }),
+    )
+    .await;
+
+    // Search for nearest neighbors with a filter on primary key "ck" IN (1, 3)
+    let pk_ck_values = wait_for_value(
+        || async {
+            let (primary_keys, _) = client
+                .ann(
+                    &index.keyspace_name,
+                    &index.index_name,
+                    vec![1.0, 2.0, 3.0].into(),
+                    Some(PostIndexAnnFilter {
+                        restrictions: vec![PostIndexAnnRestriction::In {
+                            lhs: ck_column.clone(),
+                            rhs: vec![1.into(), 3.into()],
+                        }],
+                        allow_filtering: false,
+                    }),
+                    NonZeroUsize::new(100).unwrap().into(),
+                )
+                .await;
+            let pk_ck_values: HashSet<_> = primary_keys
+                .get(&pk_column)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as usize)
+                .zip(
+                    primary_keys
+                        .get(&ck_column)
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_i64().unwrap() as usize),
+                )
+                .collect();
+            (pk_ck_values.len() == 6).then_some(pk_ck_values)
+        },
+        "Waiting for ANN to return 6 results",
+    )
+    .await;
+    (0..3).for_each(|i| {
+        assert!(
+            pk_ck_values.contains(&(i, 1)),
+            "Expected pk_ck_values to contain value ({i}, 1)"
+        );
+        assert!(
+            pk_ck_values.contains(&(i, 3)),
+            "Expected pk_ck_values to contain value ({i}, 3)"
+        );
+    });
+}
+
+#[tokio::test]
+#[ntest::timeout(10_000)]
+async fn ann_filter_primary_key_int_eq_tuple() {
+    crate::enable_tracing();
+
+    let pk_column: ColumnName = "pk".into();
+    let ck_column: ColumnName = "ck".into();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        [pk_column.clone(), ck_column.clone()],
+        [
+            (pk_column.clone(), NativeType::Int),
+            (ck_column.clone(), NativeType::Int),
+        ],
+        (0..30).map(|i| {
+            (
+                vec![CqlValue::Int(i / 10), CqlValue::Int(i % 10)].into(),
+                Some(vec![i as f32, i as f32, i as f32].into()),
+                OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
+            )
+        }),
+    )
+    .await;
+
+    // Search for nearest neighbors with a filter on primary key ("pk", "ck") = (1, 5)
+    let (primary_keys, _) = client
+        .ann(
+            &index.keyspace_name,
+            &index.index_name,
+            vec![1.0, 2.0, 3.0].into(),
+            Some(PostIndexAnnFilter {
+                restrictions: vec![PostIndexAnnRestriction::EqTuple {
+                    lhs: vec![pk_column.clone(), ck_column.clone()],
+                    rhs: vec![1.into(), 5.into()],
+                }],
+                allow_filtering: false,
+            }),
+            NonZeroUsize::new(100).unwrap().into(),
+        )
+        .await;
+    let pk_values: Vec<_> = primary_keys
+        .get(&pk_column)
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as usize)
+        .collect();
+    let ck_values: Vec<_> = primary_keys
+        .get(&ck_column)
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as usize)
+        .collect();
+    assert_eq!(pk_values.len(), 1);
+    assert_eq!(ck_values.len(), 1);
+    assert_eq!(pk_values.first(), Some(&1));
+    assert_eq!(ck_values.first(), Some(&5));
+}
+
+#[tokio::test]
+#[ntest::timeout(10_000)]
+async fn ann_filter_primary_key_int_in_tuple() {
+    crate::enable_tracing();
+
+    let pk_column: ColumnName = "pk".into();
+    let ck_column: ColumnName = "ck".into();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        [pk_column.clone(), ck_column.clone()],
+        [
+            (pk_column.clone(), NativeType::Int),
+            (ck_column.clone(), NativeType::Int),
+        ],
+        (0..30).map(|i| {
+            (
+                vec![CqlValue::Int(i / 10), CqlValue::Int(i % 10)].into(),
+                Some(vec![i as f32, i as f32, i as f32].into()),
+                OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
+            )
+        }),
+    )
+    .await;
+
+    // Search for nearest neighbors with a filter on primary key ("pk", "ck") IN ((0,7), (1, 5))
+    let (primary_keys, _) = client
+        .ann(
+            &index.keyspace_name,
+            &index.index_name,
+            vec![1.0, 2.0, 3.0].into(),
+            Some(PostIndexAnnFilter {
+                restrictions: vec![PostIndexAnnRestriction::InTuple {
+                    lhs: vec![pk_column.clone(), ck_column.clone()],
+                    rhs: vec![vec![0.into(), 7.into()], vec![1.into(), 5.into()]],
+                }],
+                allow_filtering: false,
+            }),
+            NonZeroUsize::new(100).unwrap().into(),
+        )
+        .await;
+    let pk_ck_values: HashSet<_> = primary_keys
+        .get(&pk_column)
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as usize)
+        .zip(
+            primary_keys
+                .get(&ck_column)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as usize),
+        )
+        .collect();
+    assert_eq!(pk_ck_values.len(), 2);
+    assert!(
+        pk_ck_values.contains(&(0, 7)),
+        "Expected pk_ck_values to contain value (0, 7)"
+    );
+    assert!(
+        pk_ck_values.contains(&(1, 5)),
+        "Expected pk_ck_values to contain value (1, 5)"
+    );
 }
 
 #[tokio::test]

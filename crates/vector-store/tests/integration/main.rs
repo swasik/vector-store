@@ -45,3 +45,16 @@ where
     .await
     .unwrap_or_else(|_| panic!("Timeout on: {msg}"))
 }
+
+async fn wait_for_value<T>(mut producer: impl AsyncFnMut() -> Option<T>, msg: &str) -> T {
+    time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(value) = producer().await {
+                break value;
+            }
+            task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Timeout on: {msg}"))
+}

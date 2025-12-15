@@ -394,15 +394,18 @@ pub(crate) fn new_db_index(
                 )))
                 .await
                 .unwrap();
-            while !rx_index.is_closed() {
+            while !rx_index.is_closed() && !tx_embeddings.is_closed() {
                 tokio::select! {
                     item = items.next() => {
                         let Some(item) = item else {
                             break;
                         };
-                        if tx_embeddings.send((item, None)).await.is_err() {
-                            break;
-                        }
+                        tokio::spawn({
+                            let tx_embeddings = tx_embeddings.clone();
+                            async move {
+                                _ = tx_embeddings.send((item, None)).await;
+                            }
+                        });
                     }
                     Some(msg) = rx_index.recv() => {
                         process_db_index(&db, &metadata, msg).await;
