@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use uuid::Uuid;
+use vector_store::ColumnName;
 use vector_store::Config;
 use vector_store::Connectivity;
 use vector_store::ExpansionAdd;
@@ -31,6 +32,7 @@ use vector_store::node_state::NodeState;
 
 pub(crate) async fn setup_store(
     config: Config,
+    primary_keys: impl IntoIterator<Item = ColumnName>,
 ) -> (
     impl std::future::Future<Output = (HttpClient, impl Sized, impl Sized)>,
     IndexMetadata,
@@ -58,7 +60,7 @@ pub(crate) async fn setup_store(
         index.keyspace_name.clone(),
         index.table_name.clone(),
         Table {
-            primary_keys: Arc::new(vec!["pk".into(), "ck".into()]),
+            primary_keys: Arc::new(primary_keys.into_iter().collect()),
             dimensions: [(index.target_column.clone(), index.dimensions)]
                 .into_iter()
                 .collect(),
@@ -96,17 +98,22 @@ pub(crate) async fn setup_store(
     (run, index, db, node_state)
 }
 
-pub(crate) async fn setup_store_and_wait_for_index() -> (
+pub(crate) async fn setup_store_and_wait_for_index(
+    primary_keys: impl IntoIterator<Item = ColumnName>,
+) -> (
     IndexMetadata,
     HttpClient,
     DbBasic,
     impl Sized,
     Sender<NodeState>,
 ) {
-    let (run, index, db, node_state) = setup_store(Config {
-        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        ..Default::default()
-    })
+    let (run, index, db, node_state) = setup_store(
+        Config {
+            vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ..Default::default()
+        },
+        primary_keys,
+    )
     .await;
     let (client, server, _config_tx) = run.await;
 
@@ -123,10 +130,13 @@ pub(crate) async fn setup_store_and_wait_for_index() -> (
 async fn simple_create_search_delete_index() {
     crate::enable_tracing();
 
-    let (run, index, db, _node_state) = setup_store(Config {
-        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        ..Default::default()
-    })
+    let (run, index, db, _node_state) = setup_store(
+        Config {
+            vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ..Default::default()
+        },
+        ["pk".into(), "ck".into()],
+    )
     .await;
     let (client, _server, _config_tx) = run.await;
 
@@ -333,7 +343,8 @@ async fn failed_db_index_create() {
 #[tokio::test]
 async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimensions() {
     crate::enable_tracing();
-    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index().await;
+    let (index, client, _db, _server, _node_state) =
+        setup_store_and_wait_for_index(["pk".into(), "ck".into()]).await;
 
     let result = client
         .post_ann(
@@ -350,10 +361,13 @@ async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimen
 #[tokio::test]
 async fn ann_fail_while_building() {
     crate::enable_tracing();
-    let (run, index, db, _node_state) = setup_store(Config {
-        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        ..Default::default()
-    })
+    let (run, index, db, _node_state) = setup_store(
+        Config {
+            vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ..Default::default()
+        },
+        ["pk".into(), "ck".into()],
+    )
     .await;
     db.set_next_full_scan_progress(vector_store::Progress::InProgress(
         Percentage::try_from(33.333).unwrap(),
@@ -380,7 +394,8 @@ async fn ann_fail_while_building() {
 async fn ann_works_with_embedding_field_name() {
     // Ensure backward compatibility with the old field name "embedding".
     crate::enable_tracing();
-    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index().await;
+    let (index, client, _db, _server, _node_state) =
+        setup_store_and_wait_for_index(["pk".into(), "ck".into()]).await;
     #[derive(serde::Serialize)]
     struct EmbeddingRequest {
         embedding: Vector,
@@ -412,7 +427,7 @@ async fn http_server_is_responsive_when_index_add_hangs() {
         ]),
         ..Default::default()
     };
-    let (run, index, db, _node_state) = setup_store(config).await;
+    let (run, index, db, _node_state) = setup_store(config, ["pk".into(), "ck".into()]).await;
     // Insert a value before starting the vector store. The DbBasic test implementation does not support
     // adding embeddings while it's running, so it must be populated beforehand.
     db.insert_values(
