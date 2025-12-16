@@ -26,13 +26,16 @@ use vector_store::ExpansionAdd;
 use vector_store::ExpansionSearch;
 use vector_store::IndexMetadata;
 use vector_store::Percentage;
+use vector_store::PrimaryKey;
 use vector_store::SpaceType;
+use vector_store::Timestamp;
 use vector_store::Vector;
 use vector_store::node_state::NodeState;
 
 pub(crate) async fn setup_store(
     config: Config,
     primary_keys: impl IntoIterator<Item = ColumnName>,
+    values: impl IntoIterator<Item = (PrimaryKey, Option<Vector>, Timestamp)>,
 ) -> (
     impl std::future::Future<Output = (HttpClient, impl Sized, impl Sized)>,
     IndexMetadata,
@@ -67,6 +70,15 @@ pub(crate) async fn setup_store(
         },
     )
     .unwrap();
+
+    db.insert_values(
+        &index.keyspace_name,
+        &index.table_name,
+        &index.target_column,
+        values,
+    )
+    .unwrap();
+
     db.add_index(
         &index.keyspace_name,
         index.index_name.clone(),
@@ -100,6 +112,7 @@ pub(crate) async fn setup_store(
 
 pub(crate) async fn setup_store_and_wait_for_index(
     primary_keys: impl IntoIterator<Item = ColumnName>,
+    values: impl IntoIterator<Item = (PrimaryKey, Option<Vector>, Timestamp)>,
 ) -> (
     IndexMetadata,
     HttpClient,
@@ -113,6 +126,7 @@ pub(crate) async fn setup_store_and_wait_for_index(
             ..Default::default()
         },
         primary_keys,
+        values,
     )
     .await;
     let (client, server, _config_tx) = run.await;
@@ -136,15 +150,7 @@ async fn simple_create_search_delete_index() {
             ..Default::default()
         },
         ["pk".into(), "ck".into()],
-    )
-    .await;
-    let (client, _server, _config_tx) = run.await;
-
-    db.insert_values(
-        &index.keyspace_name,
-        &index.table_name,
-        &index.target_column,
-        vec![
+        [
             (
                 vec![CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
                 Some(vec![1., 1., 1.].into()),
@@ -162,7 +168,8 @@ async fn simple_create_search_delete_index() {
             ),
         ],
     )
-    .unwrap();
+    .await;
+    let (client, _server, _config_tx) = run.await;
 
     wait_for(
         || async {
@@ -344,7 +351,7 @@ async fn failed_db_index_create() {
 async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimensions() {
     crate::enable_tracing();
     let (index, client, _db, _server, _node_state) =
-        setup_store_and_wait_for_index(["pk".into(), "ck".into()]).await;
+        setup_store_and_wait_for_index(["pk".into(), "ck".into()], []).await;
 
     let result = client
         .post_ann(
@@ -367,6 +374,7 @@ async fn ann_fail_while_building() {
             ..Default::default()
         },
         ["pk".into(), "ck".into()],
+        [],
     )
     .await;
     db.set_next_full_scan_progress(vector_store::Progress::InProgress(
@@ -395,7 +403,7 @@ async fn ann_works_with_embedding_field_name() {
     // Ensure backward compatibility with the old field name "embedding".
     crate::enable_tracing();
     let (index, client, _db, _server, _node_state) =
-        setup_store_and_wait_for_index(["pk".into(), "ck".into()]).await;
+        setup_store_and_wait_for_index(["pk".into(), "ck".into()], []).await;
     #[derive(serde::Serialize)]
     struct EmbeddingRequest {
         embedding: Vector,
@@ -427,20 +435,17 @@ async fn http_server_is_responsive_when_index_add_hangs() {
         ]),
         ..Default::default()
     };
-    let (run, index, db, _node_state) = setup_store(config, ["pk".into(), "ck".into()]).await;
-    // Insert a value before starting the vector store. The DbBasic test implementation does not support
-    // adding embeddings while it's running, so it must be populated beforehand.
-    db.insert_values(
-        &index.keyspace_name,
-        &index.table_name,
-        &index.target_column,
-        vec![(
+    let (run, _index, _db, _node_state) = setup_store(
+        config,
+        ["pk".into(), "ck".into()],
+        [(
             vec![CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
             Some(vec![1., 1., 1.].into()),
             OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
         )],
     )
-    .unwrap();
+    .await;
+
     let (client, _server, _config_tx) = run.await;
 
     // Ensure the HTTP server stays responsive while the (simulated) embedding add is long-running.
