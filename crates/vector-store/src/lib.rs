@@ -432,6 +432,67 @@ impl Default for Limit {
     }
 }
 
+/// A restriction provided in a CQL query for filtering ANN search results.
+#[derive(Debug)]
+pub enum Restriction {
+    Eq {
+        lhs: ColumnName,
+        rhs: CqlValue,
+    },
+    In {
+        lhs: ColumnName,
+        rhs: Vec<CqlValue>,
+    },
+    Lt {
+        lhs: ColumnName,
+        rhs: CqlValue,
+    },
+    Lte {
+        lhs: ColumnName,
+        rhs: CqlValue,
+    },
+    Gt {
+        lhs: ColumnName,
+        rhs: CqlValue,
+    },
+    Gte {
+        lhs: ColumnName,
+        rhs: CqlValue,
+    },
+    EqTuple {
+        lhs: Vec<ColumnName>,
+        rhs: Vec<CqlValue>,
+    },
+    InTuple {
+        lhs: Vec<ColumnName>,
+        rhs: Vec<Vec<CqlValue>>,
+    },
+    LtTuple {
+        lhs: Vec<ColumnName>,
+        rhs: Vec<CqlValue>,
+    },
+    LteTuple {
+        lhs: Vec<ColumnName>,
+        rhs: Vec<CqlValue>,
+    },
+    GtTuple {
+        lhs: Vec<ColumnName>,
+        rhs: Vec<CqlValue>,
+    },
+    GteTuple {
+        lhs: Vec<ColumnName>,
+        rhs: Vec<CqlValue>,
+    },
+}
+
+/// A filter to apply to an ANN search. It contains restrictions from a CQL query and a flag to
+/// indicate whether ALLOW FILTERING was specified in the CQL query.
+#[derive(Debug)]
+pub struct Filter {
+    pub restrictions: Vec<Restriction>,
+    pub allow_filtering: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, derive_more::From)]
 pub struct IndexVersion(Uuid);
 

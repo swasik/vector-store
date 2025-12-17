@@ -5,6 +5,7 @@
 
 use crate::AsyncInProgress;
 use crate::Distance;
+use crate::Filter;
 use crate::Limit;
 use crate::PrimaryKey;
 use crate::Vector;
@@ -29,6 +30,12 @@ pub enum Index {
         limit: Limit,
         tx: oneshot::Sender<AnnR>,
     },
+    FilteredAnn {
+        embedding: Vector,
+        filter: Filter,
+        limit: Limit,
+        tx: oneshot::Sender<AnnR>,
+    },
     Count {
         tx: oneshot::Sender<CountR>,
     },
@@ -43,6 +50,7 @@ pub(crate) trait IndexExt {
     );
     async fn remove(&self, primary_key: PrimaryKey, in_progress: Option<AsyncInProgress>);
     async fn ann(&self, embedding: Vector, limit: Limit) -> AnnR;
+    async fn filtered_ann(&self, embedding: Vector, filter: Filter, limit: Limit) -> AnnR;
     async fn count(&self) -> CountR;
 }
 
@@ -75,6 +83,18 @@ impl IndexExt for mpsc::Sender<Index> {
         let (tx, rx) = oneshot::channel();
         self.send(Index::Ann {
             embedding,
+            limit,
+            tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    async fn filtered_ann(&self, embedding: Vector, filter: Filter, limit: Limit) -> AnnR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Index::FilteredAnn {
+            embedding,
+            filter,
             limit,
             tx,
         })

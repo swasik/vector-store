@@ -575,6 +575,9 @@ fn process<I: UsearchIndex + Send + Sync + 'static>(msg: Index, index: &IndexSta
                 limit,
             );
         }
+        Index::FilteredAnn { tx, .. } => {
+            filtered_ann(tx);
+        }
         Index::Count { tx } => {
             count(Arc::clone(&index.idx), tx);
         }
@@ -712,6 +715,10 @@ fn ann(
                 }),
         )
         .unwrap_or_else(|_| trace!("ann: unable to send response"));
+}
+
+fn filtered_ann(tx_ann: oneshot::Sender<AnnR>) {
+    _ = tx_ann.send(Err(anyhow!("Filtering not supported")));
 }
 
 fn count(idx: Arc<impl UsearchIndex>, tx: oneshot::Sender<CountR>) {
