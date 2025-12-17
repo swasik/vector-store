@@ -74,7 +74,7 @@ impl TableStore {
 }
 
 pub(crate) struct Table {
-    pub(crate) primary_keys: Vec<ColumnName>,
+    pub(crate) primary_keys: Arc<Vec<ColumnName>>,
     pub(crate) dimensions: HashMap<ColumnName, Dimensions>,
 }
 

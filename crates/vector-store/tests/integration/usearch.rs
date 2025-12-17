@@ -58,7 +58,7 @@ pub(crate) async fn setup_store(
         index.keyspace_name.clone(),
         index.table_name.clone(),
         Table {
-            primary_keys: vec!["pk".into(), "ck".into()],
+            primary_keys: Arc::new(vec!["pk".into(), "ck".into()]),
             dimensions: [(index.target_column.clone(), index.dimensions)]
                 .into_iter()
                 .collect(),
@@ -238,7 +238,7 @@ async fn failed_db_index_create() {
         index.keyspace_name.clone(),
         index.table_name.clone(),
         Table {
-            primary_keys: vec!["pk".into(), "ck".into()],
+            primary_keys: Arc::new(vec!["pk".into(), "ck".into()]),
             dimensions: [(index.target_column.clone(), index.dimensions)]
                 .into_iter()
                 .collect(),

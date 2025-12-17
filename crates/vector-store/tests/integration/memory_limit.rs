@@ -58,7 +58,7 @@ async fn memory_limit_during_index_build() {
         index.keyspace_name.clone(),
         index.table_name.clone(),
         Table {
-            primary_keys: vec!["pk".into()],
+            primary_keys: Arc::new(vec!["pk".into()]),
             dimensions: [(index.target_column.clone(), index.dimensions)]
                 .into_iter()
                 .collect(),

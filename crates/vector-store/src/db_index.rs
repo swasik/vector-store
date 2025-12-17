@@ -55,7 +55,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
-type GetPrimaryKeyColumnsR = Vec<ColumnName>;
+type GetPrimaryKeyColumnsR = Arc<Vec<ColumnName>>;
 type RangeScanResult =
     anyhow::Result<Pin<Box<dyn Stream<Item = DbEmbedding> + std::marker::Send>>, anyhow::Error>;
 const START_RETRY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -339,7 +339,7 @@ async fn process(statements: Arc<Statements>, msg: DbIndex, completed_scan_lengt
 
 struct Statements {
     session_rx: tokio::sync::watch::Receiver<Option<Arc<Session>>>,
-    primary_key_columns: Vec<ColumnName>,
+    primary_key_columns: Arc<Vec<ColumnName>>,
     st_range_scan: PreparedStatement,
 }
 
@@ -362,13 +362,15 @@ impl Statements {
             .get(metadata.table_name.as_ref())
             .ok_or_else(|| anyhow!("table {} does not exist", metadata.table_name))?;
 
-        let primary_key_columns = table
-            .partition_key
-            .iter()
-            .chain(table.clustering_key.iter())
-            .cloned()
-            .map(ColumnName::from)
-            .collect_vec();
+        let primary_key_columns = Arc::new(
+            table
+                .partition_key
+                .iter()
+                .chain(table.clustering_key.iter())
+                .cloned()
+                .map(ColumnName::from)
+                .collect_vec(),
+        );
 
         let st_partition_key_list = table.partition_key.iter().join(", ");
         let st_primary_key_list = primary_key_columns.iter().join(", ");
@@ -391,7 +393,7 @@ impl Statements {
         })
     }
 
-    fn get_primary_key_columns(&self) -> Vec<ColumnName> {
+    fn get_primary_key_columns(&self) -> GetPrimaryKeyColumnsR {
         self.primary_key_columns.clone()
     }
 
