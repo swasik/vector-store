@@ -10,6 +10,7 @@ use crate::mock_opensearch;
 use crate::wait_for;
 use ::time::OffsetDateTime;
 use httpclient::HttpClient;
+use scylla::cluster::metadata::NativeType;
 use scylla::value::CqlValue;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -59,6 +60,14 @@ async fn simple_create_search_delete_index() {
         index.table_name.clone(),
         Table {
             primary_keys: Arc::new(vec!["pk".into(), "ck".into()]),
+            columns: Arc::new(
+                [
+                    ("pk".into(), NativeType::Int),
+                    ("ck".into(), NativeType::Text),
+                ]
+                .into_iter()
+                .collect(),
+            ),
             dimensions: [(index.target_column.clone(), index.dimensions)]
                 .into_iter()
                 .collect(),

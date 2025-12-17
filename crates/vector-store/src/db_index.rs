@@ -24,6 +24,8 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use itertools::Itertools;
 use scylla::client::session::Session;
+use scylla::cluster::metadata::ColumnType;
+use scylla::cluster::metadata::NativeType;
 use scylla::errors::PagerExecutionError;
 use scylla::routing::Token;
 use scylla::statement::prepared::PreparedStatement;
@@ -33,6 +35,7 @@ use scylla_cdc::consumer::CDCRow;
 use scylla_cdc::consumer::Consumer;
 use scylla_cdc::consumer::ConsumerFactory;
 use scylla_cdc::log_reader::CDCLogReaderBuilder;
+use std::collections::HashMap;
 use std::iter;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -56,6 +59,7 @@ use tracing::trace;
 use tracing::warn;
 
 type GetPrimaryKeyColumnsR = Arc<Vec<ColumnName>>;
+type GetTableColumnsR = Arc<HashMap<ColumnName, NativeType>>;
 type RangeScanResult =
     anyhow::Result<Pin<Box<dyn Stream<Item = DbEmbedding> + std::marker::Send>>, anyhow::Error>;
 const START_RETRY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -82,6 +86,9 @@ pub enum DbIndex {
     GetPrimaryKeyColumns {
         tx: oneshot::Sender<GetPrimaryKeyColumnsR>,
     },
+    GetTableColumns {
+        tx: oneshot::Sender<GetTableColumnsR>,
+    },
     FullScanProgress {
         tx: oneshot::Sender<Progress>,
     },
@@ -89,6 +96,7 @@ pub enum DbIndex {
 
 pub(crate) trait DbIndexExt {
     async fn get_primary_key_columns(&self) -> GetPrimaryKeyColumnsR;
+    async fn get_table_columns(&self) -> GetTableColumnsR;
     async fn full_scan_progress(&self) -> Progress;
 }
 
@@ -96,6 +104,14 @@ impl DbIndexExt for mpsc::Sender<DbIndex> {
     async fn get_primary_key_columns(&self) -> GetPrimaryKeyColumnsR {
         let (tx, rx) = oneshot::channel();
         self.send(DbIndex::GetPrimaryKeyColumns { tx })
+            .await
+            .expect("internal actor should receive request");
+        rx.await.expect("internal actor should send response")
+    }
+
+    async fn get_table_columns(&self) -> GetTableColumnsR {
+        let (tx, rx) = oneshot::channel();
+        self.send(DbIndex::GetTableColumns { tx })
             .await
             .expect("internal actor should receive request");
         rx.await.expect("internal actor should send response")
@@ -326,6 +342,9 @@ async fn process(statements: Arc<Statements>, msg: DbIndex, completed_scan_lengt
             .unwrap_or_else(|_| {
                 trace!("process: Db::GetPrimaryKeyColumns: unable to send response")
             }),
+        DbIndex::GetTableColumns { tx } => tx
+            .send(statements.get_table_columns())
+            .unwrap_or_else(|_| trace!("process: Db::GetTableColumns: unable to send response")),
         DbIndex::FullScanProgress { tx } => {
             let completed_scan_length =
                 completed_scan_length.load(std::sync::atomic::Ordering::Relaxed);
@@ -340,6 +359,7 @@ async fn process(statements: Arc<Statements>, msg: DbIndex, completed_scan_lengt
 struct Statements {
     session_rx: tokio::sync::watch::Receiver<Option<Arc<Session>>>,
     primary_key_columns: Arc<Vec<ColumnName>>,
+    table_columns: GetTableColumnsR,
     st_range_scan: PreparedStatement,
 }
 
@@ -372,11 +392,27 @@ impl Statements {
                 .collect_vec(),
         );
 
+        let table_columns = Arc::new(
+            table
+                .columns
+                .iter()
+                .filter_map(|(name, coltype)| {
+                    if let ColumnType::Native(typ) = &coltype.typ {
+                        Some((ColumnName::from(name.clone()), typ.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        );
+
         let st_partition_key_list = table.partition_key.iter().join(", ");
         let st_primary_key_list = primary_key_columns.iter().join(", ");
 
         Ok(Self {
             primary_key_columns,
+
+            table_columns,
 
             st_range_scan: session
                 .prepare(Self::range_scan_query(
@@ -395,6 +431,10 @@ impl Statements {
 
     fn get_primary_key_columns(&self) -> GetPrimaryKeyColumnsR {
         self.primary_key_columns.clone()
+    }
+
+    fn get_table_columns(&self) -> GetTableColumnsR {
+        self.table_columns.clone()
     }
 
     fn range_scan_query(

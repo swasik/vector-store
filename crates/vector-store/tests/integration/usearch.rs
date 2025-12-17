@@ -12,6 +12,7 @@ use crate::wait_for;
 use ::time::OffsetDateTime;
 use httpclient::HttpClient;
 use reqwest::StatusCode;
+use scylla::cluster::metadata::NativeType;
 use scylla::value::CqlValue;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -35,6 +36,7 @@ use vector_store::node_state::NodeState;
 pub(crate) async fn setup_store(
     config: Config,
     primary_keys: impl IntoIterator<Item = ColumnName>,
+    columns: impl IntoIterator<Item = (ColumnName, NativeType)>,
     values: impl IntoIterator<Item = (PrimaryKey, Option<Vector>, Timestamp)>,
 ) -> (
     impl std::future::Future<Output = (HttpClient, impl Sized, impl Sized)>,
@@ -64,6 +66,7 @@ pub(crate) async fn setup_store(
         index.table_name.clone(),
         Table {
             primary_keys: Arc::new(primary_keys.into_iter().collect()),
+            columns: Arc::new(columns.into_iter().collect()),
             dimensions: [(index.target_column.clone(), index.dimensions)]
                 .into_iter()
                 .collect(),
@@ -112,6 +115,7 @@ pub(crate) async fn setup_store(
 
 pub(crate) async fn setup_store_and_wait_for_index(
     primary_keys: impl IntoIterator<Item = ColumnName>,
+    columns: impl IntoIterator<Item = (ColumnName, NativeType)>,
     values: impl IntoIterator<Item = (PrimaryKey, Option<Vector>, Timestamp)>,
 ) -> (
     IndexMetadata,
@@ -126,6 +130,7 @@ pub(crate) async fn setup_store_and_wait_for_index(
             ..Default::default()
         },
         primary_keys,
+        columns,
         values,
     )
     .await;
@@ -150,6 +155,10 @@ async fn simple_create_search_delete_index() {
             ..Default::default()
         },
         ["pk".into(), "ck".into()],
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("ck".to_string().into(), NativeType::Text),
+        ],
         [
             (
                 vec![CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
@@ -256,6 +265,14 @@ async fn failed_db_index_create() {
         index.table_name.clone(),
         Table {
             primary_keys: Arc::new(vec!["pk".into(), "ck".into()]),
+            columns: Arc::new(
+                [
+                    ("pk".into(), NativeType::Int),
+                    ("ck".into(), NativeType::Text),
+                ]
+                .into_iter()
+                .collect(),
+            ),
             dimensions: [(index.target_column.clone(), index.dimensions)]
                 .into_iter()
                 .collect(),
@@ -350,8 +367,15 @@ async fn failed_db_index_create() {
 #[tokio::test]
 async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimensions() {
     crate::enable_tracing();
-    let (index, client, _db, _server, _node_state) =
-        setup_store_and_wait_for_index(["pk".into(), "ck".into()], []).await;
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        ["pk".into(), "ck".into()],
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("ck".to_string().into(), NativeType::Text),
+        ],
+        [],
+    )
+    .await;
 
     let result = client
         .post_ann(
@@ -374,6 +398,10 @@ async fn ann_fail_while_building() {
             ..Default::default()
         },
         ["pk".into(), "ck".into()],
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("ck".to_string().into(), NativeType::Text),
+        ],
         [],
     )
     .await;
@@ -402,8 +430,15 @@ async fn ann_fail_while_building() {
 async fn ann_works_with_embedding_field_name() {
     // Ensure backward compatibility with the old field name "embedding".
     crate::enable_tracing();
-    let (index, client, _db, _server, _node_state) =
-        setup_store_and_wait_for_index(["pk".into(), "ck".into()], []).await;
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        ["pk".into(), "ck".into()],
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("ck".to_string().into(), NativeType::Text),
+        ],
+        [],
+    )
+    .await;
     #[derive(serde::Serialize)]
     struct EmbeddingRequest {
         embedding: Vector,
@@ -427,6 +462,7 @@ async fn ann_failed_when_wrong_number_of_primary_keys() {
     crate::enable_tracing();
     let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
         vec!["pk".into()],
+        [("pk".into(), NativeType::Int)],
         [(
             vec![CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
             Some(vec![1., 1., 1.].into()),
@@ -463,6 +499,10 @@ async fn http_server_is_responsive_when_index_add_hangs() {
     let (run, _index, _db, _node_state) = setup_store(
         config,
         ["pk".into(), "ck".into()],
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("ck".to_string().into(), NativeType::Text),
+        ],
         [(
             vec![CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
             Some(vec![1., 1., 1.].into()),
