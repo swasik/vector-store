@@ -423,6 +423,31 @@ async fn ann_works_with_embedding_field_name() {
 }
 
 #[tokio::test]
+async fn ann_failed_when_wrong_number_of_primary_keys() {
+    crate::enable_tracing();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        vec!["pk".into()],
+        [(
+            vec![CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
+            Some(vec![1., 1., 1.].into()),
+            OffsetDateTime::from_unix_timestamp(10).unwrap().into(),
+        )],
+    )
+    .await;
+
+    let response = client
+        .post_ann(
+            &index.keyspace_name,
+            &index.index_name,
+            vec![1.0, 2.0, 3.0].into(),
+            NonZeroUsize::new(1).unwrap().into(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
 #[ntest::timeout(10_000)]
 async fn http_server_is_responsive_when_index_add_hangs() {
     crate::enable_tracing();

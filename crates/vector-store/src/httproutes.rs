@@ -506,7 +506,7 @@ async fn post_index_ann(
                             })
                             .map_ok(|primary_key| primary_key.0[idx_column].clone())
                             .map_ok(try_to_json)
-                            .flatten()
+                            .map(|primary_key| primary_key.flatten())
                             .collect();
                         primary_keys.map(|primary_keys| (column, primary_keys))
                     })
