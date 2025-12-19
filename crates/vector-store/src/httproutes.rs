@@ -26,6 +26,7 @@ use axum::Router;
 use axum::extract;
 use axum::extract::Path;
 use axum::extract::State;
+use axum::http::Extensions;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
@@ -34,6 +35,7 @@ use axum::response;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
+use axum_server_dual_protocol::Protocol;
 use itertools::Itertools;
 use macros::ToEnumSchema;
 use prometheus::Encoder;
@@ -96,6 +98,7 @@ struct RoutesInnerState {
     metrics: Arc<Metrics>,
     node_state: Sender<NodeState>,
     index_engine_version: String,
+    use_tls: bool,
 }
 
 pub(crate) fn new(
@@ -103,12 +106,14 @@ pub(crate) fn new(
     metrics: Arc<Metrics>,
     node_state: Sender<NodeState>,
     index_engine_version: String,
+    use_tls: bool,
 ) -> Router {
     let state = RoutesInnerState {
         engine,
         metrics: metrics.clone(),
         node_state,
         index_engine_version,
+        use_tls,
     };
     let (router, api) = new_open_api_router();
     let router = router
@@ -367,7 +372,8 @@ pub struct PostIndexAnnResponse {
     description = "Performs an Approximate Nearest Neighbor (ANN) search using the specified index. \
 Returns the vectors most similar to the provided vector. \
 The maximum number of results is controlled by the optional 'limit' parameter in the payload. \
-The similarity metric is determined at index creation and cannot be changed per query.",
+The similarity metric is determined at index creation and cannot be changed per query. \
+If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
     params(
         ("keyspace" = KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the vector index."),
         ("index" = IndexName, Path, description = "The name of the ScyllaDB vector index within the specified keyspace to perform the search on.")
@@ -382,6 +388,12 @@ The similarity metric is determined at index creation and cannot be changed per 
         (
             status = 400,
             description = "Bad request. Possible causes: invalid vector size, malformed input, or missing required fields.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 403,
+            description = "Bad request. The TLS is enabled in a configuration, but client connected over the plain HTTP.",
             content_type = "application/json",
             body = ErrorMessage
         ),
@@ -407,9 +419,21 @@ The similarity metric is determined at index creation and cannot be changed per 
 )]
 async fn post_index_ann(
     State(state): State<RoutesInnerState>,
+    extensions: Extensions,
     Path((keyspace, index_name)): Path<(KeyspaceName, IndexName)>,
     extract::Json(request): extract::Json<PostIndexAnnRequest>,
 ) -> Response {
+    if state.use_tls
+        && extensions
+            .get::<Protocol>()
+            .is_some_and(|protocol| *protocol == Protocol::Plain)
+    {
+        let msg =
+            "TLS is required, but the request was made over an insecure connection.".to_string();
+        debug!("post_index_ann: {msg}");
+        return (StatusCode::FORBIDDEN, msg).into_response();
+    }
+
     // Start timing
     let timer = state
         .metrics

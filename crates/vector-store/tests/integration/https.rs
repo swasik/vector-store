@@ -5,11 +5,14 @@
 
 use crate::db_basic;
 use rcgen::CertifiedKey;
+use reqwest::StatusCode;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::sync::watch;
 use vector_store::Config;
+use vector_store::httproutes::PostIndexAnnRequest;
 
 fn create_temp_file<C: AsRef<[u8]>>(content: C) -> NamedTempFile {
     let mut file = NamedTempFile::new().unwrap();
@@ -70,18 +73,63 @@ async fn test_https_server_responds() {
     )
     .await;
 
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(cert.pem().as_bytes()).unwrap())
         .build()
-        .unwrap()
+        .unwrap();
+
+    let response = client
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Request to HTTP server metrics failed with status: {}",
+        response.status()
+    );
+
+    let response = client
         .get(format!("https://{addr}/api/v1/status"))
         .send()
         .await
         .unwrap();
-
     assert!(
         response.status().is_success(),
         "Request to HTTPS server failed with status: {}",
         response.status()
     );
+
+    let response = client
+        .get(format!("http://{addr}/api/v1/status"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Request to HTTP server failed with status: {}",
+        response.status()
+    );
+
+    let response = client
+        .post(format!("http://{addr}/api/v1/indexes/table/index/ann"))
+        .json(&PostIndexAnnRequest {
+            vector: vec![1.0].into(),
+            limit: NonZeroUsize::new(1).unwrap().into(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = client
+        .post(format!("https://{addr}/api/v1/indexes/table/index/ann"))
+        .json(&PostIndexAnnRequest {
+            vector: vec![1.0].into(),
+            limit: NonZeroUsize::new(1).unwrap().into(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

@@ -38,7 +38,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Performs an Approximate Nearest Neighbor (ANN) search using the specified index. Returns the vectors most similar to the provided vector. The maximum number of results is controlled by the optional 'limit' parameter in the payload. The similarity metric is determined at index creation and cannot be changed per query.",
+        "description": "Performs an Approximate Nearest Neighbor (ANN) search using the specified index. Returns the vectors most similar to the provided vector. The maximum number of results is controlled by the optional 'limit' parameter in the payload. The similarity metric is determined at index creation and cannot be changed per query. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
         "operationId": "post_index_ann",
         "parameters": [
           {
@@ -83,6 +83,16 @@
           },
           "400": {
             "description": "Bad request. Possible causes: invalid vector size, malformed input, or missing required fields.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Bad request. The TLS is enabled in a configuration, but client connected over the plain HTTP.",
             "content": {
               "application/json": {
                 "schema": {

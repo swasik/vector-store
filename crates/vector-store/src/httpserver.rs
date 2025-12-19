@@ -11,7 +11,6 @@ use crate::metrics::Metrics;
 use crate::node_state::NodeState;
 use axum_server::Handle;
 use axum_server::accept::NoDelayAcceptor;
-use axum_server::tls_rustls::RustlsAcceptor;
 use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -98,21 +97,24 @@ pub(crate) async fn new(
     tokio::spawn({
         let handle = handle.clone();
         async move {
-            let router = httproutes::new(engine, metrics, state, index_engine_version);
-            let server = axum_server::bind(config.addr).handle(handle);
-            let acceptor = NoDelayAcceptor::new();
-
             let result = match tls_config {
-                Some(config) => {
-                    server
-                        .acceptor(RustlsAcceptor::new(config).acceptor(acceptor))
-                        .serve(router.into_make_service())
+                Some(tls_config) => {
+                    axum_server_dual_protocol::bind_dual_protocol(config.addr, tls_config)
+                        .handle(handle)
+                        .serve(
+                            httproutes::new(engine, metrics, state, index_engine_version, true)
+                                .into_make_service(),
+                        )
                         .await
                 }
                 _ => {
-                    server
-                        .acceptor(acceptor)
-                        .serve(router.into_make_service())
+                    axum_server::bind(config.addr)
+                        .handle(handle)
+                        .acceptor(NoDelayAcceptor::new())
+                        .serve(
+                            httproutes::new(engine, metrics, state, index_engine_version, false)
+                                .into_make_service(),
+                        )
                         .await
                 }
             };
