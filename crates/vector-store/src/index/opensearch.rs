@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use crate::ColumnName;
 use crate::Connectivity;
 use crate::Dimensions;
 use crate::Distance;
@@ -85,6 +86,7 @@ impl IndexFactory for OpenSearchIndexFactory {
     fn create_index(
         &self,
         index: IndexConfiguration,
+        _: Arc<Vec<ColumnName>>,
         _: mpsc::Sender<Memory>,
     ) -> anyhow::Result<mpsc::Sender<Index>> {
         new(

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use crate::ColumnName;
 use crate::Connectivity;
 use crate::Dimensions;
 use crate::ExpansionAdd;
@@ -11,6 +12,7 @@ use crate::IndexId;
 use crate::SpaceType;
 use crate::index::actor::Index;
 use crate::memory::Memory;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub struct IndexConfiguration {
@@ -26,6 +28,7 @@ pub trait IndexFactory {
     fn create_index(
         &self,
         index: IndexConfiguration,
+        primary_key_columns: Arc<Vec<ColumnName>>,
         memory: mpsc::Sender<Memory>,
     ) -> anyhow::Result<mpsc::Sender<Index>>;
     fn index_engine_version(&self) -> String;

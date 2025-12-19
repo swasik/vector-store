@@ -3,13 +3,16 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use crate::ColumnName;
 use crate::Config;
 use crate::Dimensions;
 use crate::Distance;
+use crate::Filter;
 use crate::IndexFactory;
 use crate::IndexId;
 use crate::Limit;
 use crate::PrimaryKey;
+use crate::Restriction;
 use crate::SpaceType;
 use crate::Vector;
 use crate::index::actor::AnnR;
@@ -22,6 +25,7 @@ use crate::memory::Memory;
 use crate::memory::MemoryExt;
 use anyhow::anyhow;
 use bimap::BiMap;
+use scylla::value::CqlValue;
 use std::collections::HashSet;
 use std::iter;
 use std::sync::Arc;
@@ -83,6 +87,7 @@ impl IndexFactory for UsearchIndexFactory {
     fn create_index(
         &self,
         index: IndexConfiguration,
+        primary_key_columns: Arc<Vec<ColumnName>>,
         memory: mpsc::Sender<Memory>,
     ) -> anyhow::Result<mpsc::Sender<Index>> {
         match &self.mode {
@@ -103,6 +108,7 @@ impl IndexFactory for UsearchIndexFactory {
                     idx,
                     index.id,
                     index.dimensions,
+                    primary_key_columns,
                     Arc::clone(&self.tokio_semaphore),
                     Arc::clone(&self.rayon_semaphore),
                     memory,
@@ -114,6 +120,7 @@ impl IndexFactory for UsearchIndexFactory {
                     sim,
                     index.id,
                     index.dimensions,
+                    primary_key_columns,
                     Arc::clone(&self.tokio_semaphore),
                     Arc::clone(&self.rayon_semaphore),
                     memory,
@@ -166,6 +173,12 @@ trait UsearchIndex {
         vector: &Vector,
         limit: Limit,
     ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>>;
+    fn filtered_search(
+        &self,
+        vector: &Vector,
+        limit: Limit,
+        filter: impl Fn(Key) -> bool,
+    ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>>;
 
     fn stop(&self);
 }
@@ -213,6 +226,22 @@ impl UsearchIndex for ThreadedUsearchIndex {
         limit: Limit,
     ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>> {
         let matches = self.inner.search(&vector.0, limit.0.get())?;
+        Ok(matches
+            .keys
+            .into_iter()
+            .zip(matches.distances)
+            .map(|(key, distance)| (key.into(), distance.into())))
+    }
+
+    fn filtered_search(
+        &self,
+        vector: &Vector,
+        limit: Limit,
+        filter: impl Fn(Key) -> bool,
+    ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>> {
+        let matches = self
+            .inner
+            .filtered_search(&vector.0, limit.0.get(), |key| filter(Key(key)))?;
         Ok(matches
             .keys
             .into_iter()
@@ -391,6 +420,15 @@ impl UsearchIndex for RwLock<Simulator> {
         Ok(keys.into_iter().map(|key| (key, 0.0.into())))
     }
 
+    fn filtered_search(
+        &self,
+        vector: &Vector,
+        limit: Limit,
+        _filter: impl Fn(Key) -> bool,
+    ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>> {
+        self.search(vector, limit)
+    }
+
     fn stop(&self) {}
 }
 
@@ -452,6 +490,7 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
     idx: Arc<I>,
     id: IndexId,
     dimensions: Dimensions,
+    primary_key_columns: Arc<Vec<ColumnName>>,
     tokio_semaphore: Arc<Semaphore>,
     rayon_semaphore: Arc<Semaphore>,
     memory: mpsc::Sender<Memory>,
@@ -479,7 +518,14 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
                         continue;
                     }
 
-                    dispatch_task(msg, Arc::clone(&idx), &tokio_semaphore, &rayon_semaphore).await;
+                    dispatch_task(
+                        msg,
+                        Arc::clone(&idx),
+                        Arc::clone(&primary_key_columns),
+                        &tokio_semaphore,
+                        &rayon_semaphore,
+                    )
+                    .await;
                 }
 
                 idx.write().await.stop();
@@ -508,6 +554,7 @@ fn get_index_concurrency(
 async fn dispatch_task(
     msg: Index,
     idx: Arc<TokioRwLock<IndexState<impl UsearchIndex + Send + Sync + 'static>>>,
+    primary_key_columns: Arc<Vec<ColumnName>>,
     tokio_semaphore: &Arc<Semaphore>,
     rayon_semaphore: &Arc<Semaphore>,
 ) {
@@ -522,14 +569,14 @@ async fn dispatch_task(
         let permit = Arc::clone(tokio_semaphore).acquire_owned().await.unwrap();
         tokio::spawn(async move {
             crate::move_to_the_end_of_async_runtime_queue().await;
-            process(msg, &lock);
+            process(msg, &lock, &primary_key_columns);
             drop(permit);
             drop(lock);
         });
     } else {
         let permit = Arc::clone(rayon_semaphore).acquire_owned().await.unwrap();
         rayon::spawn(move || {
-            process(msg, &lock);
+            process(msg, &lock, &primary_key_columns);
             drop(permit);
             drop(lock);
         });
@@ -540,7 +587,11 @@ fn should_run_on_tokio(msg: &Index) -> bool {
     matches!(msg, Index::Ann { .. } | Index::Count { .. })
 }
 
-fn process<I: UsearchIndex + Send + Sync + 'static>(msg: Index, index: &IndexState<I>) {
+fn process<I: UsearchIndex + Send + Sync + 'static>(
+    msg: Index,
+    index: &IndexState<I>,
+    primary_key_columns: &[ColumnName],
+) {
     match msg {
         Index::AddOrReplace {
             primary_key,
@@ -566,17 +617,27 @@ fn process<I: UsearchIndex + Send + Sync + 'static>(msg: Index, index: &IndexSta
             limit,
             tx,
         } => {
-            ann(
-                Arc::clone(&index.idx),
-                tx,
-                &index.keys,
-                embedding,
-                index.dimensions,
-                limit,
-            );
+            if let Some(tx) = validate_dimensions(tx, &embedding, index.dimensions) {
+                ann(Arc::clone(&index.idx), tx, &index.keys, embedding, limit);
+            }
         }
-        Index::FilteredAnn { tx, .. } => {
-            filtered_ann(tx);
+        Index::FilteredAnn {
+            embedding,
+            limit,
+            filter,
+            tx,
+        } => {
+            if let Some(tx) = validate_dimensions(tx, &embedding, index.dimensions) {
+                filtered_ann(
+                    Arc::clone(&index.idx),
+                    tx,
+                    &index.keys,
+                    primary_key_columns,
+                    embedding,
+                    filter,
+                    limit,
+                );
+            }
         }
         Index::Count { tx } => {
             count(Arc::clone(&index.idx), tx);
@@ -682,20 +743,28 @@ fn remove(
     };
 }
 
+fn validate_dimensions(
+    tx_ann: oneshot::Sender<AnnR>,
+    embedding: &Vector,
+    dimensions: Dimensions,
+) -> Option<oneshot::Sender<AnnR>> {
+    if let Err(err) = validator::embedding_dimensions(embedding, dimensions) {
+        tx_ann
+            .send(Err(err))
+            .unwrap_or_else(|_| trace!("validate_dimensions: unable to send response"));
+        None
+    } else {
+        Some(tx_ann)
+    }
+}
+
 fn ann(
     idx: Arc<impl UsearchIndex>,
     tx_ann: oneshot::Sender<AnnR>,
     keys: &RwLock<BiMap<PrimaryKey, Key>>,
     embedding: Vector,
-    dimensions: Dimensions,
     limit: Limit,
 ) {
-    if let Err(err) = validator::embedding_dimensions(&embedding, dimensions) {
-        return tx_ann
-            .send(Err(err))
-            .unwrap_or_else(|_| trace!("ann: unable to send response"));
-    }
-
     tx_ann
         .send(
             idx.search(&embedding, limit)
@@ -717,8 +786,83 @@ fn ann(
         .unwrap_or_else(|_| trace!("ann: unable to send response"));
 }
 
-fn filtered_ann(tx_ann: oneshot::Sender<AnnR>) {
-    _ = tx_ann.send(Err(anyhow!("Filtering not supported")));
+fn filtered_ann(
+    idx: Arc<impl UsearchIndex>,
+    tx_ann: oneshot::Sender<AnnR>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
+    primary_key_columns: &[ColumnName],
+    embedding: Vector,
+    filter: Filter,
+    limit: Limit,
+) {
+    fn annotate<F>(f: F) -> F
+    where
+        F: for<'a, 'b> Fn(&'a PrimaryKey, &'b ColumnName) -> Option<&'a CqlValue>,
+    {
+        f
+    }
+
+    let primary_key_value = annotate(
+        |primary_key: &PrimaryKey, name: &ColumnName| -> Option<&CqlValue> {
+            primary_key_columns
+                .iter()
+                .position(|key_column| key_column == name)
+                .and_then(move |idx| primary_key.0.get(idx))
+        },
+    );
+
+    let id_ok = |key: Key| {
+        let Some(primary_key) = keys.read().unwrap().get_by_right(&key).cloned() else {
+            return false;
+        };
+        filter
+            .restrictions
+            .iter()
+            .all(|restriction| match restriction {
+                Restriction::Eq { lhs, rhs } => primary_key_value(&primary_key, lhs) == Some(rhs),
+                Restriction::In { lhs, rhs } => {
+                    let value = primary_key_value(&primary_key, lhs);
+                    rhs.iter().any(|rhs| value == Some(rhs))
+                }
+                Restriction::EqTuple { lhs, rhs } => lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .all(|(lhs, rhs)| primary_key_value(&primary_key, lhs) == Some(rhs)),
+                Restriction::InTuple { lhs, rhs } => {
+                    let values: Vec<_> = lhs
+                        .iter()
+                        .map(|lhs| primary_key_value(&primary_key, lhs))
+                        .collect();
+                    rhs.iter().any(|rhs| {
+                        values
+                            .iter()
+                            .zip(rhs.iter())
+                            .all(|(value, rhs)| value == &Some(rhs))
+                    })
+                }
+                _ => false,
+            })
+    };
+
+    tx_ann
+        .send(
+            idx.filtered_search(&embedding, limit, id_ok)
+                .map_err(|err| anyhow!("ann: search failed: {err}"))
+                .and_then(|matches| {
+                    let keys = keys.read().unwrap();
+                    let (primary_keys, distances) = itertools::process_results(
+                        matches.map(|(key, distance)| {
+                            keys.get_by_right(&key)
+                                .cloned()
+                                .ok_or(anyhow!("not defined primary key column {key}"))
+                                .map(|primary_key| (primary_key, distance))
+                        }),
+                        |it| it.unzip(),
+                    )?;
+                    Ok((primary_keys, distances))
+                }),
+        )
+        .unwrap_or_else(|_| trace!("ann: unable to send response"));
 }
 
 fn count(idx: Arc<impl UsearchIndex>, tx: oneshot::Sender<CountR>) {
@@ -832,6 +976,7 @@ mod tests {
                     expansion_search: ExpansionSearch::default(),
                     space_type: SpaceType::Euclidean,
                 },
+                Arc::new(vec![]),
                 memory::new(config_rx),
             )
             .unwrap();
@@ -956,6 +1101,7 @@ mod tests {
                     expansion_search: ExpansionSearch::default(),
                     space_type: SpaceType::Euclidean,
                 },
+                Arc::new(vec![]),
                 memory_tx,
             )
             .unwrap();
@@ -1013,6 +1159,7 @@ mod tests {
                     expansion_search: ExpansionSearch::default(),
                     space_type: SpaceType::Euclidean,
                 },
+                Arc::new(vec![]),
                 memory::new(config_rx),
             )
             .unwrap();

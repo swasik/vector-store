@@ -10,6 +10,7 @@ use crate::Metrics;
 use crate::db::Db;
 use crate::db::DbExt;
 use crate::db_index::DbIndex;
+use crate::db_index::DbIndexExt;
 use crate::factory::IndexFactory;
 use crate::index::Index;
 use crate::index::factory::IndexConfiguration;
@@ -174,6 +175,16 @@ async fn add_index(
         return;
     }
 
+    let (db_index, embeddings_stream) = match db.get_db_index(metadata.clone()).await {
+        Ok((db_index, embeddings_stream)) => (db_index, embeddings_stream),
+        Err(err) => {
+            debug!("unable to create a db monitoring task for an index {id}: {err}");
+            tx.send(Err(err))
+                .unwrap_or_else(|_| trace!("add_index: unable to send response"));
+            return;
+        }
+    };
+
     let index_actor = match index_factory.create_index(
         IndexConfiguration {
             id: id.clone(),
@@ -183,21 +194,12 @@ async fn add_index(
             expansion_search: metadata.expansion_search,
             space_type: metadata.space_type,
         },
+        db_index.get_primary_key_columns().await,
         memory,
     ) {
         Ok(actor) => actor,
         Err(err) => {
             debug!("unable to create an index {id}: {err}");
-            tx.send(Err(err))
-                .unwrap_or_else(|_| trace!("add_index: unable to send response"));
-            return;
-        }
-    };
-
-    let (db_index, embeddings_stream) = match db.get_db_index(metadata.clone()).await {
-        Ok((db_index, embeddings_stream)) => (db_index, embeddings_stream),
-        Err(err) => {
-            debug!("unable to create a db monitoring task for an index {id}: {err}");
             tx.send(Err(err))
                 .unwrap_or_else(|_| trace!("add_index: unable to send response"));
             return;
