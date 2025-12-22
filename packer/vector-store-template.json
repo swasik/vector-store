@@ -6,7 +6,7 @@
       "ami_name": "{{ user `vector_image_name` }}",
       "source_ami": "{{ user (printf \"aws_source_ami_%s\" (user \"arch\")) }}",
       "instance_type": "{{user (printf \"aws_instance_type_%s\" (user \"arch\")) }}",
-      "ami_regions": "us-west-2,eu-west-2,eu-west-1,eu-central-1,eu-north-1",
+      "ami_regions": "{{user `aws_regions`}}",
       "user_data_file": "files/user_data.txt",
       "subnet_filter": {
         "filters": {
@@ -126,6 +126,7 @@
 
     "arch": "amd64",
     "aws_region": "us-east-1",
+    "aws_regions": "us-west-2,eu-west-2,eu-west-1,eu-central-1,eu-north-1",
     "aws_source_ami_amd64": "ami-02a35bd020554f400",
     "aws_instance_type_amd64": "c4.xlarge",
     "aws_source_ami_arm64": "ami-026fccd88446aa0bf",
