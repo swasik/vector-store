@@ -125,6 +125,7 @@
     "vector_image_name": "vector-store-{{ user `vector_version` | replace_all \".\" \"-\" }}-{{ user `arch` }}-{{ isotime \"2006-01-02t03-04-05z\" }}",
 
     "arch": "amd64",
+    "swap_size": "0",
     "aws_region": "us-east-1",
     "aws_regions": "us-west-2,eu-west-2,eu-west-1,eu-central-1,eu-north-1",
     "aws_source_ami_amd64": "ami-02a35bd020554f400",
@@ -133,7 +134,7 @@
     "aws_instance_type_arm64": "c7g.xlarge",
 
     "aws_ssh_username": "ubuntu",
-    "aws_install_args": "--cloud aws --verbose --version {{ user `vector_version` }} --arch {{ user `arch` }}",
+    "aws_install_args": "--cloud aws --verbose --version {{ user `vector_version` }} --arch {{ user `arch` }} --swap-size {{ user `swap_size` }}",
 
     "gcp_project_id": "scylla-images",
     "gcp_zone": "europe-west1-b",
@@ -145,6 +146,6 @@
     "gcp_source_image_family_arm64": "ubuntu-minimal-2204-lts-arm64",
     "gcp_instance_type_arm64": "t2a-standard-2",
     "gcp_ssh_username": "ubuntu",
-    "gcp_install_args": "--cloud gce --verbose --version {{ user `vector_version` }} --arch {{ user `arch` }}"
+    "gcp_install_args": "--cloud gce --verbose --version {{ user `vector_version` }} --arch {{ user `arch` }} --swap-size {{ user `swap_size` }}"
   }
 }
