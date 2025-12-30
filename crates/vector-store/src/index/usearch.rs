@@ -30,6 +30,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::Semaphore;
@@ -69,8 +70,9 @@ impl IndexFactory for UsearchIndexFactory {
                     quantization: ScalarKind::F32,
                     ..Default::default()
                 };
-
-                let idx = Arc::new(usearch::Index::new(&options)?);
+                let threads =
+                    Handle::current().metrics().num_workers() + rayon::current_num_threads();
+                let idx = Arc::new(ThreadedUsearchIndex::new(options, threads)?);
                 new(
                     idx,
                     index.id,
@@ -142,25 +144,41 @@ trait UsearchIndex {
     fn stop(&self);
 }
 
-impl UsearchIndex for usearch::Index {
+struct ThreadedUsearchIndex {
+    inner: usearch::Index,
+    threads: usize,
+}
+
+impl ThreadedUsearchIndex {
+    fn new(options: IndexOptions, threads: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: usearch::Index::new(&options)?,
+            threads,
+        })
+    }
+}
+
+impl UsearchIndex for ThreadedUsearchIndex {
     fn reserve(&self, size: usize) -> anyhow::Result<()> {
-        Ok(self.reserve(size)?)
+        Ok(self
+            .inner
+            .reserve_capacity_and_threads(size, self.threads)?)
     }
 
     fn capacity(&self) -> usize {
-        self.capacity()
+        self.inner.capacity()
     }
 
     fn size(&self) -> usize {
-        self.size()
+        self.inner.size()
     }
 
     fn add(&self, key: Key, vector: &Vector) -> anyhow::Result<()> {
-        Ok(self.add(key.0, &vector.0)?)
+        Ok(self.inner.add(key.0, &vector.0)?)
     }
 
     fn remove(&self, key: Key) -> anyhow::Result<()> {
-        Ok(self.remove(key.0).map(|_| ())?)
+        Ok(self.inner.remove(key.0).map(|_| ())?)
     }
 
     fn search(
@@ -168,7 +186,7 @@ impl UsearchIndex for usearch::Index {
         vector: &Vector,
         limit: Limit,
     ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>> {
-        let matches = self.search(&vector.0, limit.0.get())?;
+        let matches = self.inner.search(&vector.0, limit.0.get())?;
         Ok(matches
             .keys
             .into_iter()
@@ -699,9 +717,57 @@ mod tests {
     use scylla::value::CqlValue;
     use std::num::NonZeroUsize;
     use std::time::Duration;
+    use tokio::runtime::Handle;
     use tokio::sync::watch;
     use tokio::task;
     use tokio::time;
+
+    fn add_concurrently(
+        index: mpsc::Sender<Index>,
+        threads: usize,
+        adds_per_worker: usize,
+        dimensions: NonZeroUsize,
+    ) -> Vec<task::JoinHandle<()>> {
+        let mut add_handles = Vec::new();
+        for worker in 0..threads {
+            let actor = index.clone();
+            add_handles.push(tokio::spawn(async move {
+                for offset in 0..adds_per_worker {
+                    let id = worker * adds_per_worker + offset;
+                    actor
+                        .add_or_replace(
+                            vec![CqlValue::Int(id as i32)].into(),
+                            vec![0.0f32; dimensions.get()].into(),
+                            None,
+                        )
+                        .await;
+                }
+            }));
+        }
+        add_handles
+    }
+
+    fn search_concurrently(
+        index: mpsc::Sender<Index>,
+        threads: usize,
+        searches_per_worker: usize,
+        dimensions: NonZeroUsize,
+    ) -> Vec<task::JoinHandle<()>> {
+        let mut search_handles = Vec::new();
+        for _ in 0..threads {
+            let actor = index.clone();
+            search_handles.push(tokio::spawn(async move {
+                for _ in 0..searches_per_worker {
+                    let limit = NonZeroUsize::new(5).unwrap().into();
+                    let _ = actor
+                        .ann(vec![0.0f32; dimensions.get()].into(), limit)
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        search_handles
+    }
 
     #[tokio::test]
     async fn add_or_replace_size_ann() {
@@ -873,6 +939,56 @@ mod tests {
         // Wait for the add operation to complete, as it runs in a separate task.
         time::timeout(Duration::from_secs(10), async {
             while actor.count().await.unwrap() != 1 {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ntest::timeout(10_000)]
+    async fn concurrent_add_and_search() {
+        // By default, Usearch limits concurrent operations (searches, adds) to the number of CPU cores.
+        // Exceeding this limit results in a "No available threads to lock" error.
+        // This test verifies our concurrency control by spawning a high number of parallel adds and searches (2 x num of cores).
+        let (_, config_rx) = watch::channel(Arc::new(Config::default()));
+        let dimensions = NonZeroUsize::new(1024).unwrap();
+        let factory = UsearchIndexFactory {
+            tokio_semaphore: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            rayon_semaphore: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            mode: Mode::Usearch,
+        };
+        let index = factory
+            .create_index(
+                IndexConfiguration {
+                    id: IndexId::new(&"vector".to_string().into(), &"store".to_string().into()),
+                    dimensions: dimensions.into(),
+                    connectivity: Connectivity::default(),
+                    expansion_add: ExpansionAdd::default(),
+                    expansion_search: ExpansionSearch::default(),
+                    space_type: SpaceType::Euclidean,
+                },
+                memory::new(config_rx),
+            )
+            .unwrap();
+        let threads = Handle::current().metrics().num_workers();
+
+        let adds_per_worker = 50;
+        let add_handles = add_concurrently(index.clone(), threads, adds_per_worker, dimensions);
+        let search_handles =
+            search_concurrently(index.clone(), threads, adds_per_worker, dimensions);
+
+        for handle in add_handles {
+            handle.await.unwrap();
+        }
+        for handle in search_handles {
+            handle.await.unwrap();
+        }
+
+        // Wait for expected number of vectors to be added.
+        time::timeout(Duration::from_secs(10), async {
+            while index.count().await.unwrap() != threads * adds_per_worker {
                 task::yield_now().await;
             }
         })
