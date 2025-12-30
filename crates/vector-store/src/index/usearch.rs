@@ -31,9 +31,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::runtime::Handle;
+use tokio::sync::AcquireError;
 use tokio::sync::Notify;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::RwLock as TokioRwLock;
-use tokio::sync::Semaphore;
+use tokio::sync::Semaphore as TokioSemaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -46,6 +48,30 @@ use tracing::trace;
 use usearch::IndexOptions;
 use usearch::MetricKind;
 use usearch::ScalarKind;
+
+pub struct Semaphore {
+    inner: Arc<TokioSemaphore>,
+    permits: usize,
+}
+
+impl Semaphore {
+    pub const MAX_PERMITS: usize = TokioSemaphore::MAX_PERMITS;
+
+    pub fn new(permits: usize) -> Self {
+        Self {
+            inner: Arc::new(TokioSemaphore::new(permits)),
+            permits,
+        }
+    }
+
+    pub fn permits(&self) -> usize {
+        self.permits
+    }
+
+    pub async fn acquire_owned(self: Arc<Self>) -> Result<OwnedSemaphorePermit, AcquireError> {
+        self.inner.clone().acquire_owned().await
+    }
+}
 
 pub struct UsearchIndexFactory {
     tokio_semaphore: Arc<Semaphore>,
@@ -441,11 +467,10 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
             let id = id.clone();
             async move {
                 debug!("starting");
-
-                let idx = Arc::new(TokioRwLock::new(IndexState::new(
-                    Arc::clone(&idx),
-                    dimensions,
-                )));
+                let idx = Arc::new(TokioRwLock::with_max_readers(
+                    IndexState::new(Arc::clone(&idx), dimensions),
+                    get_index_concurrency(&tokio_semaphore, &rayon_semaphore),
+                ));
 
                 let mut allocate_prev = Allocate::Can;
 
@@ -466,6 +491,18 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
     );
 
     Ok(tx)
+}
+
+fn get_index_concurrency(
+    tokio_semaphore: &Arc<Semaphore>,
+    rayon_semaphore: &Arc<Semaphore>,
+) -> u32 {
+    // The maximum number of concurrent readers for `tokio::sync::RwLock`.
+    const MAX_INDEX_CONCURRENCY: u32 = u32::MAX >> 3;
+    // The concurrency for a single index is limited by the maximum of the global
+    // add/remove and search concurrency limits. This prevents a single, busy index
+    // from exhausting both the global add/remove and search concurrency pools.
+    (rayon_semaphore.permits().max(tokio_semaphore.permits()) as u32).min(MAX_INDEX_CONCURRENCY)
 }
 
 async fn dispatch_task(
@@ -994,5 +1031,24 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_index_concurrency() {
+        let tokio_semaphore = Arc::new(Semaphore::new(8));
+        let rayon_semaphore = Arc::new(Semaphore::new(4));
+        assert_eq!(get_index_concurrency(&tokio_semaphore, &rayon_semaphore), 8);
+
+        let tokio_semaphore = Arc::new(Semaphore::new(2));
+        let rayon_semaphore = Arc::new(Semaphore::new(4));
+        assert_eq!(get_index_concurrency(&tokio_semaphore, &rayon_semaphore), 4);
+
+        let tokio_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
+        let rayon_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
+        // Verify that `get_index_concurrency` does not exceed the maximum number of readers allowed by `TokioRwLock`.
+        TokioRwLock::with_max_readers(
+            (),
+            get_index_concurrency(&tokio_semaphore, &rayon_semaphore),
+        );
     }
 }
