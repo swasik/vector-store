@@ -31,16 +31,19 @@ async fn test_secondary_uri_works_correctly(actors: TestActors) {
             db_ip: actors.services_subnet.ip(DB_OCTET_1),
             primary_vs_uris: vec![vs_url.clone()],
             secondary_vs_uris: vec![],
+            args: default_scylla_args(),
         },
         ScyllaNodeConfig {
             db_ip: actors.services_subnet.ip(DB_OCTET_2),
             primary_vs_uris: vec![],
             secondary_vs_uris: vec![vs_url.clone()],
+            args: default_scylla_args(),
         },
         ScyllaNodeConfig {
             db_ip: actors.services_subnet.ip(DB_OCTET_3),
             primary_vs_uris: vec![],
             secondary_vs_uris: vec![vs_url.clone()],
+            args: default_scylla_args(),
         },
     ];
     let vs_configs = vec![VectorStoreNodeConfig {

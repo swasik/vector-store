@@ -5,8 +5,54 @@
 
 use async_backtrace::framed;
 use std::net::Ipv4Addr;
+use std::sync::LazyLock;
+use std::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+
+static DEFAULT_SCYLLA_ARGS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| {
+    RwLock::new(
+        [
+            "--overprovisioned",
+            "--developer-mode=true",
+            "--smp=2",
+            "--memory=1G",
+            "--unsafe-bypass-fsync=on",
+            "--kernel-page-cache=on",
+            "--reactor-backend=io_uring",
+            "--rf-rack-valid-keyspaces=true",
+            "--collectd=0",
+            "--max-networking-io-control-blocks=1000",
+            "--commitlog-use-o-dsync=0",
+            "--flush-schema-tables-after-modification=false",
+            "--auto-snapshot=0",
+            "--logger-log-level=compaction=warn",
+            "--logger-log-level=migration_manager=warn",
+            "--shutdown-announce-in-ms=0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+    )
+});
+
+/// Returns the default ScyllaDB arguments used when starting a scylla instance
+pub fn default_scylla_args() -> Vec<String> {
+    DEFAULT_SCYLLA_ARGS
+        .read()
+        .expect("failed to acquire read lock on DEFAULT_SCYLLA_ARGS")
+        .clone()
+}
+
+/// Sets the default ScyllaDB arguments used when starting a scylla instance. It changes
+/// the default arguments for all validator's tests. It is needed to be able to customize
+/// default arguments for all tests from scylladb.git repository without touching code
+/// in the vector-store.git.
+pub fn set_default_scylla_args(args: Vec<String>) {
+    *DEFAULT_SCYLLA_ARGS
+        .write()
+        .expect("failed to acquire write lock on DEFAULT_SCYLLA_ARGS") = args;
+}
 
 /// Configuration for a single ScyllaDB node in the test cluster.
 #[derive(Clone)]
@@ -17,6 +63,8 @@ pub struct ScyllaNodeConfig {
     pub primary_vs_uris: Vec<String>,
     /// Secondary Vector Store URIs (--vector-store-secondary-uri).
     pub secondary_vs_uris: Vec<String>,
+    /// Additional args to pass to the ScyllaDB process.
+    pub args: Vec<String>,
 }
 
 pub enum ScyllaCluster {

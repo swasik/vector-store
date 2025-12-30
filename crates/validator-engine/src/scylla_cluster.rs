@@ -211,8 +211,7 @@ async fn run_node(
 
     let db_ip = node_config.db_ip;
 
-    cmd.arg("--overprovisioned")
-        .arg("--options-file")
+    cmd.arg("--options-file")
         .arg(&conf)
         .arg("--workdir")
         .arg(path)
@@ -222,18 +221,13 @@ async fn run_node(
         .arg(db_ip.to_string())
         .arg("--api-address")
         .arg(db_ip.to_string())
-        .arg("--developer-mode")
-        .arg("true")
-        .arg("--smp")
-        .arg("2")
         .arg("--log-to-stdout")
         .arg("true")
         .arg("--logger-ostream-type")
         .arg("stdout")
-        .arg("--rf-rack-valid-keyspaces")
-        .arg("true")
         .arg("--endpoint-snitch")
         .arg("GossipingPropertyFileSnitch")
+        .args(node_config.args.clone())
         .spawn()
         .expect("start: failed to spawn scylladb")
 }
