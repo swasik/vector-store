@@ -558,10 +558,22 @@ async fn dispatch_task(
     tokio_semaphore: &Arc<Semaphore>,
     rayon_semaphore: &Arc<Semaphore>,
 ) {
-    if let Index::AddOrReplace { .. } = &msg
+    if let Index::Add { .. } = &msg
         && let Err(err) = reserve(Arc::clone(rayon_semaphore), Arc::clone(&idx)).await
     {
         error!("unable to reserve space for index: {err}");
+        return;
+    }
+    if let Index::Remove {
+        primary_key,
+        in_progress: _in_progress,
+    } = &msg
+    {
+        // Remove (like reserve) is not safe to run concurrently with other operations.
+        // Therefore, we perform it upfront with an exclusive write lock.
+        // See: https://github.com/unum-cloud/USearch/issues/697.
+        let lock = idx.write().await;
+        remove(Arc::clone(&lock.idx), &lock.keys, primary_key.clone()).await;
         return;
     }
     let lock = idx.read_owned().await;
@@ -593,24 +605,18 @@ fn process<I: UsearchIndex + Send + Sync + 'static>(
     primary_key_columns: &[ColumnName],
 ) {
     match msg {
-        Index::AddOrReplace {
+        Index::Add {
             primary_key,
             embedding,
             in_progress: _in_progress,
         } => {
-            add_or_replace(
+            add(
                 Arc::clone(&index.idx),
                 &index.keys,
                 &index.usearch_key,
                 primary_key,
                 embedding,
             );
-        }
-        Index::Remove {
-            primary_key,
-            in_progress: _in_progress,
-        } => {
-            remove(Arc::clone(&index.idx), &index.keys, primary_key);
         }
         Index::Ann {
             embedding,
@@ -641,6 +647,9 @@ fn process<I: UsearchIndex + Send + Sync + 'static>(
         }
         Index::Count { tx } => {
             count(Arc::clone(&index.idx), tx);
+        }
+        _ => {
+            unreachable!();
         }
     }
 }
@@ -691,7 +700,7 @@ fn needs_more_capacity(idx: &Arc<impl UsearchIndex>) -> Option<usize> {
     }
 }
 
-fn add_or_replace(
+fn add(
     idx: Arc<impl UsearchIndex>,
     keys: &RwLock<BiMap<PrimaryKey, Key>>,
     usearch_key: &AtomicU64,
@@ -699,37 +708,14 @@ fn add_or_replace(
     embedding: Vector,
 ) {
     let key = usearch_key.fetch_add(1, Ordering::Relaxed).into();
-
-    let (key, remove) = if keys
-        .write()
-        .unwrap()
-        .insert_no_overwrite(primary_key.clone(), key)
-        .is_ok()
-    {
-        (key, false)
-    } else {
-        usearch_key.fetch_sub(1, Ordering::Relaxed);
-        (
-            *keys.read().unwrap().get_by_left(&primary_key).unwrap(),
-            true,
-        )
-    };
-
-    let remove_key_from_bimap = |key: &Key| {
-        keys.write().unwrap().remove_by_right(key);
-    };
-
-    if remove && let Err(err) = idx.remove(key) {
-        debug!("add_or_replace: unable to remove embedding for key {key}: {err}");
-        return;
-    }
     if let Err(err) = idx.add(key, &embedding) {
-        debug!("add_or_replace: unable to add embedding for key {key}: {err}");
-        remove_key_from_bimap(&key);
+        debug!("add: unable to add embedding for key {key}: {err}");
+        return;
     };
+    let _ = keys.write().unwrap().insert(primary_key.clone(), key);
 }
 
-fn remove(
+async fn remove(
     idx: Arc<impl UsearchIndex>,
     keys: &RwLock<BiMap<PrimaryKey, Key>>,
     primary_key: PrimaryKey,
@@ -876,7 +862,7 @@ async fn check_memory_allocation(
     allocate_prev: &mut Allocate,
     id: &IndexId,
 ) -> bool {
-    if !matches!(msg, Index::AddOrReplace { .. }) {
+    if !matches!(msg, Index::Add { .. }) {
         return true;
     }
 
@@ -923,7 +909,7 @@ mod tests {
                 for offset in 0..adds_per_worker {
                     let id = worker * adds_per_worker + offset;
                     actor
-                        .add_or_replace(
+                        .add(
                             vec![CqlValue::Int(id as i32)].into(),
                             vec![0.0f32; dimensions.get()].into(),
                             None,
@@ -982,21 +968,21 @@ mod tests {
             .unwrap();
 
         actor
-            .add_or_replace(
+            .add(
                 vec![CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
                 vec![1., 1., 1.].into(),
                 None,
             )
             .await;
         actor
-            .add_or_replace(
+            .add(
                 vec![CqlValue::Int(2), CqlValue::Text("two".to_string())].into(),
                 vec![2., -2., 2.].into(),
                 None,
             )
             .await;
         actor
-            .add_or_replace(
+            .add(
                 vec![CqlValue::Int(3), CqlValue::Text("three".to_string())].into(),
                 vec![3., 3., 3.].into(),
                 None,
@@ -1026,7 +1012,13 @@ mod tests {
         );
 
         actor
-            .add_or_replace(
+            .remove(
+                vec![CqlValue::Int(3), CqlValue::Text("three".to_string())].into(),
+                None,
+            )
+            .await;
+        actor
+            .add(
                 vec![CqlValue::Int(3), CqlValue::Text("three".to_string())].into(),
                 vec![2.1, -2.1, 2.1].into(),
                 None,
@@ -1112,7 +1104,7 @@ mod tests {
             memory_rx
         });
         actor
-            .add_or_replace(vec![CqlValue::Int(1)].into(), vec![1., 1., 1.].into(), None)
+            .add(vec![CqlValue::Int(1)].into(), vec![1., 1., 1.].into(), None)
             .await;
         let mut memory_rx = memory_respond.await.unwrap();
         assert_eq!(actor.count().await.unwrap(), 0);
@@ -1122,7 +1114,7 @@ mod tests {
             _ = tx.send(Allocate::Can);
         });
         actor
-            .add_or_replace(vec![CqlValue::Int(1)].into(), vec![1., 1., 1.].into(), None)
+            .add(vec![CqlValue::Int(1)].into(), vec![1., 1., 1.].into(), None)
             .await;
         memory_respond.await.unwrap();
 

@@ -298,7 +298,7 @@ async fn process(
     client: Arc<OpenSearch>,
 ) {
     match msg {
-        Index::AddOrReplace {
+        Index::Add {
             primary_key,
             embedding,
             in_progress: _in_progress,

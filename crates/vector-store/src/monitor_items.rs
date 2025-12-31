@@ -67,11 +67,13 @@ async fn add(
     id: &IndexId,
 ) {
     let mut modify = true;
+    let mut remove_before_add = false;
     timestamps
         .entry(embedding.primary_key.clone())
         .and_modify(|timestamp| {
             if timestamp.0 < embedding.timestamp.0 {
                 *timestamp = embedding.timestamp;
+                remove_before_add = true;
             } else {
                 modify = false;
             }
@@ -88,9 +90,10 @@ async fn add(
                     "update",
                 ])
                 .inc();
-            index
-                .add_or_replace(primary_key, embedding, in_progress)
-                .await;
+            if remove_before_add {
+                index.remove(primary_key.clone(), None).await;
+            }
+            index.add(primary_key, embedding, in_progress).await;
         } else {
             metrics
                 .modified
@@ -212,7 +215,7 @@ mod tests {
             .await
             .unwrap();
 
-        let Some(Index::AddOrReplace {
+        let Some(Index::Add {
             primary_key,
             embedding,
             in_progress: None,
@@ -223,7 +226,7 @@ mod tests {
         assert_eq!(primary_key, vec![CqlValue::Int(1)].into());
         assert_eq!(embedding, vec![1.].into());
 
-        let Some(Index::AddOrReplace {
+        let Some(Index::Add {
             primary_key,
             embedding,
             in_progress: None,
@@ -234,7 +237,16 @@ mod tests {
         assert_eq!(primary_key, vec![CqlValue::Int(2)].into());
         assert_eq!(embedding, vec![2.].into());
 
-        let Some(Index::AddOrReplace {
+        // The entry is already present, so it's removed first.
+        let Some(Index::Remove {
+            primary_key,
+            in_progress: None,
+        }) = rx_index.recv().await
+        else {
+            unreachable!();
+        };
+        assert_eq!(primary_key, vec![CqlValue::Int(2)].into());
+        let Some(Index::Add {
             primary_key,
             embedding,
             in_progress: None,
@@ -254,7 +266,16 @@ mod tests {
         };
         assert_eq!(primary_key, vec![CqlValue::Int(1)].into());
 
-        let Some(Index::AddOrReplace {
+        // The entry is already present, so it's removed first.
+        let Some(Index::Remove {
+            primary_key,
+            in_progress: None,
+        }) = rx_index.recv().await
+        else {
+            unreachable!();
+        };
+        assert_eq!(primary_key, vec![CqlValue::Int(1)].into());
+        let Some(Index::Add {
             primary_key,
             embedding,
             in_progress: None,
