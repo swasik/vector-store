@@ -53,6 +53,9 @@ pub(crate) async fn new(
                 process(msg, &mut state).await;
             }
 
+            info!("Final shutting down the scylla cluster...");
+            stop(&mut state).await;
+
             debug!("finished");
         })
         .instrument(debug_span!("db")),

@@ -19,8 +19,12 @@ use std::panic;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 use tokio::runtime::Builder;
+use tokio::runtime::Handle;
+use tokio::task;
+use tokio::time;
 use tracing::error;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
@@ -318,7 +322,7 @@ pub fn run() -> Result<(), &'static str> {
 
             let filter_map = parse_test_filters(&filters, &test_cases);
 
-            vector_search_validator_tests::run(
+            let result = vector_search_validator_tests::run(
                 TestActors {
                     services_subnet,
                     dns,
@@ -330,7 +334,24 @@ pub fn run() -> Result<(), &'static str> {
             )
             .await
             .then_some(())
-            .ok_or("Some vector-search-validator tests failed")
+            .ok_or("Some vector-search-validator tests failed");
+
+            info!("Waiting for all tasks to finish...");
+            const FINISH_TASKS_TIMEOUT: Duration = Duration::from_secs(10);
+            if time::timeout(FINISH_TASKS_TIMEOUT, async {
+                while Handle::current().metrics().num_alive_tasks() > 0 {
+                    task::yield_now().await;
+                }
+            })
+            .await
+            .is_err()
+            {
+                error!("Timed out waiting for tasks to finish");
+            } else {
+                info!("All tasks finished");
+            }
+
+            result
         }))
 }
 
