@@ -10,6 +10,11 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use tempfile::TempDir;
+use tempfile::tempdir;
+use tempfile::tempdir_in;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -27,6 +32,7 @@ pub(crate) async fn new(
     path: PathBuf,
     verbose: bool,
     disable_colors: bool,
+    tmpdir: PathBuf,
 ) -> mpsc::Sender<VectorStoreCluster> {
     let (tx, mut rx) = mpsc::channel(10);
 
@@ -35,7 +41,7 @@ pub(crate) async fn new(
         "vector-store executable '{path:?}' does not exist"
     );
 
-    let mut state = State::new(path, verbose, disable_colors).await;
+    let mut state = State::new(path, verbose, disable_colors, tmpdir).await;
 
     tokio::spawn(
         frame!(async move {
@@ -60,6 +66,7 @@ struct NodeState {
     vs_ip: Ipv4Addr,
     child: Option<Child>,
     client: Option<HttpClient>,
+    _workdir: Option<TempDir>,
 }
 
 struct State {
@@ -68,11 +75,12 @@ struct State {
     version: String,
     verbose: bool,
     disable_colors: bool,
+    tmpdir: PathBuf,
 }
 
 impl State {
     #[framed]
-    async fn new(path: PathBuf, verbose: bool, disable_colors: bool) -> Self {
+    async fn new(path: PathBuf, verbose: bool, disable_colors: bool, tmpdir: PathBuf) -> Self {
         let version = String::from_utf8_lossy(
             &Command::new(&path)
                 .arg("--version")
@@ -90,6 +98,7 @@ impl State {
             nodes: Vec::new(),
             verbose,
             disable_colors,
+            tmpdir,
         }
     }
 }
@@ -130,7 +139,7 @@ async fn process(msg: VectorStoreCluster, state: &mut State) {
 }
 
 #[framed]
-async fn run_node(node_config: &VectorStoreNodeConfig, state: &State) -> Child {
+async fn run_node(node_config: &VectorStoreNodeConfig, state: &State, workdir: &TempDir) -> Child {
     let mut cmd = Command::new(&state.path);
     if !state.verbose {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -146,6 +155,22 @@ async fn run_node(node_config: &VectorStoreNodeConfig, state: &State) -> Child {
             "VECTOR_STORE_DISABLE_COLORS",
             state.disable_colors.to_string(),
         );
+
+    if let Some(u) = node_config.user.as_deref()
+        && let Some(p) = node_config.password.as_deref()
+    {
+        File::create_new(workdir.path().join("password"))
+            .await
+            .expect("run_node: failed to create auth_credentials file")
+            .write_all(p.as_bytes())
+            .await
+            .expect("run_node: failed to write password to auth_credentials file");
+
+        cmd.env("VECTOR_STORE_SCYLLADB_USERNAME", u).env(
+            "VECTOR_STORE_SCYLLADB_PASSWORD_FILE",
+            workdir.path().join("password").to_str().unwrap(),
+        );
+    }
 
     for (k, v) in &node_config.envs {
         cmd.env(k, v);
@@ -171,13 +196,15 @@ async fn start(node_configs: Vec<VectorStoreNodeConfig>, state: &mut State) {
             node_config.db_ip
         );
 
-        let child = run_node(node_config, state).await;
+        let workdir = tempdir_in(&state.tmpdir).expect("start: failed to create temporary workdir");
+        let child = run_node(node_config, state, &workdir).await;
         let client = HttpClient::new(node_config.vs_addr());
 
         state.nodes.push(NodeState {
             vs_ip: node_config.vs_ip,
             child: Some(child),
             client: Some(client),
+            _workdir: Some(workdir),
         });
     }
 
@@ -199,13 +226,15 @@ async fn start_node(node_config: VectorStoreNodeConfig, state: &mut State) {
         .position(|n| n.vs_ip == node_config.vs_ip);
 
     if let Some(idx) = node_index {
-        let child = run_node(&node_config, state).await;
+        let workdir = tempdir().expect("start_node: failed to create temporary workdir");
+        let child = run_node(&node_config, state, &workdir).await;
         let client = HttpClient::new(node_config.vs_addr());
 
         state.nodes[idx] = NodeState {
             vs_ip: node_config.vs_ip,
             child: Some(child),
             client: Some(client),
+            _workdir: Some(workdir),
         };
     }
 }

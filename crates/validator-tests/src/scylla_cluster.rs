@@ -29,6 +29,7 @@ static DEFAULT_SCYLLA_ARGS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| {
             "--logger-log-level=compaction=warn",
             "--logger-log-level=migration_manager=warn",
             "--shutdown-announce-in-ms=0",
+            "--tablets-mode-for-new-keyspaces=enabled",
         ]
         .into_iter()
         .map(String::from)
@@ -65,6 +66,8 @@ pub struct ScyllaNodeConfig {
     pub secondary_vs_uris: Vec<String>,
     /// Additional args to pass to the ScyllaDB process.
     pub args: Vec<String>,
+    /// Optional config overrides for scylla.yaml.
+    pub config: Option<Vec<u8>>,
 }
 
 pub enum ScyllaCluster {
@@ -73,7 +76,6 @@ pub enum ScyllaCluster {
     },
     Start {
         node_configs: Vec<ScyllaNodeConfig>,
-        conf: Option<Vec<u8>>,
     },
     WaitForReady {
         tx: oneshot::Sender<bool>,
@@ -83,11 +85,9 @@ pub enum ScyllaCluster {
     },
     Up {
         node_configs: Vec<ScyllaNodeConfig>,
-        conf: Option<Vec<u8>>,
     },
     UpNode {
         node_config: ScyllaNodeConfig,
-        conf: Option<Vec<u8>>,
     },
     Down {
         tx: oneshot::Sender<()>,
@@ -106,11 +106,7 @@ pub trait ScyllaClusterExt {
     fn version(&self) -> impl Future<Output = String>;
 
     /// Starts the ScyllaDB cluster with the given node configurations.
-    fn start(
-        &self,
-        node_configs: Vec<ScyllaNodeConfig>,
-        conf: Option<Vec<u8>>,
-    ) -> impl Future<Output = ()>;
+    fn start(&self, node_configs: Vec<ScyllaNodeConfig>) -> impl Future<Output = ()>;
 
     /// Stops the ScyllaDB cluster.
     fn stop(&self) -> impl Future<Output = ()>;
@@ -119,21 +115,13 @@ pub trait ScyllaClusterExt {
     fn wait_for_ready(&self) -> impl Future<Output = bool>;
 
     /// Starts a paused cluster back again.
-    fn up(
-        &self,
-        node_configs: Vec<ScyllaNodeConfig>,
-        conf: Option<Vec<u8>>,
-    ) -> impl Future<Output = ()>;
+    fn up(&self, node_configs: Vec<ScyllaNodeConfig>) -> impl Future<Output = ()>;
 
     /// Pauses a cluster.
     fn down(&self) -> impl Future<Output = ()>;
 
     /// Starts a single paused ScyllaDB instance back again.
-    fn up_node(
-        &self,
-        node_config: ScyllaNodeConfig,
-        conf: Option<Vec<u8>>,
-    ) -> impl Future<Output = ()>;
+    fn up_node(&self, node_config: ScyllaNodeConfig) -> impl Future<Output = ()>;
 
     /// Pauses a single ScyllaDB instance.
     fn down_node(&self, db_ip: Ipv4Addr) -> impl Future<Output = ()>;
@@ -157,8 +145,8 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
     }
 
     #[framed]
-    async fn start(&self, node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>) {
-        self.send(ScyllaCluster::Start { node_configs, conf })
+    async fn start(&self, node_configs: Vec<ScyllaNodeConfig>) {
+        self.send(ScyllaCluster::Start { node_configs })
             .await
             .expect("ScyllaClusterExt::start: internal actor should receive request");
     }
@@ -184,15 +172,15 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
     }
 
     #[framed]
-    async fn up(&self, node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>) {
-        self.send(ScyllaCluster::Up { node_configs, conf })
+    async fn up(&self, node_configs: Vec<ScyllaNodeConfig>) {
+        self.send(ScyllaCluster::Up { node_configs })
             .await
             .expect("ScyllaClusterExt::up: internal actor should receive request")
     }
 
     #[framed]
-    async fn up_node(&self, node_config: ScyllaNodeConfig, conf: Option<Vec<u8>>) {
-        self.send(ScyllaCluster::UpNode { node_config, conf })
+    async fn up_node(&self, node_config: ScyllaNodeConfig) {
+        self.send(ScyllaCluster::UpNode { node_config })
             .await
             .expect("ScyllaClusterExt::up_node: internal actor should receive request")
     }
@@ -220,7 +208,7 @@ impl ScyllaClusterExt for mpsc::Sender<ScyllaCluster> {
     #[framed]
     async fn restart(&self, node_config: &ScyllaNodeConfig) {
         self.down_node(node_config.db_ip).await;
-        self.up_node(node_config.clone(), None).await;
+        self.up_node(node_config.clone()).await;
         assert!(self.wait_for_ready().await);
     }
 

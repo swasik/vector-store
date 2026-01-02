@@ -112,8 +112,8 @@ async fn process(msg: ScyllaCluster, state: &mut State) {
                 .expect("process ScyllaCluster::Version: failed to send a response");
         }
 
-        ScyllaCluster::Start { node_configs, conf } => {
-            start(node_configs, conf, state).await;
+        ScyllaCluster::Start { node_configs } => {
+            start(node_configs, state).await;
         }
 
         ScyllaCluster::Stop { tx } => {
@@ -127,12 +127,12 @@ async fn process(msg: ScyllaCluster, state: &mut State) {
                 .expect("process ScyllaCluster::WaitForReady: failed to send a response");
         }
 
-        ScyllaCluster::Up { node_configs, conf } => {
-            up(node_configs, conf, state).await;
+        ScyllaCluster::Up { node_configs } => {
+            up(node_configs, state).await;
         }
 
-        ScyllaCluster::UpNode { node_config, conf } => {
-            up_node(node_config, conf, state).await;
+        ScyllaCluster::UpNode { node_config } => {
+            up_node(node_config, state).await;
         }
 
         ScyllaCluster::Down { tx } => {
@@ -159,12 +159,11 @@ async fn process(msg: ScyllaCluster, state: &mut State) {
 async fn run_node(
     node_config: &ScyllaNodeConfig,
     seeds: &str,
-    conf: &Option<Vec<u8>>,
     path: &Path,
     rack: &str,
     state: &State,
 ) -> Child {
-    let conf = if let Some(conf) = conf {
+    let conf = if let Some(conf) = node_config.config.as_ref() {
         let conf_path = path.join("scylla.conf");
         fs::write(&conf_path, conf)
             .await
@@ -236,7 +235,7 @@ async fn run_node(
 }
 
 #[framed]
-async fn start(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state: &mut State) {
+async fn start(node_configs: Vec<ScyllaNodeConfig>, state: &mut State) {
     if node_configs.is_empty() {
         return;
     }
@@ -263,7 +262,7 @@ async fn start(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state
             node_config.secondary_vs_uris
         );
 
-        let child = run_node(node_config, &seeds, &conf, workdir.path(), &rack, state).await;
+        let child = run_node(node_config, &seeds, workdir.path(), &rack, state).await;
 
         state.nodes.push(NodeState {
             db_ip: node_config.db_ip,
@@ -398,7 +397,7 @@ async fn wait_for_ready(state: &State) -> bool {
 }
 
 #[framed]
-async fn up(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state: &mut State) {
+async fn up(node_configs: Vec<ScyllaNodeConfig>, state: &mut State) {
     if state.nodes.is_empty() {
         return;
     }
@@ -415,13 +414,13 @@ async fn up(node_configs: Vec<ScyllaNodeConfig>, conf: Option<Vec<u8>>, state: &
 
     for (i, path) in nodes.into_iter() {
         let rack = format!("rack{}", i + 1);
-        let child = run_node(&node_configs[i], &seed_ip, &conf, &path, &rack, state).await;
+        let child = run_node(&node_configs[i], &seed_ip, &path, &rack, state).await;
         state.nodes[i].child = Some(child);
     }
 }
 
 #[framed]
-async fn up_node(node_config: ScyllaNodeConfig, conf: Option<Vec<u8>>, state: &mut State) {
+async fn up_node(node_config: ScyllaNodeConfig, state: &mut State) {
     if state.nodes.is_empty() {
         return;
     }
@@ -437,7 +436,7 @@ async fn up_node(node_config: ScyllaNodeConfig, conf: Option<Vec<u8>>, state: &m
     {
         let rack = format!("rack{}", i + 1);
         let path = node.workdir.as_ref().unwrap().path().to_path_buf();
-        let child = run_node(&node_config, &seed_ip, &conf, &path, &rack, state).await;
+        let child = run_node(&node_config, &seed_ip, &path, &rack, state).await;
         state.nodes[i].child = Some(child);
     }
 }

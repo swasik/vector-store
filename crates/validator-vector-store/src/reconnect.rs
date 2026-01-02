@@ -97,7 +97,7 @@ async fn reconnect_doesnt_break_fullscan(actors: TestActors) {
     }
     actors
         .db
-        .up(get_default_scylla_node_configs(&actors).await, None)
+        .up(get_default_scylla_node_configs(&actors).await)
         .await;
 
     assert!(actors.db.wait_for_ready().await);

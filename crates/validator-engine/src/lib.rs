@@ -307,8 +307,9 @@ pub fn run() -> Result<(), &'static str> {
 
             let services_subnet = Arc::new(ServicesSubnet::new(base_ip));
             let dns = dns::new(dns_ip).await;
-            let db = scylla_cluster::new(scylla, scylla_default_conf, tmpdir, verbose).await;
-            let vs = vector_store_cluster::new(vector_store, verbose, disable_colors).await;
+            let db =
+                scylla_cluster::new(scylla, scylla_default_conf, tmpdir.clone(), verbose).await;
+            let vs = vector_store_cluster::new(vector_store, verbose, disable_colors, tmpdir).await;
 
             info!(
                 "{} version: {}",

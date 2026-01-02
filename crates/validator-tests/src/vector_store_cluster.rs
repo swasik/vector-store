@@ -17,6 +17,12 @@ pub struct VectorStoreNodeConfig {
     pub vs_ip: Ipv4Addr,
     /// The IP address of the ScyllaDB node to connect to.
     pub db_ip: Ipv4Addr,
+    /// Optional authentication username for the Vector Store node.
+    /// If `None`, authentication is disabled.
+    pub user: Option<String>,
+    /// Optional authentication password for the Vector Store node.
+    /// If `None`, authentication is disabled.
+    pub password: Option<String>,
     /// Additional environment variables to pass to the Vector Store process.
     pub envs: HashMap<String, String>,
 }
