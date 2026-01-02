@@ -89,20 +89,18 @@ async fn simple_create_drop_multiple_indexes(actors: TestActors) {
     let index1 = create_index(&session, &clients, &table, "v1").await;
 
     // Wait for the full scan to complete and check if ANN query succeeds on v1
-    wait_for(
-        || async {
-            session
-                .query_unpaged(
-                    format!("SELECT * FROM {table} ORDER BY v1 ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
-                    (),
-                )
-                .await
-                .is_ok()
-        },
-        "Waiting for full scan to complete. ANN query should succeed",
-        DEFAULT_OPERATION_TIMEOUT,
-    )
-    .await;
+    for client in &clients {
+        wait_for_index(client, &index1).await;
+    }
+    assert!(
+        session
+            .query_unpaged(
+                format!("SELECT * FROM {table} ORDER BY v1 ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
+                (),
+            )
+            .await
+            .is_ok()
+    );
 
     // ANN query on v2 should not succeed without the index
     session
@@ -126,20 +124,18 @@ async fn simple_create_drop_multiple_indexes(actors: TestActors) {
         .expect("failed to run ANN query");
 
     // Wait for the full scan to complete and check if ANN query succeeds on v2
-    wait_for(
-        || async {
-            session
-                .query_unpaged(
-                    format!("SELECT * FROM {table} ORDER BY v2 ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
-                    (),
-                )
-                .await
-                .is_ok()
-        },
-        "Waiting for full scan to complete. ANN query should succeed",
-        DEFAULT_OPERATION_TIMEOUT,
-    )
-    .await;
+    for client in &clients {
+        wait_for_index(client, &index2).await;
+    }
+    assert!(
+        session
+            .query_unpaged(
+                format!("SELECT * FROM {table} ORDER BY v2 ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
+                (),
+            )
+            .await
+            .is_ok()
+    );
 
     // Drop index on column v1
     session
