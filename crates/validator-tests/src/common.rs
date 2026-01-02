@@ -14,6 +14,7 @@ use httpclient::HttpClient;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::response::query_result::QueryRowsResult;
+use scylla::statement::Statement;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -215,9 +216,11 @@ pub async fn wait_for_index(
 }
 
 #[framed]
-pub async fn get_query_results(query: String, session: &Session) -> QueryRowsResult {
+pub async fn get_query_results(query: impl Into<String>, session: &Session) -> QueryRowsResult {
+    let mut stmt = Statement::new(query);
+    stmt.set_is_idempotent(true);
     session
-        .query_unpaged(query, ())
+        .query_unpaged(stmt, ())
         .await
         .expect("failed to run query")
         .into_rows_result()
@@ -225,9 +228,14 @@ pub async fn get_query_results(query: String, session: &Session) -> QueryRowsRes
 }
 
 #[framed]
-pub async fn get_opt_query_results(query: String, session: &Session) -> Option<QueryRowsResult> {
+pub async fn get_opt_query_results(
+    query: impl Into<String>,
+    session: &Session,
+) -> Option<QueryRowsResult> {
+    let mut stmt = Statement::new(query);
+    stmt.set_is_idempotent(true);
     session
-        .query_unpaged(query, ())
+        .query_unpaged(stmt, ())
         .await
         .ok()?
         .into_rows_result()
