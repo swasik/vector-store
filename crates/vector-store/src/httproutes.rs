@@ -190,7 +190,7 @@ async fn get_indexes(State(state): State<RoutesInnerState>) -> Response {
     let index_ids = state.engine.get_index_ids().await;
     let mut indexes = Vec::new();
     
-    for id in index_ids.iter() {
+    for id in index_ids {
         let memory_usage = if let Some((index, _)) = state.engine.get_index(id.clone()).await {
             index.memory_usage().await.unwrap_or(0)
         } else {
