@@ -119,7 +119,10 @@ async fn simple_create_search_delete_index() {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 1);
-    assert_eq!(indexes[0], vector_store::IndexInfo::new("vector", "ann"));
+    assert_eq!(indexes[0].keyspace, "vector".to_string().into());
+    assert_eq!(indexes[0].index, "ann".to_string().into());
+    // OpenSearch indexes should have memory_usage of 0 since OpenSearch doesn't provide memory stats
+    assert_eq!(indexes[0].memory_usage, 0, "OpenSearch index should have memory_usage of 0");
 
     let (primary_keys, distances) = client
         .ann(

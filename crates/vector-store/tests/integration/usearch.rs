@@ -167,7 +167,9 @@ async fn simple_create_search_delete_index() {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 1);
-    assert_eq!(indexes[0], vector_store::IndexInfo::new("vector", "ann",));
+    assert_eq!(indexes[0].keyspace, "vector".to_string().into());
+    assert_eq!(indexes[0].index, "ann".to_string().into());
+    assert!(indexes[0].memory_usage > 0, "Memory usage should be greater than 0 for uSearch index");
 
     let (primary_keys, distances) = client
         .ann(
@@ -287,8 +289,10 @@ async fn failed_db_index_create() {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 2);
-    assert!(indexes.contains(&vector_store::IndexInfo::new("vector", "ann")));
-    assert!(indexes.contains(&vector_store::IndexInfo::new("vector", "ann2")));
+    assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann"));
+    assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann2"));
+    // Verify that memory_usage is populated for uSearch indexes
+    assert!(indexes.iter().all(|i| i.memory_usage > 0), "All uSearch indexes should have memory_usage > 0");
 
     db.add_index(
         &index.keyspace_name,
@@ -312,9 +316,9 @@ async fn failed_db_index_create() {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 3);
-    assert!(indexes.contains(&vector_store::IndexInfo::new("vector", "ann")));
-    assert!(indexes.contains(&vector_store::IndexInfo::new("vector", "ann2")));
-    assert!(indexes.contains(&vector_store::IndexInfo::new("vector", "ann3")));
+    assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann"));
+    assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann2"));
+    assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann3"));
 
     db.del_index(&index.keyspace_name, &"ann2".to_string().into())
         .unwrap();
@@ -327,8 +331,8 @@ async fn failed_db_index_create() {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 2);
-    assert!(indexes.contains(&vector_store::IndexInfo::new("vector", "ann")));
-    assert!(indexes.contains(&vector_store::IndexInfo::new("vector", "ann3")));
+    assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann"));
+    assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann3"));
 }
 
 #[tokio::test]
