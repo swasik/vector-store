@@ -14,7 +14,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
@@ -42,6 +41,53 @@ fn protocol(tls_config: &Option<RustlsConfig>) -> &'static str {
     }
 }
 
+/// Retry spawning a server with exponential backoff
+async fn spawn_server_with_retry(
+    config: &Config,
+    state: Sender<NodeState>,
+    engine: Sender<Engine>,
+    metrics: Arc<Metrics>,
+    index_engine_version: String,
+) -> anyhow::Result<(Handle, SocketAddr)> {
+    let mut retry_delay = Duration::from_millis(50);
+    let max_retries = 10;
+
+    for attempt in 1..=max_retries {
+        if attempt > 1 {
+            time::sleep(retry_delay).await;
+        }
+
+        match spawn_server(
+            config,
+            state.clone(),
+            engine.clone(),
+            metrics.clone(),
+            index_engine_version.clone(),
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if attempt < max_retries {
+                    tracing::warn!(
+                        "Failed to start HTTP server (attempt {}/{}): {e}, retrying in {:?}",
+                        attempt,
+                        max_retries,
+                        retry_delay
+                    );
+                    // Exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms, 1600ms, ...
+                    retry_delay =
+                        Duration::from_millis((retry_delay.as_millis() * 2).min(2000) as u64);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    unreachable!()
+}
+
 pub(crate) async fn new(
     state: Sender<NodeState>,
     engine: Sender<Engine>,
@@ -56,7 +102,7 @@ pub(crate) async fn new(
     let initial_config = config_rx.borrow().clone();
 
     // Start initial server and get actual bound address
-    let (initial_handle, actual_addr) = spawn_server(
+    let (initial_handle, actual_addr) = spawn_server_with_retry(
         &initial_config,
         state.clone(),
         engine.clone(),
@@ -122,11 +168,8 @@ pub(crate) async fn new(
                             tracing::info!("Shutting down old HTTP server");
                             current_handle.graceful_shutdown(Some(Duration::from_secs(10)));
 
-                            // Wait for the port to become available (max 2 seconds = 40 attempts * 50ms)
-                            wait_for_port_available(current_addr, 40).await;
-
-                            // Start new server
-                            match spawn_server(
+                            // Start new server with retry
+                            match spawn_server_with_retry(
                                 &new_config,
                                 state.clone(),
                                 engine.clone(),
@@ -156,40 +199,13 @@ pub(crate) async fn new(
 
             // Final shutdown
             tracing::info!("HTTP server shutting down");
-            current_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-            // Wait for the port to be released (max 2 seconds)
-            wait_for_port_available(current_addr, 40).await;
+            current_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            // Brief delay to allow clean shutdown
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
 
     Ok((tx, actual_addr))
-}
-
-/// Wait for a port to become available by attempting to bind to it.
-/// Returns when the port can be successfully bound, or after max_attempts.
-async fn wait_for_port_available(addr: SocketAddr, max_attempts: u32) {
-    for attempt in 1..=max_attempts {
-        match TcpListener::bind(addr).await {
-            Ok(_) => {
-                tracing::debug!(
-                    "Port {} is available after {} attempts",
-                    addr.port(),
-                    attempt
-                );
-                return;
-            }
-            Err(_) => {
-                if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-        }
-    }
-    tracing::warn!(
-        "Port {} availability check completed after {} attempts - port may still be in use",
-        addr.port(),
-        max_attempts
-    );
 }
 
 /// Spawn a new HTTP server instance with the given configuration
