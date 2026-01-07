@@ -6,6 +6,8 @@
 use async_backtrace::framed;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::time::Duration;
+use tokio::time;
 use tracing::info;
 use vector_search_validator_tests::common::*;
 use vector_search_validator_tests::*;
@@ -40,6 +42,11 @@ pub(crate) async fn new() -> TestCase {
             "ann_query_returns_rows_identified_by_composite_primary_key",
             timeout,
             ann_query_returns_rows_identified_by_composite_primary_key,
+        )
+        .with_test(
+            "ann_query_returns_rows_using_cdc",
+            timeout,
+            ann_query_returns_rows_using_cdc,
         )
 }
 
@@ -377,6 +384,110 @@ async fn ann_query_returns_rows_identified_by_composite_primary_key(actors: Test
     );
 
     // Drop keyspace
+    session
+        .query_unpaged(format!("DROP KEYSPACE {keyspace}"), ())
+        .await
+        .expect("failed to drop a keyspace");
+
+    info!("finished");
+}
+
+/// Test that ANN queries return correct results when data is inserted using CDC.
+///
+/// Steps:
+/// 1. Prepare a cluster with scylladb and vector-store nodes.
+/// 2. Create a keyspace and a table with a vector column.
+/// 3. Create a vector index on the vector column (table without data).
+/// 4. Wait until vector-stores create indexes.
+/// 5. Insert data into the table that will be picked up by CDC.
+/// 6. Wait until vector-stores update indexes using CDC.
+/// 7. Perform an ANN query and verify the results.
+/// 8. Drop the keyspace.
+#[framed]
+async fn ann_query_returns_rows_using_cdc(actors: TestActors) {
+    info!("started");
+
+    let (session, clients) = prepare_connection(&actors).await;
+    let keyspace = create_keyspace(&session).await;
+    let table = create_table(
+        &session,
+        "pk TEXT, ck TEXT, v VECTOR<FLOAT, 3>, PRIMARY KEY (pk, ck)",
+        None,
+    )
+    .await;
+
+    info!("Initially, the index should have 0 vectors");
+    let index = create_index(&session, &clients, &table, "v").await;
+
+    for client in &clients {
+        let index_status = wait_for_index(client, &index).await;
+        assert_eq!(index_status.count, 0, "Expected 0 vectors to be indexed");
+    }
+
+    info!("Insert data that will be picked up by CDC");
+    let data: [(&'static str, &'static str, Vec<f32>); 4] = [
+        ("pk-1", "ck-1", vec![0.0, 0.0, 0.0]),
+        ("pk-1", "ck-2", vec![1.0, 1.0, 1.0]),
+        ("pk-2", "ck-1", vec![0.0, 0.0, 0.0]),
+        ("pk-2", "ck-2", vec![1.0, 1.0, 1.0]),
+    ];
+    for (pk, ck, v) in &data {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, ck, v) VALUES (?, ?, ?)"),
+                (pk, ck, v),
+            )
+            .await
+            .expect("failed to insert data");
+    }
+
+    info!("Waiting till all vector-stores update indexes using CDC");
+    wait_for(
+        || async {
+            for client in &clients {
+                loop {
+                    let index_status = wait_for_index(client, &index).await;
+                    if index_status.count == 4 {
+                        break;
+                    }
+                    time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            true
+        },
+        "Waiting for all vector-stores update indexes using CDC",
+        Duration::from_secs(60),
+    )
+    .await;
+
+    info!("Now perform the ANN query");
+    let result = get_opt_query_results(
+        format!("SELECT pk, ck FROM {table} ORDER BY v ANN OF [0.0, 0.0, 0.0] LIMIT 2"),
+        &session,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.rows_num(), 2);
+    let rows: HashSet<(String, String)> = result
+        .rows::<(String, String)>()
+        .expect("failed to get rows")
+        .map(|row| row.expect("failed to get row"))
+        .collect();
+
+    info!(
+        "Assert that we have the expected rows, ('pk-1', 'ck-1') and ('pk-2', 'ck-1'), as they have the closest vectors."
+    );
+    assert_eq!(
+        rows,
+        [
+            ("pk-1".to_string(), "ck-1".to_string()),
+            ("pk-2".to_string(), "ck-1".to_string()),
+        ]
+        .into_iter()
+        .collect::<HashSet<(String, String)>>()
+    );
+
+    info!("Drop keyspace");
     session
         .query_unpaged(format!("DROP KEYSPACE {keyspace}"), ())
         .await
