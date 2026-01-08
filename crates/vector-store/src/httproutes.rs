@@ -153,6 +153,11 @@ pub struct IndexInfo {
     pub keyspace: KeyspaceName,
     pub index: IndexName,
     pub data_type: DataType,
+    /// Estimated memory usage in bytes for the index. This value is an estimate provided by the
+    /// uSearch library's memory_usage function and represents a relatively accurate lower bound
+    /// on the amount of memory consumed by the index. In practice, its error will be below 10%.
+    /// This value is 0 if memory statistics are not supported by the index implementation.
+    pub estimated_memory_usage: usize,
 }
 
 impl IndexInfo {
@@ -161,6 +166,7 @@ impl IndexInfo {
             keyspace: String::from(keyspace).into(),
             index: String::from(index).into(),
             data_type: DataType::F32,
+            estimated_memory_usage: 0,
         }
     }
 }
@@ -181,17 +187,24 @@ impl IndexInfo {
     )
 )]
 async fn get_indexes(State(state): State<RoutesInnerState>) -> Response {
-    let indexes: Vec<_> = state
-        .engine
-        .get_index_ids()
-        .await
-        .iter()
-        .map(|id| IndexInfo {
+    let index_ids = state.engine.get_index_ids().await;
+    let mut indexes = Vec::new();
+    
+    for id in index_ids {
+        let estimated_memory_usage = if let Some((index, _)) = state.engine.get_index(id.clone()).await {
+            index.estimated_memory_usage().await.unwrap_or(0)
+        } else {
+            0
+        };
+        
+        indexes.push(IndexInfo {
             keyspace: id.keyspace(),
             index: id.index(),
             data_type: DataType::F32, // currently the only supported data type by Vector Store
-        })
-        .collect();
+            estimated_memory_usage,
+        });
+    }
+    
     (StatusCode::OK, response::Json(indexes)).into_response()
 }
 
