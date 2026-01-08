@@ -267,22 +267,22 @@
           "keyspace",
           "index",
           "data_type",
-          "memory_usage"
+          "estimated_memory_usage"
         ],
         "properties": {
           "data_type": {
             "$ref": "#/components/schemas/DataType"
+          },
+          "estimated_memory_usage": {
+            "type": "integer",
+            "description": "Estimated memory usage in bytes for the index. This value is an estimate provided by the\nuSearch library's memory_usage function and represents a relatively accurate lower bound\non the amount of memory consumed by the index. In practice, its error will be below 10%.\nFor OpenSearch-based indexes, this value is always 0 as memory statistics are not available.",
+            "minimum": 0
           },
           "index": {
             "$ref": "#/components/schemas/IndexName"
           },
           "keyspace": {
             "$ref": "#/components/schemas/KeyspaceName"
-          },
-          "memory_usage": {
-            "type": "integer",
-            "description": "Memory usage in bytes for the index. This value is provided by the uSearch library's\nmemory_usage function and represents a relatively accurate lower bound on the amount\nof memory consumed by the index. In practice, its error will be below 10%.\nFor OpenSearch-based indexes, this value is always 0 as memory statistics are not available.",
-            "minimum": 0
           }
         }
       },

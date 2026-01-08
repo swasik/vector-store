@@ -311,10 +311,10 @@ async fn process(
             tx,
         } => ann(id, tx, keys, embedding, dimensions, limit, client).await,
         Index::Count { tx } => count(id, tx, client).await,
-        Index::MemoryUsage { tx } => {
+        Index::EstimatedMemoryUsage { tx } => {
             // OpenSearch does not provide memory usage statistics, return 0
             tx.send(Ok(0))
-                .unwrap_or_else(|_| trace!("memory_usage: unable to send response"));
+                .unwrap_or_else(|_| trace!("estimated_memory_usage: unable to send response"));
         }
     }
 }

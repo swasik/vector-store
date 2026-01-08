@@ -15,7 +15,7 @@ use crate::Vector;
 use crate::index::actor::AnnR;
 use crate::index::actor::CountR;
 use crate::index::actor::Index;
-use crate::index::actor::MemoryUsageR;
+use crate::index::actor::EstimatedMemoryUsageR;
 use crate::index::factory::IndexConfiguration;
 use crate::index::validator;
 use crate::memory::Allocate;
@@ -168,7 +168,7 @@ trait UsearchIndex {
         limit: Limit,
     ) -> anyhow::Result<impl Iterator<Item = (Key, Distance)>>;
 
-    fn memory_usage(&self) -> usize;
+    fn estimated_memory_usage(&self) -> usize;
     fn stop(&self);
 }
 
@@ -222,7 +222,7 @@ impl UsearchIndex for ThreadedUsearchIndex {
             .map(|(key, distance)| (key.into(), distance.into())))
     }
 
-    fn memory_usage(&self) -> usize {
+    fn estimated_memory_usage(&self) -> usize {
         self.inner.memory_usage()
     }
 
@@ -397,7 +397,7 @@ impl UsearchIndex for RwLock<Simulator> {
         Ok(keys.into_iter().map(|key| (key, 0.0.into())))
     }
 
-    fn memory_usage(&self) -> usize {
+    fn estimated_memory_usage(&self) -> usize {
         // For simulator, return an approximation based on the number of keys
         self.read().unwrap().keys.read().unwrap().len() * std::mem::size_of::<Key>()
     }
@@ -548,7 +548,7 @@ async fn dispatch_task(
 }
 
 fn should_run_on_tokio(msg: &Index) -> bool {
-    matches!(msg, Index::Ann { .. } | Index::Count { .. } | Index::MemoryUsage { .. })
+    matches!(msg, Index::Ann { .. } | Index::Count { .. } | Index::EstimatedMemoryUsage { .. })
 }
 
 fn process<I: UsearchIndex + Send + Sync + 'static>(msg: Index, index: &IndexState<I>) {
@@ -589,8 +589,8 @@ fn process<I: UsearchIndex + Send + Sync + 'static>(msg: Index, index: &IndexSta
         Index::Count { tx } => {
             count(Arc::clone(&index.idx), tx);
         }
-        Index::MemoryUsage { tx } => {
-            memory_usage(Arc::clone(&index.idx), tx);
+        Index::EstimatedMemoryUsage { tx } => {
+            estimated_memory_usage(Arc::clone(&index.idx), tx);
         }
     }
 }
@@ -733,9 +733,9 @@ fn count(idx: Arc<impl UsearchIndex>, tx: oneshot::Sender<CountR>) {
         .unwrap_or_else(|_| trace!("count: unable to send response"));
 }
 
-fn memory_usage(idx: Arc<impl UsearchIndex>, tx: oneshot::Sender<MemoryUsageR>) {
-    tx.send(Ok(idx.memory_usage()))
-        .unwrap_or_else(|_| trace!("memory_usage: unable to send response"));
+fn estimated_memory_usage(idx: Arc<impl UsearchIndex>, tx: oneshot::Sender<EstimatedMemoryUsageR>) {
+    tx.send(Ok(idx.estimated_memory_usage()))
+        .unwrap_or_else(|_| trace!("estimated_memory_usage: unable to send response"));
 }
 
 async fn check_memory_allocation(

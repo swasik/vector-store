@@ -169,7 +169,7 @@ async fn simple_create_search_delete_index() {
     assert_eq!(indexes.len(), 1);
     assert_eq!(indexes[0].keyspace, "vector".to_string().into());
     assert_eq!(indexes[0].index, "ann".to_string().into());
-    assert!(indexes[0].memory_usage > 0, "Memory usage should be greater than 0 for uSearch index");
+    assert!(indexes[0].estimated_memory_usage > 0, "Estimated memory usage should be greater than 0 for uSearch index");
 
     let (primary_keys, distances) = client
         .ann(
@@ -291,8 +291,8 @@ async fn failed_db_index_create() {
     assert_eq!(indexes.len(), 2);
     assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann"));
     assert!(indexes.iter().any(|i| i.keyspace.as_ref() == "vector" && i.index.as_ref() == "ann2"));
-    // Verify that memory_usage is populated for uSearch indexes
-    assert!(indexes.iter().all(|i| i.memory_usage > 0), "All uSearch indexes should have memory_usage > 0");
+    // Verify that estimated_memory_usage is populated for uSearch indexes
+    assert!(indexes.iter().all(|i| i.estimated_memory_usage > 0), "All uSearch indexes should have estimated_memory_usage > 0");
 
     db.add_index(
         &index.keyspace_name,
