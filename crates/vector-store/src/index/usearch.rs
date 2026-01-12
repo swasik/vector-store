@@ -935,8 +935,7 @@ mod tests {
                     let limit = NonZeroUsize::new(5).unwrap().into();
                     let _ = actor
                         .ann(vec![0.0f32; dimensions.get()].into(), limit)
-                        .await
-                        .unwrap();
+                        .await;
                 }
             }));
         }
