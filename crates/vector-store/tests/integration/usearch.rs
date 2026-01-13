@@ -34,6 +34,7 @@ use vector_store::SpaceType;
 use vector_store::Timestamp;
 use vector_store::Vector;
 use vector_store::httproutes::PostIndexAnnFilter;
+use vector_store::httproutes::PostIndexAnnResponse;
 use vector_store::httproutes::PostIndexAnnRestriction;
 use vector_store::node_state::NodeState;
 
@@ -478,17 +479,29 @@ async fn ann_failed_when_wrong_number_of_primary_keys() {
     )
     .await;
 
-    let response = client
-        .post_ann(
-            &index.keyspace_name,
-            &index.index_name,
-            vec![1.0, 2.0, 3.0].into(),
-            None,
-            NonZeroUsize::new(1).unwrap().into(),
-        )
-        .await;
+    wait_for(
+        || async {
+            let response = client
+                .post_ann(
+                    &index.keyspace_name,
+                    &index.index_name,
+                    vec![1.0, 2.0, 3.0].into(),
+                    None,
+                    NonZeroUsize::new(1).unwrap().into(),
+                )
+                .await;
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+                true
+            } else {
+                let response = response.json::<PostIndexAnnResponse>().await.unwrap();
+                assert_eq!(response.distances.len(), 0);
+                false
+            }
+        },
+        "Waiting for index to be return internal server error on ANN",
+    )
+    .await;
 }
 
 #[tokio::test]
