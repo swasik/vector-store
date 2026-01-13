@@ -464,6 +464,81 @@ impl From<SpaceType> for MetricKind {
     }
 }
 
+mod operation {
+    use super::Index;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::Notify;
+
+    #[derive(PartialEq)]
+    enum Mode {
+        Insert,
+        Search,
+    }
+
+    pub(super) struct Permit {
+        notify: Arc<Notify>,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            let previous = self.counter.fetch_sub(1, Ordering::Relaxed);
+            if previous == 1 {
+                self.notify.notify_one();
+            }
+        }
+    }
+
+    pub(super) struct Operation {
+        mode: Mode,
+        notify: Arc<Notify>,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl Operation {
+        pub(super) fn new() -> Self {
+            Self {
+                mode: Mode::Insert,
+                notify: Arc::new(Notify::new()),
+                counter: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Wait until it will be possible to spawn operation.
+        ///
+        /// The function must be called before spawning operation tasks as it blocks
+        /// until only requested family of operations is in progress.
+        pub(super) async fn permit(&mut self, msg: &Index) -> Permit {
+            let mode = mode(msg);
+
+            while self.mode != mode {
+                if self.counter.load(Ordering::Relaxed) == 0 {
+                    // it is safe to switch to the operation because there are no spawned tasks
+                    // and self.counter won't be changed
+                    self.mode = mode;
+                    break;
+                }
+                self.notify.notified().await;
+            }
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Permit {
+                notify: Arc::clone(&self.notify),
+                counter: Arc::clone(&self.counter),
+            }
+        }
+    }
+
+    fn mode(msg: &Index) -> Mode {
+        match msg {
+            Index::Ann { .. } | Index::FilteredAnn { .. } | Index::Count { .. } => Mode::Search,
+            Index::Add { .. } => Mode::Insert,
+            _ => unreachable!(),
+        }
+    }
+}
+
 struct IndexState<I: UsearchIndex + Send + Sync + 'static> {
     idx: Arc<I>,
     keys: RwLock<BiMap<PrimaryKey, Key>>,
@@ -512,6 +587,7 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
                 ));
 
                 let mut allocate_prev = Allocate::Can;
+                let mut operation = operation::Operation::new();
 
                 while let Some(msg) = rx.recv().await {
                     if !check_memory_allocation(&msg, &memory, &mut allocate_prev, &id).await {
@@ -519,6 +595,7 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
                     }
 
                     dispatch_task(
+                        &mut operation,
                         msg,
                         Arc::clone(&idx),
                         Arc::clone(&primary_key_columns),
@@ -552,6 +629,7 @@ fn get_index_concurrency(
 }
 
 async fn dispatch_task(
+    operation: &mut operation::Operation,
     msg: Index,
     idx: Arc<TokioRwLock<IndexState<impl UsearchIndex + Send + Sync + 'static>>>,
     primary_key_columns: Arc<Vec<ColumnName>>,
@@ -577,6 +655,7 @@ async fn dispatch_task(
         return;
     }
     let lock = idx.read_owned().await;
+    let operation_permit = operation.permit(&msg).await;
     if should_run_on_tokio(&msg) {
         let permit = Arc::clone(tokio_semaphore).acquire_owned().await.unwrap();
         tokio::spawn(async move {
@@ -584,6 +663,7 @@ async fn dispatch_task(
             process(msg, &lock, &primary_key_columns);
             drop(permit);
             drop(lock);
+            drop(operation_permit);
         });
     } else {
         let permit = Arc::clone(rayon_semaphore).acquire_owned().await.unwrap();
@@ -591,6 +671,7 @@ async fn dispatch_task(
             process(msg, &lock, &primary_key_columns);
             drop(permit);
             drop(lock);
+            drop(operation_permit);
         });
     }
 }
