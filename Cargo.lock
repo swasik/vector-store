@@ -3973,6 +3973,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vector-search-validator-tests",
+ "vector-store",
 ]
 
 [[package]]

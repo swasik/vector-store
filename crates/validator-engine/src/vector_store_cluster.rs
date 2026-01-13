@@ -276,7 +276,8 @@ async fn stop_node(state: &mut State, vs_ip: Ipv4Addr) {
 async fn wait_for_node(client: &HttpClient) -> bool {
     time::timeout(Duration::from_secs(30), async {
         loop {
-            if matches!(client.status().await, Ok(NodeStatus::Serving)) {
+            let status = client.status().await;
+            if matches!(status, Ok(NodeStatus::Serving)) {
                 return true;
             }
             time::sleep(Duration::from_millis(100)).await;
@@ -300,7 +301,7 @@ async fn wait_for_ready(state: &State) -> bool {
                 "Waiting for Vector Store node at IP {} to be ready...",
                 &node.vs_ip
             );
-            wait_for_node(client).await;
+            assert!(wait_for_node(client).await);
             info!("Vector Store node at IP {} is ready.", &node.vs_ip);
         } else {
             tracing::error!("Client for node at IP {} is not initialized.", &node.vs_ip);

@@ -116,15 +116,20 @@ pub async fn init(actors: TestActors) {
 }
 
 #[framed]
+pub async fn init_dns(actors: &TestActors) {
+    let vs_ips = get_default_vs_ips(actors);
+    for (name, ip) in VS_NAMES.iter().zip(vs_ips.iter()) {
+        actors.dns.upsert(name.to_string(), *ip).await;
+    }
+}
+
+#[framed]
 pub async fn init_with_config(
     actors: TestActors,
     scylla_configs: Vec<ScyllaNodeConfig>,
     vs_configs: Vec<VectorStoreNodeConfig>,
 ) {
-    let vs_ips = get_default_vs_ips(&actors);
-    for (name, ip) in VS_NAMES.iter().zip(vs_ips.iter()) {
-        actors.dns.upsert(name.to_string(), *ip).await;
-    }
+    init_dns(&actors).await;
 
     actors.db.start(scylla_configs).await;
     assert!(actors.db.wait_for_ready().await);
