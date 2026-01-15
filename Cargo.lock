@@ -4016,6 +4016,7 @@ version = "1.4.0"
 dependencies = [
  "async-backtrace",
  "scylla",
+ "scylla-proxy",
  "tokio",
  "tracing",
  "vector-search-validator-tests",
