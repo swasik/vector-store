@@ -38,6 +38,13 @@ use vector_store::httproutes::PostIndexAnnResponse;
 use vector_store::httproutes::PostIndexAnnRestriction;
 use vector_store::node_state::NodeState;
 
+pub(crate) fn test_config() -> Config {
+    Config {
+        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..Default::default()
+    }
+}
+
 pub(crate) async fn setup_store(
     config: Config,
     primary_keys: impl IntoIterator<Item = ColumnName>,
@@ -131,16 +138,8 @@ pub(crate) async fn setup_store_and_wait_for_index(
     impl Sized,
     Sender<NodeState>,
 ) {
-    let (run, index, db, node_state) = setup_store(
-        Config {
-            vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            ..Default::default()
-        },
-        primary_keys,
-        columns,
-        values,
-    )
-    .await;
+    let (run, index, db, node_state) =
+        setup_store(test_config(), primary_keys, columns, values).await;
     let (client, server, _config_tx) = run.await;
 
     wait_for(
@@ -157,10 +156,7 @@ async fn simple_create_search_delete_index() {
     crate::enable_tracing();
 
     let (run, index, db, _node_state) = setup_store(
-        Config {
-            vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            ..Default::default()
-        },
+        test_config(),
         ["pk".into(), "ck".into()],
         [
             ("pk".to_string().into(), NativeType::Int),
@@ -255,11 +251,7 @@ async fn failed_db_index_create() {
     let (_, rx) = watch::channel(Arc::new(Config::default()));
     let index_factory = vector_store::new_index_factory_usearch(rx).unwrap();
 
-    let config = vector_store::Config {
-        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        ..Default::default()
-    };
-    let (_config_tx, config_rx) = watch::channel(Arc::new(config));
+    let (_config_tx, config_rx) = watch::channel(Arc::new(test_config()));
 
     let (_server_actor, addr) =
         vector_store::run(node_state, db_actor, internals, index_factory, config_rx)
@@ -404,10 +396,7 @@ async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimen
 async fn ann_fail_while_building() {
     crate::enable_tracing();
     let (run, index, db, _node_state) = setup_store(
-        Config {
-            vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            ..Default::default()
-        },
+        test_config(),
         ["pk".into(), "ck".into()],
         [
             ("pk".to_string().into(), NativeType::Int),
@@ -909,13 +898,12 @@ async fn ann_filter_primary_key_int_in_tuple() {
 async fn http_server_is_responsive_when_index_add_hangs() {
     crate::enable_tracing();
     let config = Config {
-        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         usearch_simulator: Some(vec![
             Duration::from_secs(0),
             Duration::from_secs(20), // Simulate long add operation (longer than test timeout).
             Duration::from_secs(0),
         ]),
-        ..Default::default()
+        ..test_config()
     };
     let (run, _index, _db, _node_state) = setup_store(
         config,

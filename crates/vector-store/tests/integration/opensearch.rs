@@ -7,12 +7,12 @@ use crate::db_basic;
 use crate::db_basic::Index;
 use crate::db_basic::Table;
 use crate::mock_opensearch;
+use crate::usearch::test_config;
 use crate::wait_for;
 use ::time::OffsetDateTime;
 use httpclient::HttpClient;
 use scylla::cluster::metadata::NativeType;
 use scylla::value::CqlValue;
-use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -44,11 +44,7 @@ async fn simple_create_search_delete_index() {
     let index_factory =
         vector_store::new_index_factory_opensearch(server.base_url(), config_rx_factory).unwrap();
 
-    let config = vector_store::Config {
-        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        ..Default::default()
-    };
-    let (_config_tx, config_rx) = watch::channel(Arc::new(config));
+    let (_config_tx, config_rx) = watch::channel(Arc::new(test_config()));
 
     let (_server_actor, addr) =
         vector_store::run(node_state, db_actor, internals, index_factory, config_rx)

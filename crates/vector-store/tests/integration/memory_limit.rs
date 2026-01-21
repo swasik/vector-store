@@ -6,11 +6,11 @@
 use crate::db_basic;
 use crate::db_basic::Index;
 use crate::db_basic::Table;
+use crate::usearch::test_config;
 use ::time::OffsetDateTime;
 use httpclient::HttpClient;
 use scylla::cluster::metadata::NativeType;
 use scylla::value::CqlValue;
-use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,12 +113,11 @@ async fn memory_limit_during_index_build() {
         "Setting VS memory limit to {LIMIT_MEMORY} bytes, current used memory is {used_memory} bytes, "
     );
 
-    let mut config = Config {
+    let config = Config {
         memory_limit: Some(limit_memory),
         memory_usage_check_interval: Some(Duration::from_millis(10)),
-        ..Default::default()
+        ..test_config()
     };
-    config.vector_store_addr = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (_config_tx, config_rx) = watch::channel(Arc::new(config));
     let index_factory = vector_store::new_index_factory_usearch(config_rx.clone()).unwrap();
