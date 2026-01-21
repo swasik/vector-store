@@ -3,10 +3,11 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use std::net::SocketAddr;
+
 use crate::usearch;
 use crate::wait_for;
 use scylla::cluster::metadata::NativeType;
-use vector_store::Config;
 use vector_store::httproutes::NodeStatus;
 
 #[tokio::test]
@@ -30,7 +31,10 @@ async fn status_is_serving_after_creation() {
 async fn status_is_bootstrapping_while_discovering_indexes() {
     crate::enable_tracing();
     let (run, _index, db, _node_state) = usearch::setup_store(
-        Config::default(),
+        vector_store::Config {
+            vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ..Default::default()
+        },
         ["pk".into(), "ck".into()],
         [
             ("pk".to_string().into(), NativeType::Int),
