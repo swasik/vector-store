@@ -73,7 +73,7 @@ async fn quantization_is_effectively_applied() {
         )
         .await;
 
-        let (_, distances) = client
+        let (_, distances, _) = client
             .ann(
                 &index.keyspace_name,
                 &index.index_name,
