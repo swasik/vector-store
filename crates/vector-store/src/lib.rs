@@ -395,6 +395,7 @@ pub enum SpaceType {
     #[default]
     Cosine,
     DotProduct,
+    Hamming,
 }
 
 impl FromStr for SpaceType {
@@ -405,6 +406,7 @@ impl FromStr for SpaceType {
             "EUCLIDEAN" => Ok(Self::Euclidean),
             "COSINE" => Ok(Self::Cosine),
             "DOT_PRODUCT" => Ok(Self::DotProduct),
+            "HAMMING" => Ok(Self::Hamming),
             _ => Err(anyhow::anyhow!("Unknown space type: {s}")),
         }
     }
