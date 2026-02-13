@@ -13,6 +13,18 @@ mod info;
 
 use config_manager::ConfigManager;
 
+/// Custom allocator callback that routes USearch's internal allocations through MiMalloc.
+extern "C" fn mimalloc_alloc(size: usize, alignment: usize) -> *mut u8 {
+    let layout = std::alloc::Layout::from_size_align(size, alignment).unwrap();
+    unsafe { std::alloc::GlobalAlloc::alloc(&mimalloc::MiMalloc, layout) }
+}
+
+/// Custom deallocator callback that routes USearch's internal deallocations through MiMalloc.
+extern "C" fn mimalloc_dealloc(ptr: *mut u8, size: usize, alignment: usize) {
+    let layout = std::alloc::Layout::from_size_align(size, alignment).unwrap();
+    unsafe { std::alloc::GlobalAlloc::dealloc(&mimalloc::MiMalloc, ptr, layout) }
+}
+
 #[derive(Parser)]
 #[clap(version)]
 struct Args {}
@@ -74,6 +86,13 @@ fn main() -> anyhow::Result<()> {
         let node_state = vector_store::new_node_state().await;
 
         let opensearch_addr = config.opensearch_addr.clone();
+
+        // Replace USearch's internal allocator with MiMalloc before creating any index.
+        // SAFETY: No USearch indices exist yet at this point.
+        unsafe {
+            usearch::set_allocator(Some(mimalloc_alloc), Some(mimalloc_dealloc));
+        }
+        tracing::info!("Replaced USearch allocator with MiMalloc");
 
         let index_factory = if let Some(addr) = opensearch_addr {
             tracing::info!("Using OpenSearch index factory at {addr}");
