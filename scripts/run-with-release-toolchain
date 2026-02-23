@@ -7,6 +7,14 @@ repo=$(realpath $repo/..)
 
 TARGETARCH="${TARGETARCH:-amd64}"
 
+# Set architecture-specific C/C++ optimization flags for native deps (USearch/SimSIMD)
+case "$TARGETARCH" in
+    arm64)
+        export CXXFLAGS="${CXXFLAGS:--march=armv8.4-a+sve}"
+        export CFLAGS="${CFLAGS:--march=armv8.4-a+sve}"
+        ;;
+esac
+
 rust_version=$(grep channel $repo/rust-toolchain.toml | cut -d '"' -f 2)
 image=rust:$rust_version-bookworm
 
@@ -22,6 +30,8 @@ docker run --rm \
     --platform linux/$TARGETARCH \
     --user "$(id -u)":"$(id -g)" \
     -e CARGO_TARGET_DIR="./target/$TARGETARCH" \
+    ${CXXFLAGS:+-e CXXFLAGS="$CXXFLAGS"} \
+    ${CFLAGS:+-e CFLAGS="$CFLAGS"} \
     -v "$repo":"$repo" \
     -v "$user_cargo_home/git":"$docker_cargo_home/git" \
     -v "$user_cargo_home/registry":"$docker_cargo_home/registry" \

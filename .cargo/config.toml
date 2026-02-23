@@ -1,2 +1,14 @@
 [alias]
 openapi = "run --features dev-tools --bin generate-openapi -- api/openapi.json"
+
+# Graviton3 (Neoverse V1) optimizations for aarch64 builds.
+# Rustc will target neoverse-v1 when building for aarch64.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=neoverse-v1"]
+
+# Note: C/C++ flags for USearch/SimSIMD (CXXFLAGS/CFLAGS="-march=armv8.4-a+sve")
+# cannot be set here via [env] because they would also apply to x86_64 C deps
+# (e.g. ring) and break cross-compilation. Instead, set them:
+#   - In run-with-release-toolchain (for cross-compilation builds)
+#   - Via environment variables when building natively on aarch64:
+#     CXXFLAGS="-march=armv8.4-a+sve" CFLAGS="-march=armv8.4-a+sve" cargo build --release

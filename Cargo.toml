@@ -72,3 +72,8 @@ vector-search-validator-vector-store = { path = "crates/validator-vector-store" 
 vector-store = { path = "crates/vector-store" }
 secrecy = "0.10.3"
 rayon = "1.11.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
