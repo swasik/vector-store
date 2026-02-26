@@ -1,0 +1,737 @@
+"""
+ScyllaDB Vector Similarity Search (VSS) Sizing Algorithm
+======================================================
+
+Calculates infrastructure requirements for deploying ScyllaDB Vector Search,
+covering three main components:
+
+1. **Search Node Baseline** - RAM needed to hold the HNSW (USearch) index
+   entirely in memory.
+2. **Throughput Sizing** - vCPUs required on search nodes to meet a target
+   QPS at P99 ≤ 15 ms latency.
+3. **Data Node Sizing** - vCPUs and storage for the ScyllaDB data nodes that
+   back the search nodes.
+
+The formulas and heuristics are derived from internal ScyllaDB sizing
+guidelines and benchmarks.
+
+Input Parameters
+----------------
+- **num_vectors** (int) - Total number of vectors to be indexed (N).
+  Min: 10 000, Max: 4 000 000 000, Default: 50 000 000.
+  UI note: should be visualized on a logarithmic scale.
+- **dimensions** (int) - Number of dimensions per vector embedding.
+  Min: 1, Max: 16 000, Default: 1 536.
+  Common values: 128 (image features), 768 (BERT), 1536 (OpenAI), 4096 (LLMs).
+- **target_qps** (int) - Desired queries-per-second at P99 <= 15 ms latency.
+  Min: 10, Max: 1 000 000, Default: 1 000.
+- **recall** (int) - Target recall accuracy as a percentage.
+  Min: 70, Max: 99, Default: 90.
+  Higher recall dramatically reduces throughput per vCPU.
+- **k** (int) - Number of nearest-neighbour results per query.
+  Min: 1, Max: 1 000, Default: 10.
+  K=100 halves the throughput compared to K=10.
+- **quantization** (Quantization) - Compression strategy for vector elements:
+  NONE (float32, 1x), 
+  SCALAR (uint8, ~3x memory savings), or
+  BINARY (1-bit, ~10x memory savings).
+  Default: NONE.
+  SCALAR quantization doubles the effective K for throughput sizing because of oversampling.
+  BINARY quantization quadruples the effective QPS for throughput sizing because of rescoring.
+- **metadata_bytes_per_vector** (int) - Average payload stored alongside each
+  embedding on data nodes (used only for data-node storage calculation).
+  Min: 4, Max: 1 048 576 (1 MiB), Default: 100.
+  UI note: should be visualized on a logarithmic scale.
+- **filtering_columns** (int) - Number of filtering columns used in queries.
+  Each column adds 30 bytes per vector to search-node RAM.
+  Min: 0, Max: 20, Default: 0.
+
+References
+----------
+- ScyllaDB Cloud Vector Search docs:
+  https://cloud.docs.scylladb.com/stable/vector-search/index.html
+- HNSW paper: Malkov & Yashunin, 2018
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+# ---------------------------------------------------------------------------
+# Enums & constants
+# ---------------------------------------------------------------------------
+
+class Quantization(Enum):
+    """Vector element quantization strategy.
+
+    Each variant maps to a *compression ratio* that reduces the per-vector
+    memory footprint relative to ``float32`` storage.
+
+    * ``NONE``   - full ``float32`` (4 bytes per dimension), ratio = 1x
+    * ``SCALAR`` - scalar quantisation to ``uint8`` (1 byte per dim), ratio = 3x
+    * ``BINARY`` - 1-bit quantisation (1 bit per dim), ratio = 10x
+
+    For throughput sizing:
+    * ``SCALAR`` - the effective K is doubled (re-ranking overhead)
+    * ``BINARY`` - the effective QPS requirement is quadrupled (re-ranking
+      overhead)
+    """
+    NONE = "none"
+    SCALAR = "scalar"
+    BINARY = "binary"
+
+
+# Known data points for recall -> QPS multiplier (linear interpolation).
+# Higher recall demands more compute per query.
+_RECALL_QPS_POINTS: list[tuple[int, float]] = [
+    (70, 2.0),
+    (90, 1.0),
+    (95, 0.40),
+    (99, 0.02),
+]
+
+# Base QPS/vCPU at P99 ≤ 15 ms, K=10, recall ≤ 90 %.
+# Bucket boundaries are defined by vector count.  QPS/vCPU is linearly
+# interpolated between consecutive bucket endpoints.
+_QPS_BUCKETS: list[tuple[str, int, int, int]] = [
+    # (label, max_vectors, max_dims, base_qps_per_vcpu)
+    ("low-medium",        5_000_000, 1024, 350),
+    ("medium-large",    100_000_000, 1024, 250),
+    ("large-xlarge",  1_000_000_000, 1024, 170),
+    ("xlarge+",       4_000_000_000, 1024,  80),
+]
+
+# Ratio of search-node vCPUs to data-node vCPUs.
+SEARCH_TO_DATA_VCPU_RATIO = 6
+
+# ScyllaDB data-node replication factor (always 3 for production).
+REPLICATION_FACTOR = 3
+
+# Overhead factor applied to raw index size (metadata, alignment, etc.).
+INDEX_OVERHEAD_FACTOR = 1.1
+
+# Bytes per float32 element.
+FLOAT32_BYTES = 4
+
+# Minimum number of search node replicas for production availability.
+MIN_SEARCH_REPLICAS = 2
+
+# Dimensionality bounds.
+MIN_DIMENSIONS = 1
+MAX_DIMENSIONS = 16_000
+
+# Minimum HNSW M parameter (connectivity).
+MIN_M = 4
+
+# RAM overhead per filtering column per vector (bytes).
+FILTERING_COLUMN_BYTES_PER_VECTOR = 30
+
+# Filtering columns bounds.
+MIN_FILTERING_COLUMNS = 0
+MAX_FILTERING_COLUMNS = 20
+
+# Vector count bounds.
+MAX_VECTORS = 4_000_000_000
+MIN_VECTORS = 10_000
+
+# Metadata bytes bounds.
+MAX_METADATA_BYTES = 1_048_576   # 1 MiB
+MIN_METADATA_BYTES = 4
+
+# K bounds.
+MIN_K = 1
+MAX_K = 1_000
+
+# QPS bounds (non-zero).
+MAX_QPS = 1_000_000
+MIN_QPS = 10
+
+# Recall bounds.
+MIN_RECALL = 70
+MAX_RECALL = 99
+
+# Compression ratios for quantization strategies.
+SCALAR_COMPRESSION_RATIO = 3.0
+BINARY_COMPRESSION_RATIO = 10.0
+
+# Default values for SizingInput fields.
+DEFAULT_NUM_VECTORS = 50_000_000
+DEFAULT_DIMENSIONS = 1_536
+DEFAULT_TARGET_QPS = 1_000
+DEFAULT_RECALL = 90
+DEFAULT_K = 10
+DEFAULT_METADATA_BYTES = 100
+
+
+# ---------------------------------------------------------------------------
+# Available instance types
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class InstanceType:
+    """An AWS instance type available for search-node deployment."""
+    name: str
+    vcpus: int
+    ram_gb: float
+    cost_per_hour: float
+
+# ScyllaDB Cloud currently supports the following instance
+# types for search nodes. Prices as of 2026-02-26.
+AVAILABLE_INSTANCES: list[InstanceType] = [
+    InstanceType("t4g.medium",     2,    4,    0.134),
+    InstanceType("r7g.medium",     1,    8,    0.214),
+    InstanceType("r7g.large",      2,   16,    0.428),
+    InstanceType("r7g.xlarge",     4,   32,    0.857),
+    InstanceType("r7g.2xlarge",    8,   64,    1.714),
+    InstanceType("r7g.4xlarge",   16,  128,    3.427),
+    InstanceType("r7g.8xlarge",   32,  256,    6.854),
+    InstanceType("r7g.12xlarge",  48,  384,   10.282),
+    InstanceType("r7g.16xlarge",  64,  512,   13.709),
+    InstanceType("r7i.24xlarge",  96,  768,   25.402),
+    InstanceType("r7i.48xlarge", 192, 1536,   50.803),
+]
+
+
+# ---------------------------------------------------------------------------
+# Input parameters
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SizingInput:
+    """All user-supplied parameters needed to compute a VSS sizing estimate.
+
+    Parameters
+    ----------
+    num_vectors : int
+        Total number of vectors to be indexed (N).
+        Min: 10 000, Max: 4 000 000 000, Default: 50 000 000.
+    dimensions : int
+        Number of dimensions per vector embedding.
+        Min: 1, Max: 16 000, Default: 1 536.
+    target_qps : int
+        Desired queries-per-second at P99 ≤ 15 ms latency.
+        Min: 10, Max: 1 000 000, Default: 1 000.
+    recall : int
+        Target recall accuracy as a percentage.
+        Min: 70, Max: 99, Default: 90.
+    k : int
+        Number of nearest-neighbour results returned per query.
+        Min: 1, Max: 1 000, Default: 10.
+    quantization : Quantization
+        Compression strategy applied to vector elements (default ``NONE``).
+    metadata_bytes_per_vector : int
+        Average additional payload stored alongside each embedding on the
+        data nodes (used only for data-node storage calculation).
+        Min: 4, Max: 1 048 576 (1 MiB), Default: 100.
+    filtering_columns : int
+        Number of filtering columns.  Each column adds 30 bytes per vector
+        to search-node RAM.  Min: 0, Max: 20, Default: 0.
+    """
+    num_vectors: int = DEFAULT_NUM_VECTORS
+    dimensions: int = DEFAULT_DIMENSIONS
+    target_qps: int = DEFAULT_TARGET_QPS
+    recall: int = DEFAULT_RECALL
+    k: int = DEFAULT_K
+    quantization: Quantization = Quantization.NONE
+    metadata_bytes_per_vector: int = DEFAULT_METADATA_BYTES
+    filtering_columns: int = MIN_FILTERING_COLUMNS
+
+    def __post_init__(self) -> None:
+        if not MIN_VECTORS <= self.num_vectors <= MAX_VECTORS:
+            raise ValueError(
+                f"num_vectors must be between {MIN_VECTORS:,} and {MAX_VECTORS:,}"
+            )
+        if not MIN_DIMENSIONS <= self.dimensions <= MAX_DIMENSIONS:
+            raise ValueError(
+                f"dimensions must be between {MIN_DIMENSIONS} and {MAX_DIMENSIONS}"
+            )
+        if not MIN_QPS <= self.target_qps <= MAX_QPS:
+            raise ValueError(
+                f"target_qps must be between "
+                f"{MIN_QPS:,} and {MAX_QPS:,}"
+            )
+        if not MIN_RECALL <= self.recall <= MAX_RECALL:
+            raise ValueError(
+                f"recall must be between {MIN_RECALL} and {MAX_RECALL}"
+            )
+        if not MIN_K <= self.k <= MAX_K:
+            raise ValueError(f"k must be between {MIN_K} and {MAX_K}")
+        if not MIN_METADATA_BYTES <= self.metadata_bytes_per_vector <= MAX_METADATA_BYTES:
+            raise ValueError(
+                f"metadata_bytes_per_vector must be between "
+                f"{MIN_METADATA_BYTES} and {MAX_METADATA_BYTES:,}"
+            )
+        if not MIN_FILTERING_COLUMNS <= self.filtering_columns <= MAX_FILTERING_COLUMNS:
+            raise ValueError(
+                f"filtering_columns must be between {MIN_FILTERING_COLUMNS} and "
+                f"{MAX_FILTERING_COLUMNS}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Output / result
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HNSWParams:
+    """Resolved HNSW index configuration parameters."""
+    m: int
+
+
+@dataclass
+class SearchNodeSizing:
+    """Sizing result for a single VSS (uSearch) search node replica."""
+    index_ram_bytes: int
+    filtering_ram_bytes: int
+    total_ram_bytes: int
+    total_ram_gb: float
+    required_vcpus: int
+    base_qps_per_vcpu: float
+    effective_qps_per_vcpu: float
+    throughput_bucket: str
+
+
+@dataclass
+class InstanceSelection:
+    """Result of the search-node instance type selection.
+
+    The algorithm picks the cheapest instance configuration that satisfies
+    both the per-replica RAM requirement (every replica holds the full HNSW
+    index) and the aggregate vCPU requirement (query load is distributed
+    across replicas).  At least ``MIN_SEARCH_REPLICAS`` instances are
+    always provisioned for high availability.
+    """
+    instance_type: InstanceType
+    num_instances: int
+    total_vcpus: int
+    total_ram_gb: float
+    total_cost_per_hour: float
+
+
+@dataclass
+class DataNodeSizing:
+    """Sizing result for the ScyllaDB data-node tier."""
+    total_vcpus: int
+    vcpus_per_node: int
+    num_nodes: int
+    total_storage_bytes: int
+    total_storage_gb: float
+    embedding_storage_bytes: int
+    metadata_storage_bytes: int
+
+
+@dataclass
+class SizingResult:
+    """Complete VSS sizing recommendation."""
+    input: SizingInput
+    hnsw_params: HNSWParams
+    compression_ratio: float
+    search_node: SearchNodeSizing
+    data_node: DataNodeSizing
+    instance_selection: InstanceSelection
+    search_replicas: int
+    summary: str = field(default="", repr=False)
+
+
+# ---------------------------------------------------------------------------
+# Core algorithm
+# ---------------------------------------------------------------------------
+
+def _round_up_m(n: int | float) -> int:
+    """Round *n* up to the next power of two, clamped to ``MIN_M``."""
+    if n <= MIN_M:
+        return MIN_M
+    return 2 ** math.ceil(math.log2(n))
+
+
+def _estimate_m(num_vectors: int, recall: int) -> int:
+    """Estimate the HNSW M parameter from the dataset size and target recall.
+
+    Formula::
+
+        M = 1.5 * log10(N) * (-ln(1 - Recall))
+
+    rounded up to the smallest power of two >= the raw estimate.
+
+    The required graph connectivity is driven by two factors:
+
+    * **Graph Size (N)** — In a Navigable Small World the number of hops
+      required to traverse the graph scales logarithmically with the number
+      of nodes.
+
+    * **The "Long Tail" of Recall (R)** — Achieving 80 % recall is easy;
+      pushing from 95 % to 99 % is exponentially harder because you are
+      trying to capture the edge-case vectors hidden deep in local minima.
+      This behaves asymptotically.
+    """
+    recall_fraction = recall / 100.0
+    m_raw = 1.5 * math.log10(max(num_vectors, 1)) * (
+        -math.log(1.0 - recall_fraction)
+    )
+    return _round_up_m(m_raw)
+
+
+def _get_compression_ratio(quantization: Quantization) -> float:
+    """Return the effective compression ratio for the given quantization.
+
+    * ``NONE``   -> 1x (no compression)
+    * ``SCALAR`` -> 3x memory savings
+    * ``BINARY`` -> 10x memory savings
+    """
+    if quantization is Quantization.NONE:
+        return 1.0
+    if quantization is Quantization.SCALAR:
+        return SCALAR_COMPRESSION_RATIO
+    if quantization is Quantization.BINARY:
+        return BINARY_COMPRESSION_RATIO
+    raise ValueError(f"Unknown quantization: {quantization}")
+
+
+def _compute_index_ram(
+    num_vectors: int,
+    dimensions: int,
+    m: int,
+    compression_ratio: float,
+) -> int:
+    """Compute the RAM (in bytes) required to store the HNSW index.
+
+    Formula (from the sizing guide):
+        RAM = N x 4 x (Dim + M x ln(N) / ln(M x 0.5)) x 1.1 / compression
+
+    The ``x 4`` factor accounts for float32 (4 bytes) per element, and the
+    ``x 1.1`` overhead covers uSearch metadata, alignment, and bookkeeping.
+
+    Returns
+    -------
+    int
+        RAM in bytes (rounded up to the nearest byte).
+    """
+    n = num_vectors
+    d = dimensions
+    ln_n = math.log(n) if n > 1 else 0.0
+    # Guard against log(0) when M*0.5 < 1 (shouldn't happen in practice).
+    denom = math.log(m * 0.5) if m * 0.5 > 1 else 1.0
+    graph_component = m * ln_n / denom
+    raw = n * FLOAT32_BYTES * (d + graph_component) * INDEX_OVERHEAD_FACTOR
+    return math.ceil(raw / compression_ratio)
+
+
+def _get_base_qps_per_vcpu(
+    num_vectors: int,
+    dimensions: int,
+) -> tuple[str, float]:
+    """Return (bucket_label, base_QPS_per_vCPU) for the dataset profile.
+
+    QPS/vCPU is linearly interpolated between consecutive bucket endpoints.
+    Vectors at or below the first bucket boundary receive that bucket's QPS.
+    Vectors at or above the last bucket boundary receive the last bucket's QPS.
+
+    When *dimensions* exceeds the bucket's reference dimensionality (1024),
+    the QPS is scaled down proportionally: ``qps * (ref_dims / dimensions)``.
+    Dimensions at or below 1024 have no effect.
+    """
+    # Below or at the first bucket boundary -> flat first-bucket QPS.
+    first_label, first_max, first_ref_dims, first_qps = _QPS_BUCKETS[0]
+    if num_vectors <= first_max:
+        dim_factor = min(1.0, first_ref_dims / dimensions)
+        return first_label, float(first_qps) * dim_factor
+
+    # Interpolate between consecutive bucket endpoints.
+    for i in range(1, len(_QPS_BUCKETS)):
+        label, cur_max, cur_ref_dims, cur_qps = _QPS_BUCKETS[i]
+        prev_max = _QPS_BUCKETS[i - 1][1]
+        prev_qps = _QPS_BUCKETS[i - 1][3]
+        if num_vectors <= cur_max:
+            fraction = (num_vectors - prev_max) / (cur_max - prev_max)
+            qps = prev_qps + (cur_qps - prev_qps) * fraction
+            dim_factor = min(1.0, cur_ref_dims / dimensions)
+            return label, qps * dim_factor
+
+    # At or beyond the last bucket -> last bucket's QPS.
+    last = _QPS_BUCKETS[-1]
+    dim_factor = min(1.0, last[2] / dimensions)
+    return last[0], float(last[3]) * dim_factor
+
+
+def _recall_qps_multiplier(recall: int) -> float:
+    """Interpolate the QPS multiplier for a given recall percentage.
+
+    For recall ≤ 90 %, the multiplier is capped at 1.0 (baseline).
+    For recall between known data points, linear interpolation is used.
+    """
+    if recall <= _RECALL_QPS_POINTS[0][0]:
+        return _RECALL_QPS_POINTS[0][1]
+
+    for i in range(len(_RECALL_QPS_POINTS) - 1):
+        r_lo, m_lo = _RECALL_QPS_POINTS[i]
+        r_hi, m_hi = _RECALL_QPS_POINTS[i + 1]
+        if r_lo <= recall <= r_hi:
+            fraction = (recall - r_lo) / (r_hi - r_lo)
+            return m_lo + (m_hi - m_lo) * fraction
+
+    # Beyond last known point — use the last value.
+    return _RECALL_QPS_POINTS[-1][1]
+
+
+def _effective_qps_per_vcpu(
+    base_qps: float,
+    recall: int,
+    k: int,
+) -> float:
+    """Adjust the base QPS/vCPU for recall target and K value.
+
+    - Higher recall tiers reduce throughput per vCPU (interpolated).
+    - K = 100 halves the throughput compared to K = 10; intermediate K
+      values are interpolated linearly.
+    """
+    recall_factor = _recall_qps_multiplier(recall)
+
+    # K adjustment: K=10 -> factor 1.0, K=100 -> factor 0.5, linear between.
+    if k <= 10:
+        k_factor = 1.0
+    elif k >= 100:
+        k_factor = 0.5
+    else:
+        k_factor = 1.0 - 0.5 * (k - 10) / 90.0
+
+    return base_qps * recall_factor * k_factor
+
+
+def _select_instance(
+    index_ram_gb: float,
+    required_vcpus: int,
+) -> InstanceSelection:
+    """Select the cheapest instance configuration for search-node replicas.
+
+    Each search replica holds the full HNSW index in RAM, so every instance
+    must have at least *index_ram_gb* of memory.  The query load is
+    distributed across all replicas, so the aggregate vCPU count must meet
+    *required_vcpus*.  At least ``MIN_SEARCH_REPLICAS`` instances are always
+    provisioned for high availability.  When more than two replicas are
+    needed, the count is rounded up to the next multiple of 3 so that
+    replicas can be evenly distributed across availability zones.
+
+    The function evaluates every entry in ``AVAILABLE_INSTANCES`` and returns
+    the option with the lowest total hourly cost.
+
+    Raises
+    ------
+    ValueError
+        If no available instance has enough RAM for the index.
+    """
+    best: InstanceSelection | None = None
+
+    for inst in AVAILABLE_INSTANCES:
+        if inst.ram_gb < index_ram_gb:
+            continue
+
+        if required_vcpus > 0 and inst.vcpus > 0:
+            num = max(
+                MIN_SEARCH_REPLICAS,
+                math.ceil(required_vcpus / inst.vcpus),
+            )
+        else:
+            num = MIN_SEARCH_REPLICAS
+
+        # When more than 2 replicas are needed, round up to the next
+        # multiple of 3 for even distribution across availability zones.
+        if num > MIN_SEARCH_REPLICAS and num % 3 != 0:
+            num = num + (3 - num % 3)
+
+        total_cost = num * inst.cost_per_hour
+
+        candidate = InstanceSelection(
+            instance_type=inst,
+            num_instances=num,
+            total_vcpus=num * inst.vcpus,
+            total_ram_gb=round(num * inst.ram_gb, 2),
+            total_cost_per_hour=round(total_cost, 3),
+        )
+
+        if best is None or candidate.total_cost_per_hour < best.total_cost_per_hour:
+            best = candidate
+
+    if best is None:
+        raise ValueError(
+            f"No available instance has enough RAM ({index_ram_gb:.2f} GB) "
+            f"for the HNSW index. Consider using quantization to reduce "
+            f"memory requirements."
+        )
+
+    return best
+
+
+def compute_sizing(inp: SizingInput) -> SizingResult:
+    """Run the full 3-step VSS sizing algorithm.
+
+    Steps
+    -----
+    1. **Search-node baseline** - compute RAM per search-node replica.
+    2. **Throughput sizing** - compute vCPUs required on search nodes.
+    3. **Data-node sizing** - compute vCPUs and storage for ScyllaDB data
+       nodes.
+
+    Parameters
+    ----------
+    inp : SizingInput
+        All user-supplied sizing parameters.
+
+    Returns
+    -------
+    SizingResult
+        Complete infrastructure recommendation.
+    """
+    # --- Resolve HNSW M parameter ---
+    m = _estimate_m(inp.num_vectors, inp.recall)
+    hnsw = HNSWParams(m=m)
+
+    # --- Step 1: Search node baseline (RAM) ---
+    compression = _get_compression_ratio(inp.quantization)
+    index_ram = _compute_index_ram(
+        inp.num_vectors, inp.dimensions, m, compression,
+    )
+    filtering_ram = (
+        inp.filtering_columns * FILTERING_COLUMN_BYTES_PER_VECTOR
+        * inp.num_vectors
+    )
+    total_search_ram = index_ram + filtering_ram
+    total_search_ram_gb = total_search_ram / (1024 ** 3)
+
+    # --- Step 2: Throughput sizing (search node vCPUs) ---
+    bucket_label, base_qps = _get_base_qps_per_vcpu(
+        inp.num_vectors, inp.dimensions,
+    )
+
+    # For SCALAR quantization, size as if K is twice as large (re-ranking).
+    effective_k = (
+        inp.k * 2 if inp.quantization is Quantization.SCALAR else inp.k
+    )
+    eff_qps = _effective_qps_per_vcpu(base_qps, inp.recall, effective_k)
+
+    # For BINARY quantization, size as if QPS is 4x larger (re-ranking).
+    effective_target_qps = (
+        inp.target_qps * 4
+        if inp.quantization is Quantization.BINARY
+        else inp.target_qps
+    )
+
+    search_vcpus = math.ceil(effective_target_qps / eff_qps) if eff_qps > 0 else 0
+
+    search_node = SearchNodeSizing(
+        index_ram_bytes=index_ram,
+        filtering_ram_bytes=filtering_ram,
+        total_ram_bytes=total_search_ram,
+        total_ram_gb=round(total_search_ram_gb, 2),
+        required_vcpus=search_vcpus,
+        base_qps_per_vcpu=base_qps,
+        effective_qps_per_vcpu=round(eff_qps, 2),
+        throughput_bucket=bucket_label,
+    )
+
+    # --- Step 2b: Instance selection (search nodes) ---
+    instance_sel = _select_instance(total_search_ram_gb, search_vcpus)
+
+    # --- Step 3: Data node sizing ---
+    embedding_storage = inp.num_vectors * inp.dimensions * FLOAT32_BYTES
+    metadata_storage = inp.num_vectors * inp.metadata_bytes_per_vector
+    total_storage = embedding_storage + metadata_storage
+    total_storage_gb = total_storage / (1024 ** 3)
+
+    data_total_vcpus = max(
+        1, math.ceil(search_vcpus / SEARCH_TO_DATA_VCPU_RATIO),
+    )
+    # Distribute across replication factor; each node needs a fair share.
+    vcpus_per_node = max(
+        1, math.ceil(data_total_vcpus / REPLICATION_FACTOR),
+    )
+    # Re-derive actual total so it's consistent.
+    actual_total_vcpus = vcpus_per_node * REPLICATION_FACTOR
+
+    data_node = DataNodeSizing(
+        total_vcpus=actual_total_vcpus,
+        vcpus_per_node=vcpus_per_node,
+        num_nodes=REPLICATION_FACTOR,
+        total_storage_bytes=total_storage,
+        total_storage_gb=round(total_storage_gb, 2),
+        embedding_storage_bytes=embedding_storage,
+        metadata_storage_bytes=metadata_storage,
+    )
+
+    # --- Build human-readable summary ---
+    summary_lines = [
+        "=== ScyllaDB VSS Sizing Summary ===",
+        "",
+        f"Dataset: {inp.num_vectors:,} vectors x {inp.dimensions} dimensions",
+        f"Quantization: {inp.quantization.value}"
+        f"  (compression ratio: {compression}x)",
+        f"Recall target: ~{inp.recall}%  |  K = {inp.k}",
+        f"Target QPS: {inp.target_qps:,}  (P99 ≤ 15 ms)",
+        f"Filtering columns: {inp.filtering_columns}",
+        "",
+        "--- HNSW Parameters (computed) ---",
+        f"  M              = {hnsw.m}",
+        "",
+        "--- Search Nodes (computed, per replica) ---",
+        f"  Index RAM      = {index_ram / (1024**3):.2f} GB",
+        f"  Filtering RAM  = {filtering_ram / (1024**3):.2f} GB",
+        f"  Total RAM      = {search_node.total_ram_gb:.2f} GB",
+        f"  vCPUs required = {search_node.required_vcpus}",
+        f"  QPS/vCPU       = {search_node.effective_qps_per_vcpu:.1f}"
+        f"  (base {search_node.base_qps_per_vcpu:.1f},"
+        f" bucket: {bucket_label})",
+        f"  Replicas       = {instance_sel.num_instances}",
+        f"  Instance type  = {instance_sel.instance_type.name}",
+        f"  Total cost     = ${instance_sel.total_cost_per_hour:.3f}/hr",
+        "",
+        "--- ScyllaDB Data Nodes (computed) ---",
+        f"  Nodes          = {data_node.num_nodes}"
+        f"  (RF={REPLICATION_FACTOR})",
+        f"  vCPUs / node   = {data_node.vcpus_per_node}",
+        f"  Total storage  = {data_node.total_storage_gb:.2f} GB"
+        f"  (embeddings {embedding_storage / (1024**3):.2f} GB"
+        f" + metadata {metadata_storage / (1024**3):.2f} GB)",
+    ]
+    summary = "\n".join(summary_lines)
+
+    return SizingResult(
+        input=inp,
+        hnsw_params=hnsw,
+        compression_ratio=compression,
+        search_node=search_node,
+        data_node=data_node,
+        instance_selection=instance_sel,
+        search_replicas=instance_sel.num_instances,
+        summary=summary,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convenience helpers
+# ---------------------------------------------------------------------------
+
+def recommend_hnsw_params(num_vectors: int, recall: int) -> HNSWParams:
+    """Return recommended HNSW parameters for a given dataset size and recall
+    percentage.
+    """
+    m = _estimate_m(num_vectors, recall)
+    return HNSWParams(m=m)
+
+
+def estimate_index_ram_gb(
+    num_vectors: int,
+    dimensions: int,
+    m: int = 32,
+    quantization: Quantization = Quantization.NONE,
+    filtering_columns: int = 0,
+) -> float:
+    """Quick helper: estimate search-node RAM in GB without the full sizing.
+
+    Includes both HNSW index and filtering-column overhead.
+    """
+    compression = _get_compression_ratio(quantization)
+    ram_bytes = _compute_index_ram(num_vectors, dimensions, m, compression)
+    filtering_bytes = filtering_columns * FILTERING_COLUMN_BYTES_PER_VECTOR * num_vectors
+    return round((ram_bytes + filtering_bytes) / (1024 ** 3), 2)
