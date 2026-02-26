@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ScyllaDB VSS Sizing Calculator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <h1>ScyllaDB Vector Search Sizing Calculator</h1>
+    <p class="subtitle">Estimate infrastructure requirements for deploying ScyllaDB Vector Similarity Search</p>
+  </div>
+</header>
+
+<main>
+  <!-- ───────── Input Panel ───────── -->
+  <section class="panel inputs-panel">
+    <h2>Configuration</h2>
+
+    <!-- num_vectors (log scale) -->
+    <div class="field">
+      <div class="field-header">
+        <label for="num_vectors">Number of Vectors</label>
+        <output id="num_vectors_val" class="field-value"></output>
+      </div>
+      <input type="range" id="num_vectors" min="4" max="9.60206" step="0.01" value="7.69897">
+      <div class="field-range"><span>10 K</span><span>4 B</span></div>
+      <p class="hint">Total vectors to index. Logarithmic scale.</p>
+    </div>
+
+    <!-- dimensions -->
+    <div class="field">
+      <div class="field-header">
+        <label for="dimensions">Dimensions</label>
+        <output id="dimensions_val" class="field-value"></output>
+      </div>
+      <input type="range" id="dimensions" min="1" max="16000" step="1" value="1536">
+      <div class="field-range"><span>1</span><span>16 000</span></div>
+      <div class="preset-chips">
+        <button class="chip" data-target="dimensions" data-value="128">128</button>
+        <button class="chip" data-target="dimensions" data-value="768">768</button>
+        <button class="chip" data-target="dimensions" data-value="1536">1536</button>
+        <button class="chip" data-target="dimensions" data-value="4096">4096</button>
+      </div>
+      <p class="hint">Embedding dimensionality. Common: 128 (image), 768 (BERT), 1536 (OpenAI), 4096 (LLMs).</p>
+    </div>
+
+    <!-- target_qps -->
+    <div class="field">
+      <div class="field-header">
+        <label for="target_qps">Target QPS</label>
+        <output id="target_qps_val" class="field-value"></output>
+      </div>
+      <input type="range" id="target_qps" min="10" max="1000000" step="10" value="1000">
+      <div class="field-range"><span>10</span><span>1 000 000</span></div>
+      <p class="hint">Desired queries per second at P99 ≤ 15 ms latency.</p>
+    </div>
+
+    <!-- recall (slider) -->
+    <div class="field">
+      <div class="field-header">
+        <label for="recall">Recall Target</label>
+        <output id="recall_val" class="field-value"></output>
+      </div>
+      <input type="range" id="recall" min="70" max="99" step="1" value="90">
+      <div class="field-range"><span>70 %</span><span>99 %</span></div>
+      <p class="hint">Higher recall dramatically reduces throughput per vCPU.</p>
+    </div>
+
+    <!-- k (slider) -->
+    <div class="field">
+      <div class="field-header">
+        <label for="k">K (results per query)</label>
+        <output id="k_val" class="field-value"></output>
+      </div>
+      <input type="range" id="k" min="1" max="1000" step="1" value="10">
+      <div class="field-range"><span>1</span><span>1 000</span></div>
+      <p class="hint">Nearest-neighbour results per query. K=100 halves throughput vs K=10.</p>
+    </div>
+
+    <!-- quantization -->
+    <div class="field">
+      <div class="field-header">
+        <label>Quantization</label>
+      </div>
+      <div class="radio-group">
+        <label class="radio-card selected" data-value="none">
+          <input type="radio" name="quantization" value="none" checked>
+          <span class="radio-label">None</span>
+          <span class="radio-desc">float32 — no compression</span>
+        </label>
+        <label class="radio-card" data-value="scalar">
+          <input type="radio" name="quantization" value="scalar">
+          <span class="radio-label">Scalar (uint8)</span>
+          <span class="radio-desc">~3× memory savings</span>
+        </label>
+        <label class="radio-card" data-value="binary">
+          <input type="radio" name="quantization" value="binary">
+          <span class="radio-label">Binary (1-bit)</span>
+          <span class="radio-desc">~10× memory savings</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- metadata_bytes_per_vector (log scale) -->
+    <div class="field">
+      <div class="field-header">
+        <label for="metadata_bytes">Metadata per Vector</label>
+        <output id="metadata_bytes_val" class="field-value"></output>
+      </div>
+      <input type="range" id="metadata_bytes" min="0.60206" max="6.0206" step="0.01" value="2">
+      <div class="field-range"><span>4 B</span><span>1 MiB</span></div>
+      <p class="hint">Average payload alongside each embedding (data-node storage). Logarithmic scale.</p>
+    </div>
+
+    <!-- filtering_columns (slider) -->
+    <div class="field">
+      <div class="field-header">
+        <label for="filtering_columns">Filtering Columns</label>
+        <output id="filtering_columns_val" class="field-value"></output>
+      </div>
+      <input type="range" id="filtering_columns" min="0" max="20" step="1" value="0">
+      <div class="field-range"><span>0</span><span>20</span></div>
+      <p class="hint">Each column adds 30 bytes per vector to search-node RAM.</p>
+    </div>
+  </section>
+
+  <!-- ───────── Results Panel ───────── -->
+  <section class="panel results-panel" id="results-panel">
+    <h2>Sizing Recommendation</h2>
+    <div id="error-box" class="error-box hidden"></div>
+    <div id="results-content" class="results-grid">
+      <p class="placeholder-text">Adjust parameters on the left to see results.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>ScyllaDB VSS Sizing Calculator &mdash; based on internal benchmarks and sizing guidelines.</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
