@@ -8,6 +8,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::anyhow;
 use clap::Parser;
+use indicatif::MultiProgress;
 use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
@@ -40,12 +41,34 @@ fn main() -> anyhow::Result<()> {
 
     // Disable ANSI colors when explicitly requested or when stdout is not a terminal
     // (e.g. output is redirected to a file)
-    let use_ansi = !disable_colors && std::io::stdout().is_terminal();
+    let is_terminal = std::io::stdout().is_terminal();
+    let use_ansi = !disable_colors && is_terminal;
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?)
-        .with(fmt::layer().with_target(false).with_ansi(use_ansi))
-        .init();
+    // When running in a terminal, create a MultiProgress to coordinate progress bars
+    // with log output so that they don't overwrite each other.
+    let multi_progress = if is_terminal {
+        Some(MultiProgress::new())
+    } else {
+        None
+    };
+
+    if let Some(ref multi) = multi_progress {
+        let writer = vector_store::progress_display::ProgressWriter::new(multi.clone());
+        tracing_subscriber::registry()
+            .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?)
+            .with(
+                fmt::layer()
+                    .with_target(false)
+                    .with_ansi(use_ansi)
+                    .with_writer(move || writer.clone()),
+            )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?)
+            .with(fmt::layer().with_target(false).with_ansi(use_ansi))
+            .init();
+    }
 
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -80,6 +103,10 @@ fn main() -> anyhow::Result<()> {
         config_manager.start(dotenvy_to_std_var);
 
         let node_state = vector_store::new_node_state().await;
+
+        // Spawn progress bar display when running in a terminal
+        let _progress_handle = multi_progress
+            .map(|multi| vector_store::progress_display::spawn(node_state.clone(), multi));
 
         let opensearch_addr = config.opensearch_addr.clone();
 

@@ -27,6 +27,7 @@ futures = "0.3.31"
 hickory-server = "0.25.2"
 httpclient = { path = "crates/httpclient" }
 humantime = "2.2.0"
+indicatif = "0.17.11"
 itertools = "0.14.0"
 macros = { path = "crates/macros" }
 mimalloc = "0.1.48"

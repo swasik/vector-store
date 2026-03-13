@@ -192,7 +192,10 @@ pub(crate) async fn new(
             debug!("starting");
             let completed_scan_length = Arc::new(AtomicU64::new(0));
             node_state
-                .send_event(Event::FullScanStarted(metadata.clone()))
+                .send_event(Event::FullScanStarted(
+                    metadata.clone(),
+                    Arc::clone(&completed_scan_length),
+                ))
                 .await;
 
             info!("starting full scan on {}", metadata.key());

@@ -22,6 +22,7 @@ mod monitor_items;
 pub mod node_state;
 mod partition_key;
 mod primary_key;
+pub mod progress_display;
 mod similarity;
 mod table;
 mod timestamp;
@@ -695,7 +696,7 @@ pub async fn wait_for_shutdown() {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Percentage {
     value: f64,
 }
@@ -720,7 +721,7 @@ impl TryFrom<f64> for Percentage {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Progress {
     Done,
     InProgress(Percentage),

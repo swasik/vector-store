@@ -5,9 +5,12 @@
 
 use crate::IndexKey;
 use crate::IndexMetadata;
+use crate::Progress;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry::Vacant;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::Instrument;
@@ -36,20 +39,31 @@ pub enum Event {
     ConnectedToDb,
     DiscoveringIndexes,
     IndexesDiscovered(HashSet<IndexMetadata>),
-    FullScanStarted(IndexMetadata),
+    FullScanStarted(IndexMetadata, Arc<AtomicU64>),
     FullScanFinished(IndexMetadata),
+}
+
+/// Per-index build progress information.
+#[derive(Clone, Debug)]
+pub struct IndexBuildProgress {
+    /// The display name for this index (keyspace.index).
+    pub index_key: IndexKey,
+    /// The build progress percentage.
+    pub progress: Progress,
 }
 
 pub enum NodeState {
     SendEvent(Event),
     GetStatus(oneshot::Sender<NodeStatus>),
     GetIndexStatus(oneshot::Sender<Option<IndexStatus>>, String, String),
+    GetBuildingIndexes(oneshot::Sender<Vec<IndexBuildProgress>>),
 }
 
 pub(crate) trait NodeStateExt {
     async fn send_event(&self, event: Event);
     async fn get_status(&self) -> NodeStatus;
     async fn get_index_status(&self, keyspace: &str, index: &str) -> Option<IndexStatus>;
+    async fn get_building_indexes(&self) -> Vec<IndexBuildProgress>;
 }
 
 impl NodeStateExt for mpsc::Sender<NodeState> {
@@ -81,6 +95,15 @@ impl NodeStateExt for mpsc::Sender<NodeState> {
         rx.await
             .expect("NodeStateExt::get_index_status: failed to receive index status")
     }
+
+    async fn get_building_indexes(&self) -> Vec<IndexBuildProgress> {
+        let (tx, rx) = oneshot::channel();
+        self.send(NodeState::GetBuildingIndexes(tx))
+            .await
+            .expect("NodeStateExt::get_building_indexes: internal actor should receive request");
+        rx.await
+            .expect("NodeStateExt::get_building_indexes: failed to receive building indexes")
+    }
 }
 
 fn update_indexes(idxs: &mut HashMap<IndexKey, IndexStatus>, keys: HashSet<IndexKey>) {
@@ -106,6 +129,7 @@ pub(crate) async fn new() -> mpsc::Sender<NodeState> {
             let mut status = NodeStatus::Initializing;
             let mut initial_idxs = HashSet::new();
             let mut idxs = HashMap::<IndexKey, IndexStatus>::new();
+            let mut progress_counters = HashMap::<IndexKey, Arc<AtomicU64>>::new();
             while let Some(msg) = rx.recv().await {
                 match msg {
                     NodeState::SendEvent(event) => match event {
@@ -135,15 +159,19 @@ pub(crate) async fn new() -> mpsc::Sender<NodeState> {
                                 initial_idxs = indexes;
                             }
                         }
-                        Event::FullScanStarted(metadata) => {
-                            if let Some(index_status) = idxs.get_mut(&metadata.key()) {
+                        Event::FullScanStarted(metadata, scan_progress) => {
+                            let key = metadata.key();
+                            if let Some(index_status) = idxs.get_mut(&key) {
                                 *index_status = IndexStatus::FullScanning;
                             }
+                            progress_counters.insert(key, scan_progress);
                         }
                         Event::FullScanFinished(metadata) => {
-                            if let Some(index_status) = idxs.get_mut(&metadata.key()) {
+                            let key = metadata.key();
+                            if let Some(index_status) = idxs.get_mut(&key) {
                                 *index_status = IndexStatus::Serving;
                             }
+                            progress_counters.remove(&key);
 
                             initial_idxs.remove(&metadata);
                             if initial_idxs.is_empty() && status != NodeStatus::Serving {
@@ -170,6 +198,21 @@ pub(crate) async fn new() -> mpsc::Sender<NodeState> {
                                 tracing::debug!("Failed to send index status for missing index");
                             });
                         }
+                    }
+                    NodeState::GetBuildingIndexes(tx) => {
+                        let building: Vec<IndexBuildProgress> = progress_counters
+                            .iter()
+                            .map(|(key, counter)| {
+                                let raw = counter.load(std::sync::atomic::Ordering::Relaxed);
+                                IndexBuildProgress {
+                                    index_key: key.clone(),
+                                    progress: Progress::from(raw),
+                                }
+                            })
+                            .collect();
+                        tx.send(building).unwrap_or_else(|_| {
+                            tracing::debug!("Failed to send building indexes");
+                        });
                     }
                 }
             }
@@ -286,7 +329,10 @@ mod tests {
 
         // Simulate full scan started and finished for idx
         node_state
-            .send_event(Event::FullScanStarted(idx.clone()))
+            .send_event(Event::FullScanStarted(
+                idx.clone(),
+                Arc::new(AtomicU64::new(0)),
+            ))
             .await;
         let idx_status = node_state
             .get_index_status(&idx.keyspace_name.0, &idx.index_name.0)
