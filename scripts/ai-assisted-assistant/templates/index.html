@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Assisted Assistant for AI-Assisted PRs</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-hover: #1c2129;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #58a6ff;
+  --accent-hover: #79c0ff;
+  --green: #238636;
+  --green-bg: rgba(35,134,54,0.15);
+  --green-border: rgba(35,134,54,0.4);
+  --red: #f85149;
+  --red-bg: rgba(248,81,73,0.15);
+  --yellow: #d29922;
+  --purple: #bc8cff;
+  --radius: 8px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--text);background:var(--bg);line-height:1.5;font-size:14px}
+
+/* Header */
+header{display:flex;align-items:center;justify-content:space-between;
+  padding:12px 24px;background:var(--surface);border-bottom:1px solid var(--border)}
+header h1{font-size:15px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:8px}
+header h1::before{content:"✨";font-size:16px}
+
+/* Buttons */
+.btn{padding:7px 16px;border:1px solid var(--border);border-radius:6px;cursor:pointer;
+  font-size:13px;font-weight:500;transition:all .15s ease}
+.btn-primary{background:var(--green);border-color:var(--green);color:#fff}
+.btn-primary:hover{background:#2ea043;border-color:#2ea043}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-secondary{background:var(--surface);color:var(--text)}
+.btn-secondary:hover{background:var(--surface-hover);border-color:#8b949e}
+
+main{max-width:960px;margin:24px auto;padding:0 20px}
+
+/* Login */
+#login-view{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:32px;max-width:420px;margin:60px auto}
+#login-view h2{font-size:20px;font-weight:600;margin-bottom:4px;color:var(--text)}
+#login-view .subtitle{font-size:13px;color:var(--text-muted);margin-bottom:20px}
+#login-view label{display:block;font-size:13px;font-weight:500;margin:14px 0 6px;color:var(--text)}
+#login-view input{width:100%;padding:8px 12px;background:var(--bg);border:1px solid var(--border);
+  border-radius:6px;font-size:14px;color:var(--text);outline:none;transition:border .15s}
+#login-view input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+#login-view .help{margin-top:20px;padding:14px;background:rgba(88,166,255,.08);
+  border:1px solid rgba(88,166,255,.2);border-radius:6px;font-size:12px;color:var(--text-muted)}
+#login-view .help strong{color:var(--text)}
+#login-view .help ol{margin:8px 0 0 18px}
+#login-view .help li{margin:3px 0}
+#login-view .help a{color:var(--accent);text-decoration:none}
+#login-view .help a:hover{text-decoration:underline}
+.login-error{color:var(--red);font-size:13px;margin-top:8px}
+#login-view .btn-primary{width:100%;margin-top:18px;padding:10px}
+
+/* Issues */
+#issues-view{display:none}
+.toolbar{display:flex;align-items:center;gap:12px;margin-bottom:14px;padding:0 4px}
+.toolbar .count{font-size:13px;color:var(--text-muted);margin-left:auto}
+.issue-list{display:flex;flex-direction:column;gap:2px}
+
+.issue-row{display:flex;align-items:center;gap:12px;padding:10px 14px;
+  background:var(--surface);border:1px solid var(--border);border-radius:6px;
+  transition:all .15s ease;min-height:52px;flex-wrap:wrap}
+.issue-row:hover{background:var(--surface-hover);border-color:#444c56}
+.issue-row.labeled{background:var(--green-bg);border-color:var(--green-border)}
+.issue-row.labeled:hover{background:rgba(35,134,54,0.22)}
+.issue-row.error{border-color:var(--red);background:var(--red-bg)}
+
+.issue-row input[type=checkbox]{width:16px;height:16px;flex-shrink:0;accent-color:var(--green);cursor:pointer}
+
+.issue-key{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;font-size:13px;
+  font-weight:600;white-space:nowrap}
+.issue-key a{color:var(--accent);text-decoration:none}.issue-key a:hover{color:var(--accent-hover);text-decoration:underline}
+
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:12px;
+  font-size:11px;font-weight:500;white-space:nowrap;letter-spacing:.01em}
+.badge-type{background:rgba(139,148,158,.15);color:var(--text-muted);border:1px solid rgba(139,148,158,.2)}
+.badge-status{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.25)}
+.badge-priority-highest,.badge-priority-high{background:rgba(248,81,73,.12);color:var(--red);border:1px solid rgba(248,81,73,.25)}
+.badge-priority-medium{background:rgba(210,153,34,.12);color:var(--yellow);border:1px solid rgba(210,153,34,.25)}
+.badge-priority-low,.badge-priority-lowest{background:rgba(139,148,158,.12);color:var(--text-muted);border:1px solid rgba(139,148,158,.2)}
+.badge-label{background:rgba(35,134,54,.15);color:#3fb950;border:1px solid rgba(35,134,54,.3)}
+
+.issue-summary{font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.issue-updated{font-size:11px;color:var(--text-muted);white-space:nowrap}
+.issue-labels{display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap}
+
+.actions{display:flex;align-items:center;gap:12px;margin-top:16px;padding:0 4px}
+#spinner{display:none;font-size:13px;color:var(--text-muted)}
+#error-banner{display:none;padding:12px 16px;background:var(--red-bg);color:var(--red);
+  border:1px solid rgba(248,81,73,.3);border-radius:6px;margin-bottom:14px;font-size:13px;cursor:pointer}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>AI-Assisted Assistant for AI-Assisted PRs</h1>
+  <form id="logout-form" method="post" action="/auth/logout" style="display:none">
+    <button type="submit" class="btn btn-secondary">Sign out</button>
+  </form>
+</header>
+
+<main>
+  <div id="error-banner" onclick="this.style.display='none'"></div>
+
+  <!-- Login view -->
+  <div id="login-view">
+    <h2>Sign in to JIRA</h2>
+    <p class="subtitle">Use your Atlassian email and API token</p>
+    <form id="login-form">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" required autocomplete="username" placeholder="you@company.com">
+      <label for="api_token">API Token</label>
+      <input id="api_token" name="api_token" type="password" required autocomplete="current-password" placeholder="Paste your token here">
+      <div class="login-error" id="login-error"></div>
+      <button type="submit" class="btn btn-primary">Sign in</button>
+    </form>
+    <div class="help">
+      <strong>How to get an API token:</strong>
+      <ol>
+        <li>Go to <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noopener">id.atlassian.com &rarr; API tokens</a></li>
+        <li>Click <strong>Create API token</strong></li>
+        <li>Give it a label (e.g., &ldquo;AI-Assisted Assistant for AI-Assisted PRs&rdquo;)</li>
+        <li>Copy the generated token and paste it above</li>
+      </ol>
+    </div>
+  </div>
+
+  <!-- Issues view -->
+  <div id="issues-view">
+    <div class="toolbar">
+      <button id="select-all-btn" class="btn btn-secondary">Select All</button>
+      <span class="count" id="selected-count">0 selected</span>
+    </div>
+    <div class="issue-list" id="issue-list"></div>
+    <div class="actions">
+      <button id="lucky-btn" class="btn btn-primary" disabled>&#10024; Label it</button>
+      <span id="spinner">Updating…</span>
+    </div>
+  </div>
+</main>
+
+<script>
+(function() {
+  const loginView = document.getElementById('login-view');
+  const issuesView = document.getElementById('issues-view');
+  const logoutForm = document.getElementById('logout-form');
+  const loginForm = document.getElementById('login-form');
+  const loginError = document.getElementById('login-error');
+  const issueList = document.getElementById('issue-list');
+  const selectAllBtn = document.getElementById('select-all-btn');
+  const luckyBtn = document.getElementById('lucky-btn');
+  const spinner = document.getElementById('spinner');
+  const errorBanner = document.getElementById('error-banner');
+  const selectedCount = document.getElementById('selected-count');
+
+  const selected = new Set();
+  let issues = [];
+
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.style.display = 'block';
+  }
+
+  function relativeTime(dateStr) {
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 60) return mins + 'm ago';
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return hrs + 'h ago';
+    const days = Math.floor(hrs / 24);
+    return days + 'd ago';
+  }
+
+  function hasAiLabel(labels) {
+    return (labels || []).some(function(l) { return l === 'ai-assisted'; });
+  }
+
+  function priorityClass(priority) {
+    var p = (priority || '').toLowerCase();
+    if (p === 'highest' || p === 'high') return 'badge-priority-highest';
+    if (p === 'medium') return 'badge-priority-medium';
+    return 'badge-priority-low';
+  }
+
+  function updateCount() {
+    selectedCount.textContent = selected.size + ' selected';
+    luckyBtn.disabled = selected.size === 0;
+  }
+
+  function renderIssues(data) {
+    issues = data;
+    issueList.innerHTML = '';
+    selected.clear();
+    issues.forEach(function(issue) {
+      var isLabeled = hasAiLabel(issue.labels);
+
+      var row = document.createElement('div');
+      row.className = 'issue-row' + (isLabeled ? ' labeled' : '');
+      row.dataset.key = issue.key;
+
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.addEventListener('change', function() {
+        if (cb.checked) selected.add(issue.key); else selected.delete(issue.key);
+        updateCount();
+      });
+
+      var key = document.createElement('span');
+      key.className = 'issue-key';
+      var a = document.createElement('a');
+      a.href = issue.url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = issue.key;
+      key.appendChild(a);
+
+      var typeBadge = document.createElement('span');
+      typeBadge.className = 'badge badge-type';
+      typeBadge.textContent = issue.issueType;
+
+      var statusBadge = document.createElement('span');
+      statusBadge.className = 'badge badge-status';
+      statusBadge.textContent = issue.status;
+
+      var priBadge = document.createElement('span');
+      priBadge.className = 'badge ' + priorityClass(issue.priority);
+      priBadge.textContent = issue.priority;
+
+      var summary = document.createElement('span');
+      summary.className = 'issue-summary';
+      summary.textContent = issue.summary;
+
+      var updated = document.createElement('span');
+      updated.className = 'issue-updated';
+      updated.textContent = relativeTime(issue.updated);
+
+      var labels = document.createElement('span');
+      labels.className = 'issue-labels';
+      (issue.labels || []).forEach(function(l) {
+        var lb = document.createElement('span');
+        lb.className = 'badge badge-label';
+        lb.textContent = l;
+        labels.appendChild(lb);
+      });
+
+      row.appendChild(cb);
+      row.appendChild(key);
+      row.appendChild(typeBadge);
+      row.appendChild(statusBadge);
+      row.appendChild(priBadge);
+      row.appendChild(summary);
+      row.appendChild(updated);
+      row.appendChild(labels);
+      issueList.appendChild(row);
+    });
+    updateCount();
+  }
+
+  function showIssues() {
+    loginView.style.display = 'none';
+    issuesView.style.display = 'block';
+    logoutForm.style.display = 'block';
+  }
+
+  function showLogin() {
+    loginView.style.display = 'block';
+    issuesView.style.display = 'none';
+    logoutForm.style.display = 'none';
+  }
+
+  // Load issues on page load
+  fetch('/api/issues').then(function(r) {
+    if (r.status === 401) { showLogin(); return null; }
+    if (!r.ok) throw new Error('Failed to load issues');
+    return r.json();
+  }).then(function(data) {
+    if (!data) return;
+    showIssues();
+    renderIssues(data.issues);
+  }).catch(function(err) {
+    showLogin();
+    showError(err.message);
+  });
+
+  // Login form
+  loginForm.addEventListener('submit', function(e) {
+    e.preventDefault();
+    loginError.textContent = '';
+    var fd = new FormData(loginForm);
+    fetch('/auth/login', { method: 'POST', body: fd, redirect: 'follow' })
+      .then(function(r) {
+        if (r.redirected) { window.location.href = r.url; return; }
+        return r.json().then(function(d) { loginError.textContent = d.error || 'Login failed.'; });
+      })
+      .catch(function() { loginError.textContent = 'Network error.'; });
+  });
+
+  // Select all
+  selectAllBtn.addEventListener('click', function() {
+    var cbs = issueList.querySelectorAll('input[type=checkbox]');
+    var allChecked = selected.size === issues.length;
+    cbs.forEach(function(cb, i) {
+      cb.checked = !allChecked;
+      if (!allChecked) selected.add(issues[i].key); else selected.delete(issues[i].key);
+    });
+    updateCount();
+  });
+
+  // I'm feeling lucky
+  luckyBtn.addEventListener('click', function() {
+    luckyBtn.disabled = true;
+    spinner.style.display = 'inline';
+    fetch('/api/label', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ issueKeys: Array.from(selected) })
+    }).then(function(r) {
+      if (r.status === 401) { window.location.reload(); return null; }
+      if (!r.ok) throw new Error('Request failed');
+      return r.json();
+    }).then(function(data) {
+      if (!data) return;
+      spinner.style.display = 'none';
+      data.results.forEach(function(res) {
+        var row = issueList.querySelector('[data-key="' + res.key + '"]');
+        if (!row) return;
+        if (res.success) {
+          row.querySelector('input[type=checkbox]').checked = false;
+          selected.delete(res.key);
+          row.classList.add('labeled');
+          // Add label badge if not already present
+          var labelsEl = row.querySelector('.issue-labels');
+          if (labelsEl && !labelsEl.textContent.includes('ai-assisted')) {
+            var lb = document.createElement('span');
+            lb.className = 'badge badge-label';
+            lb.textContent = 'ai-assisted';
+            labelsEl.appendChild(lb);
+          }
+        } else {
+          row.classList.add('error');
+          row.title = res.error || 'Failed';
+        }
+      });
+      updateCount();
+    }).catch(function(err) {
+      spinner.style.display = 'none';
+      showError(err.message);
+      luckyBtn.disabled = false;
+    });
+  });
+})();
+</script>
+</body>
+</html>

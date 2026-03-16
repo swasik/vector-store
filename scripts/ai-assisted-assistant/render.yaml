@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ai-assisted-assistant
+    runtime: python
+    rootDir: scripts/ai-assisted-assistant
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: "3.12"
