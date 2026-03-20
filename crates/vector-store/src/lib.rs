@@ -83,6 +83,7 @@ pub struct Config {
     pub memory_usage_check_interval: Option<Duration>,
     pub opensearch_addr: Option<String>,
     pub credentials: Option<Credentials>,
+    pub backend: Option<String>,
     pub usearch_simulator: Option<Vec<Duration>>,
     pub cql_keepalive_interval: Option<Duration>,
     pub cql_keepalive_timeout: Option<Duration>,
@@ -107,6 +108,7 @@ impl Default for Config {
             memory_usage_check_interval: None,
             opensearch_addr: None,
             credentials: None,
+            backend: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,
@@ -675,6 +677,12 @@ pub fn new_index_factory_opensearch(
     Ok(Box::new(index::opensearch::new_opensearch(
         &addr, config_rx,
     )?))
+}
+
+pub fn new_index_factory_cuvs() -> anyhow::Result<Box<dyn IndexFactory + Send + Sync>> {
+    let search_concurrency = Handle::current().metrics().num_workers();
+    let tokio_semaphore = Arc::new(Semaphore::new(search_concurrency));
+    Ok(Box::new(index::cuvs::new_cuvs(tokio_semaphore)))
 }
 
 pub async fn wait_for_shutdown() {

@@ -81,15 +81,41 @@ fn main() -> anyhow::Result<()> {
 
         let node_state = vector_store::new_node_state().await;
 
-        let opensearch_addr = config.opensearch_addr.clone();
-
-        let index_factory = if let Some(addr) = opensearch_addr {
-            tracing::info!("Using OpenSearch index factory at {addr}");
-            vector_store::new_index_factory_opensearch(addr, config_rx.clone())?
-        } else {
-            tracing::info!("Using Usearch index factory");
-            vector_store::new_index_factory_usearch(config_rx.clone())?
-        };
+        let index_factory: Box<dyn vector_store::IndexFactory + Send + Sync> =
+            match config.backend.as_deref() {
+                Some("opensearch") => {
+                    let addr = config
+                        .opensearch_addr
+                        .as_ref()
+                        .ok_or_else(|| {
+                            anyhow!("VECTOR_STORE_OPENSEARCH_URI required for opensearch backend")
+                        })?
+                        .clone();
+                    tracing::info!("Using OpenSearch index factory at {addr}");
+                    vector_store::new_index_factory_opensearch(addr, config_rx.clone())?
+                }
+                Some("cuvs") => {
+                    tracing::info!("Using cuVS index factory");
+                    vector_store::new_index_factory_cuvs()?
+                }
+                Some("usearch") | None => {
+                    if let Some(addr) = config.opensearch_addr.as_ref() {
+                        tracing::info!("Using OpenSearch index factory at {addr}");
+                        vector_store::new_index_factory_opensearch(
+                            addr.clone(),
+                            config_rx.clone(),
+                        )?
+                    } else {
+                        tracing::info!("Using Usearch index factory");
+                        vector_store::new_index_factory_usearch(config_rx.clone())?
+                    }
+                }
+                Some(other) => {
+                    anyhow::bail!(
+                        "Unknown backend: {other}. Supported: usearch, opensearch, cuvs"
+                    );
+                }
+            };
 
         let internals = vector_store::new_internals();
         let db_actor =

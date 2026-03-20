@@ -1,0 +1,178 @@
+#!/bin/bash
+# End-to-end test for vector store cuVS backend with ScyllaDB in docker.
+# Usage: ./scripts/e2e-test-cuvs [scylla-image]
+
+set -euo pipefail
+
+SCYLLA_IMAGE="${1:-scylladb/scylla:2026.1}"
+SCYLLA_CONTAINER="scylla-cuvs-e2e-test"
+VS_ADDR="127.0.0.1:6080"
+VS_BIN="target/debug/vector-store"
+SCYLLA_ADDR="127.0.0.1"
+SCYLLA_PORT="9042"
+
+VS_PID=""
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+cleanup() {
+    echo "Cleaning up..."
+    [[ -n "$VS_PID" ]] && kill "$VS_PID" 2>/dev/null || true
+    docker rm -f "$SCYLLA_CONTAINER" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo "=== cuVS Backend End-to-End Test ==="
+
+# 0. Check that the binary exists
+if [ ! -x "$VS_BIN" ]; then
+    echo "ERROR: vector-store binary not found at $VS_BIN. Build first with: cargo build -p vector-store"
+    exit 1
+fi
+
+# 1. Start ScyllaDB
+echo "--- Step 1: Start ScyllaDB ($SCYLLA_IMAGE) ---"
+docker rm -f "$SCYLLA_CONTAINER" 2>/dev/null || true
+docker run -d --name "$SCYLLA_CONTAINER" \
+    -p "$SCYLLA_PORT:9042" \
+    "$SCYLLA_IMAGE" \
+    --smp 1 --memory 512M --developer-mode 1
+
+echo "Waiting for ScyllaDB to become ready..."
+for i in $(seq 1 90); do
+    if docker exec "$SCYLLA_CONTAINER" cqlsh -e "SELECT now() FROM system.local" 2>/dev/null; then
+        echo "ScyllaDB is ready (after ${i}s)"
+        break
+    fi
+    if [ "$i" -eq 90 ]; then
+        echo "ERROR: ScyllaDB failed to start within 90 seconds"
+        docker logs "$SCYLLA_CONTAINER" | tail -30
+        exit 1
+    fi
+    sleep 1
+done
+
+# 2. Create keyspace and table with CDC enabled
+echo "--- Step 2: Create keyspace and table ---"
+docker exec -i "$SCYLLA_CONTAINER" cqlsh <<'CQL'
+CREATE KEYSPACE IF NOT EXISTS e2e_cuvs
+WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1};
+CQL
+
+docker exec -i "$SCYLLA_CONTAINER" cqlsh <<'CQL'
+CREATE TABLE IF NOT EXISTS e2e_cuvs.vectors (
+  id int PRIMARY KEY,
+  data vector<float, 3>
+) WITH cdc = {'enabled': true};
+CQL
+
+# 3. Create a vector index via CQL (vector-store discovers it automatically)
+echo "--- Step 3: Create vector index via CQL ---"
+docker exec -i "$SCYLLA_CONTAINER" cqlsh <<'CQL'
+CREATE CUSTOM INDEX IF NOT EXISTS vectors_ann_idx
+ON e2e_cuvs.vectors(data) USING 'vector_index'
+WITH OPTIONS = {'similarity_function': 'cosine'};
+CQL
+
+# 4. Insert test vectors
+echo "--- Step 4: Insert test vectors ---"
+docker exec -i "$SCYLLA_CONTAINER" cqlsh <<'CQL'
+INSERT INTO e2e_cuvs.vectors (id, data) VALUES (1, [1.0, 0.0, 0.0]);
+INSERT INTO e2e_cuvs.vectors (id, data) VALUES (2, [0.0, 1.0, 0.0]);
+INSERT INTO e2e_cuvs.vectors (id, data) VALUES (3, [0.0, 0.0, 1.0]);
+INSERT INTO e2e_cuvs.vectors (id, data) VALUES (4, [0.707, 0.707, 0.0]);
+INSERT INTO e2e_cuvs.vectors (id, data) VALUES (5, [0.577, 0.577, 0.577]);
+CQL
+
+# 5. Start vector-store with cuVS backend
+echo "--- Step 5: Start vector-store with cuVS backend ---"
+VECTOR_STORE_URI="$VS_ADDR" \
+VECTOR_STORE_SCYLLADB_URI="$SCYLLA_ADDR:$SCYLLA_PORT" \
+VECTOR_STORE_BACKEND="cuvs" \
+RUST_LOG="info" \
+"$VS_BIN" &
+VS_PID=$!
+
+echo "Waiting for vector-store to start (PID=$VS_PID)..."
+for i in $(seq 1 30); do
+    if curl -s "http://$VS_ADDR/api/v1/info" >/dev/null 2>&1; then
+        echo "vector-store is ready (after ${i}s)"
+        break
+    fi
+    if ! kill -0 "$VS_PID" 2>/dev/null; then
+        echo "ERROR: vector-store process died"
+        exit 1
+    fi
+    if [ "$i" -eq 30 ]; then
+        echo "ERROR: vector-store failed to start within 30 seconds"
+        exit 1
+    fi
+    sleep 1
+done
+
+# 6. Check info endpoint (should report cuVS engine)
+echo "--- Step 6: Check /api/v1/info ---"
+INFO=$(curl -s "http://$VS_ADDR/api/v1/info")
+echo "Info: $INFO"
+if echo "$INFO" | grep -q "cuvs"; then
+    pass "Info endpoint reports cuVS engine"
+else
+    fail "Info endpoint does not mention cuVS (got: $INFO)"
+fi
+
+# 7. Wait for vector-store to discover the index and ingest via CDC
+echo "--- Step 7: Wait for index discovery and CDC ingestion ---"
+INDEX_FOUND=false
+for i in $(seq 1 60); do
+    INDEXES=$(curl -s "http://$VS_ADDR/api/v1/indexes")
+    if echo "$INDEXES" | grep -q "vectors_ann_idx"; then
+        echo "Index discovered by vector-store (after ${i}s)"
+        INDEX_FOUND=true
+        break
+    fi
+    sleep 1
+done
+if [ "$INDEX_FOUND" = true ]; then
+    pass "Index vectors_ann_idx discovered"
+else
+    fail "Index vectors_ann_idx not discovered within 60s (indexes: $INDEXES)"
+fi
+
+# Give CDC a few more seconds to propagate the vector data
+sleep 5
+
+# 8. Search for nearest neighbors
+echo "--- Step 8: ANN search ---"
+SEARCH_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "http://$VS_ADDR/api/v1/indexes/e2e_cuvs/vectors_ann_idx/ann" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "vector": [1.0, 0.0, 0.0],
+      "limit": 3
+    }')
+HTTP_CODE=$(echo "$SEARCH_RESPONSE" | tail -1)
+BODY=$(echo "$SEARCH_RESPONSE" | head -n -1)
+echo "Search response ($HTTP_CODE): $BODY"
+
+if [[ "$HTTP_CODE" == "200" ]]; then
+    pass "ANN search returned 200"
+else
+    fail "ANN search returned HTTP $HTTP_CODE"
+fi
+
+# Verify that id=1 (the exact match for [1.0, 0.0, 0.0]) is in the results
+if echo "$BODY" | grep -q '"id":\[1'; then
+    pass "ANN search results contain id=1 as nearest neighbor"
+else
+    fail "ANN search results do not contain id=1 (body: $BODY)"
+fi
+
+# 9. Summary
+echo ""
+echo "=== cuVS Backend E2E Test Complete ==="
+echo "Results: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi

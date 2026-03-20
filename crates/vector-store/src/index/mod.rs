@@ -10,5 +10,6 @@ pub mod validator;
 pub(crate) use actor::Index;
 pub(crate) use actor::IndexExt;
 
+pub(crate) mod cuvs;
 pub(crate) mod opensearch;
 pub(crate) mod usearch;

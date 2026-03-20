@@ -284,6 +284,10 @@ where
         config.opensearch_addr = Some(opensearch_addr);
     }
 
+    if let Ok(backend) = env("VECTOR_STORE_BACKEND") {
+        config.backend = Some(backend);
+    }
+
     config.usearch_simulator = env("VECTOR_STORE_USEARCH_SIMULATOR")
         .ok()
         .map(|v| v.split(':').map(|s| s.parse::<humantime::Duration>()).map_ok(|v| v.into()).collect::<Result<Vec<_>, _>>().map_err(|err| {
@@ -529,6 +533,7 @@ mod tests {
             memory_usage_check_interval: None,
             opensearch_addr: None,
             credentials: None,
+            backend: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,
