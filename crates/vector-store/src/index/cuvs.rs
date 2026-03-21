@@ -1232,6 +1232,7 @@ mod gpu {
         }
 
         /// Helper: create a `DLManagedTensor` wrapping a host `u32` slice.
+        #[allow(dead_code)]
         pub fn make_host_u32_tensor(
             data: &mut [u32],
             shape: &mut [i64; 2],
