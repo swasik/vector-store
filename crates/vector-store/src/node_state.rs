@@ -114,7 +114,9 @@ pub(crate) async fn new() -> mpsc::Sender<NodeState> {
                         }
                         Event::ConnectedToDb => {}
                         Event::DiscoveringIndexes => {
-                            if status != NodeStatus::Serving {
+                            if status != NodeStatus::Serving
+                                && status != NodeStatus::IndexingEmbeddings
+                            {
                                 status = NodeStatus::DiscoveringIndexes;
                             }
                         }
@@ -378,5 +380,60 @@ mod tests {
             .get_index_status(&idx.keyspace_name.0, &idx.index_name.0)
             .await;
         assert_eq!(idx_status, Some(IndexStatus::Initializing));
+    }
+
+    /// Regression test: when a schema check fires while indexes are being built
+    /// (status == IndexingEmbeddings), the DiscoveringIndexes event must NOT
+    /// reset the status back to DiscoveringIndexes.  Otherwise the next
+    /// IndexesDiscovered would re-initialise `initial_idxs` with all current
+    /// indexes — including already-completed ones whose FullScanFinished will
+    /// never arrive again — so the node would stay stuck in IndexingEmbeddings
+    /// and never log "finished building indexes".
+    #[tokio::test]
+    async fn discovering_indexes_does_not_override_indexing_embeddings() {
+        let node_state = new().await;
+
+        // Bootstrap: connect and discover one index
+        node_state.send_event(Event::ConnectingToDb).await;
+        node_state.send_event(Event::DiscoveringIndexes).await;
+
+        let idx = IndexMetadata {
+            keyspace_name: KeyspaceName("ks".to_string()),
+            index_name: IndexName("idx".to_string()),
+            table_name: TableName("tbl".to_string()),
+            target_column: ColumnName("col".to_string()),
+            index_type: DbIndexType::Global,
+            filtering_columns: Arc::new(Vec::new()),
+            dimensions: Dimensions(NonZeroUsize::new(3).unwrap()),
+            connectivity: Default::default(),
+            expansion_add: Default::default(),
+            expansion_search: Default::default(),
+            space_type: Default::default(),
+            version: Uuid::new_v4().into(),
+            quantization: Default::default(),
+        };
+
+        node_state
+            .send_event(Event::IndexesDiscovered(HashSet::from([idx.clone()])))
+            .await;
+        assert_eq!(
+            node_state.get_status().await,
+            NodeStatus::IndexingEmbeddings
+        );
+
+        // Simulate a schema-check tick arriving *while* the full scan is still
+        // running.  Before the fix this would reset status to DiscoveringIndexes.
+        node_state.send_event(Event::DiscoveringIndexes).await;
+        assert_eq!(
+            node_state.get_status().await,
+            NodeStatus::IndexingEmbeddings,
+            "DiscoveringIndexes must not override IndexingEmbeddings"
+        );
+
+        // The full scan completes → should transition to Serving
+        node_state
+            .send_event(Event::FullScanFinished(idx))
+            .await;
+        assert_eq!(node_state.get_status().await, NodeStatus::Serving);
     }
 }
