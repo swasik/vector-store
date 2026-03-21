@@ -65,6 +65,7 @@ use time::format_description::well_known::iso8601::TimePrecision;
 use tokio::sync::mpsc::Sender;
 use tower_http::trace::TraceLayer;
 use tracing::debug;
+use tracing::warn;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -573,7 +574,7 @@ async fn post_index_ann(
     let Some((index, db_index)) = state.engine.get_index(index_key.clone()).await else {
         timer.observe_duration();
         let msg = format!("missing index: {keyspace}.{index_name}");
-        debug!("post_index_ann: {msg}");
+        warn!("post_index_ann: {msg}");
         return (StatusCode::NOT_FOUND, msg).into_response();
     };
 
@@ -597,7 +598,7 @@ async fn post_index_ann(
         ) {
             Ok(filter) => filter,
             Err(err) => {
-                debug!("post_index_ann: {err}");
+                warn!("post_index_ann: filter conversion error: {err}");
                 return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
             }
         };
@@ -615,8 +616,8 @@ async fn post_index_ann(
         Err(err) => match err.downcast_ref::<validator::Error>() {
             Some(err) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
             None => {
-                let msg = format!("index.ann request error: {err}");
-                debug!("post_index_ann: {msg}");
+                let msg = format!("index.ann request error: {err:#}");
+                warn!("post_index_ann: {msg}");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
         },
@@ -627,7 +628,7 @@ async fn post_index_ann(
                     primary_keys.len(),
                     distances.len()
                 );
-                debug!("post_index_ann: {msg}");
+                warn!("post_index_ann: {msg}");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             } else {
                 let similarity_scores: Vec<SimilarityScore> = distances
@@ -666,7 +667,7 @@ async fn post_index_ann(
 
                 match primary_keys {
                     Err(err) => {
-                        debug!("post_index_ann: {err}");
+                        warn!("post_index_ann: primary key serialization: {err:#}");
                         (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
                     }
 

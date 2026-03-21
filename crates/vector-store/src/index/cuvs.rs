@@ -530,6 +530,10 @@ where
             // (e.g. partition key equality), downgrade to a plain Ann.
             // Otherwise reject: cuVS does not support filtered search.
             let msg = if let Some(_restrictions) = restrictions {
+                warn!(
+                    "cuVS: rejecting filtered ann for index {index_key:?}: \
+                     unresolvable non-partition-key restrictions remain"
+                );
                 _ = tx.send(Err(anyhow!(
                     "cuVS backend does not support filtered search (index {index_key:?})"
                 )));
@@ -674,6 +678,9 @@ fn process_search<T>(
         }
 
         Index::FilteredAnn { tx, index_key, .. } => {
+            warn!(
+                "cuVS backend does not support filtered search (index {index_key:?})"
+            );
             _ = tx.send(Err(anyhow!(
                 "cuVS backend does not support filtered search (index {index_key:?})"
             )));
@@ -689,9 +696,10 @@ fn validate_dimensions(
     dimensions: Dimensions,
 ) -> Option<oneshot::Sender<AnnR>> {
     if let Err(err) = validator::embedding_dimensions(embedding, dimensions) {
+        warn!("validate_dimensions: {err}");
         tx_ann
             .send(Err(err))
-            .unwrap_or_else(|_| trace!("validate_dimensions: unable to send response"));
+            .unwrap_or_else(|_| warn!("validate_dimensions: unable to send response"));
         None
     } else {
         Some(tx_ann)
@@ -707,25 +715,30 @@ fn ann<T>(
 ) where
     T: TableSearch + Send + Sync + 'static,
 {
+    let result = partition
+        .idx
+        .search(&embedding, limit)
+        .and_then(|matches| {
+            let table = table.read().unwrap();
+            let (primary_keys, distances): (Vec<_>, Vec<_>) = matches
+                .into_iter()
+                .filter_map(|(primary_id, distance)| {
+                    table
+                        .primary_key(partition.partition_id, primary_id)
+                        .map(|primary_key| (primary_key, distance))
+                })
+                .unzip();
+            Ok((primary_keys, distances))
+        });
+    if let Err(ref err) = result {
+        warn!(
+            "ann search failed for partition {:?}: {err:#}",
+            partition.partition_id
+        );
+    }
     tx_ann
-        .send(
-            partition
-                .idx
-                .search(&embedding, limit)
-                .and_then(|matches| {
-                    let table = table.read().unwrap();
-                    let (primary_keys, distances): (Vec<_>, Vec<_>) = matches
-                        .into_iter()
-                        .filter_map(|(primary_id, distance)| {
-                            table
-                                .primary_key(partition.partition_id, primary_id)
-                                .map(|primary_key| (primary_key, distance))
-                        })
-                        .unzip();
-                    Ok((primary_keys, distances))
-                }),
-        )
-        .unwrap_or_else(|_| trace!("ann: unable to send response"));
+        .send(result)
+        .unwrap_or_else(|_| warn!("ann: unable to send response (receiver dropped)"));
 }
 
 async fn check_memory_allocation(
@@ -1263,8 +1276,8 @@ mod gpu {
     /// **Strategy**: vectors are accumulated in a host-side `BTreeMap`. When a
     /// search is requested and the dataset has changed since the last build
     /// (tracked via a dirty flag), the CAGRA graph index is rebuilt from the
-    /// full dataset. Subsequent searches use the cached graph until the next
-    /// mutation.
+    /// full dataset. Subsequent searches reuse the cached CAGRA graph until
+    /// the next mutation invalidates it.
     ///
     /// CAGRA requires a minimum dataset size to build a meaningful graph (at
     /// least `graph_degree + 1` vectors, where `graph_degree` defaults to 64).
@@ -1282,18 +1295,49 @@ mod gpu {
         lib: Arc<cuvs_ffi::CuvsLib>,
         /// `true` when vectors have been mutated since last CAGRA build.
         dirty: RwLock<bool>,
-        /// Serialized CAGRA index bytes (empty until first build).
-        /// We serialize/deserialize across rebuilds because the cuVS C objects
-        /// are tied to a CUDA context on a specific thread.
-        cached_flat_data: RwLock<Option<CagraCachedData>>,
+        /// Cached flat data + built CAGRA graph index. Invalidated when dirty.
+        cached_build: RwLock<Option<CagraCachedBuild>>,
     }
 
-    /// Snapshot of data needed for CAGRA build, captured under read lock.
-    struct CagraCachedData {
+    /// Cached CAGRA build: flat data snapshot, PrimaryId mapping, and the
+    /// built CAGRA graph index pointer. The CAGRA graph lives in GPU
+    /// memory and is reused across searches until the next rebuild.
+    struct CagraCachedBuild {
         /// Row-major [n, d] dataset.
         flat: Vec<f32>,
         /// Ordered PrimaryId for each row.
         ids: Vec<PrimaryId>,
+        /// cuVS resources handle (CUDA stream) used for build.
+        /// Kept alive because the CAGRA graph may reference memory allocated
+        /// on this stream's memory pool.
+        res: cuvs_ffi::CuvsResources,
+        /// Built CAGRA index (null if build failed or n < MIN_CAGRA_BUILD_SIZE).
+        index_ptr: cuvs_ffi::CuvsCagraIndexPtr,
+        /// cuVS library handle for cleanup.
+        lib: Arc<cuvs_ffi::CuvsLib>,
+    }
+
+    // SAFETY: The CuvsCagraIndexPtr is an opaque handle managed by the cuVS
+    // library. It is safe to send across threads because the CAGRA graph is
+    // stored in GPU memory (device-global), and we only access it through
+    // cuVS API calls that take their own per-call cuvsResources_t (CUDA
+    // stream). Our RwLock ensures no concurrent mutation.
+    unsafe impl Send for CagraCachedBuild {}
+    unsafe impl Sync for CagraCachedBuild {}
+
+    impl Drop for CagraCachedBuild {
+        fn drop(&mut self) {
+            // SAFETY: destroy in reverse creation order — index first, then
+            // the resources that may hold the underlying memory pool.
+            unsafe {
+                if !self.index_ptr.is_null() {
+                    let _ = (self.lib.cagra_index_destroy)(self.index_ptr);
+                }
+                if self.res != 0 {
+                    let _ = (self.lib.resources_destroy)(self.res);
+                }
+            }
+        }
     }
 
     /// Minimum number of vectors required to build a CAGRA index.
@@ -1313,7 +1357,7 @@ mod gpu {
                 dimensions,
                 lib,
                 dirty: RwLock::new(true),
-                cached_flat_data: RwLock::new(None),
+                cached_build: RwLock::new(None),
             }
         }
 
@@ -1331,10 +1375,12 @@ mod gpu {
 
         /// Build or rebuild the CAGRA index from the current vector set.
         ///
-        /// Returns `(flat_data, ids)` for use in subsequent search, plus
-        /// the opaque CAGRA index pointer to pass to `cuvsCagraSearch`.
+        /// Returns the cuVS resources handle and the CAGRA index pointer.
+        /// Both must be kept alive: the resources handle owns the CUDA stream
+        /// and potentially a memory pool that the CAGRA graph references.
         ///
-        /// The caller must destroy the returned resources and index after use.
+        /// The caller must eventually destroy both via `cagra_index_destroy`
+        /// and `resources_destroy` (handled by `CagraCachedBuild::drop`).
         fn build_index(
             &self,
             flat: &mut Vec<f32>,
@@ -1412,13 +1458,16 @@ mod gpu {
 
         /// Execute a CAGRA search on a pre-built index.
         ///
+        /// Creates a fresh `cuvsResources_t` (CUDA stream) for each search
+        /// so that searches are independent of the build stream and can
+        /// safely be called from different threads.
+        ///
         /// The cuVS CAGRA search API requires query, neighbors, and distances
         /// tensors on a CUDA device (`kDLCUDA`). We use cudarc to allocate
         /// device memory, copy the query to the GPU, run the search, and
         /// copy results back.
         fn search_cagra(
             &self,
-            res: cuvs_ffi::CuvsResources,
             index_ptr: cuvs_ffi::CuvsCagraIndexPtr,
             query: &[f32],
             k: usize,
@@ -1426,6 +1475,17 @@ mod gpu {
         ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
             let lib = &self.lib;
             let d = self.dimensions;
+
+            // Create per-search cuVS resources (own CUDA stream).
+            let mut res: cuvs_ffi::CuvsResources = 0;
+            // SAFETY: cuvsResourcesCreate creates a fresh CUDA stream.
+            unsafe {
+                cuvs_ffi::check(
+                    lib,
+                    (lib.resources_create)(&mut res),
+                    "cuvsResourcesCreate (search)",
+                )?;
+            }
 
             // Create search params
             let mut search_params: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -1548,6 +1608,12 @@ mod gpu {
                 .clone_dtoh(&d_distances)
                 .map_err(|e| anyhow!("CAGRA search: failed to copy distances: {e}"))?;
 
+            // Destroy per-search resources (CUDA stream).
+            // SAFETY: res was created above and is no longer needed.
+            unsafe {
+                let _ = (lib.resources_destroy)(res);
+            }
+
             // Convert results to (PrimaryId, Distance) pairs.
             // CAGRA returns u32 indices into the flat dataset array.
             let n = ids.len();
@@ -1617,12 +1683,16 @@ mod gpu {
                 .write()
                 .unwrap()
                 .insert(primary_id, vector.as_ref().to_vec());
+            // Invalidate cached build — next search will rebuild.
+            *self.cached_build.write().unwrap() = None;
             *self.dirty.write().unwrap() = true;
             Ok(())
         }
 
         fn remove(&self, primary_id: PrimaryId) -> anyhow::Result<()> {
             self.vectors.write().unwrap().remove(&primary_id);
+            // Invalidate cached build — next search will rebuild.
+            *self.cached_build.write().unwrap() = None;
             *self.dirty.write().unwrap() = true;
             Ok(())
         }
@@ -1635,11 +1705,12 @@ mod gpu {
             let dirty = *self.dirty.read().unwrap();
             let d = self.dimensions;
 
-            // Snapshot current vectors if dirty
+            // If data changed, rebuild the flat snapshot and CAGRA graph.
             if dirty {
                 let vectors = self.vectors.read().unwrap();
                 let n = vectors.len();
                 if n == 0 {
+                    *self.dirty.write().unwrap() = false;
                     return Ok(vec![]);
                 }
 
@@ -1651,12 +1722,38 @@ mod gpu {
                 }
                 drop(vectors);
 
-                *self.cached_flat_data.write().unwrap() =
-                    Some(CagraCachedData { flat, ids });
+                // Build CAGRA if the dataset is large enough.
+                let (res, index_ptr) = if n >= MIN_CAGRA_BUILD_SIZE {
+                    match self.build_index(&mut flat, n, d) {
+                        Ok((res, ptr)) => {
+                            tracing::info!(
+                                "CAGRA graph built for {n} vectors ({d} dims)"
+                            );
+                            (res, ptr)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "CAGRA build failed ({e:#}), falling back to brute-force"
+                            );
+                            (0, std::ptr::null_mut())
+                        }
+                    }
+                } else {
+                    (0, std::ptr::null_mut())
+                };
+
+                *self.cached_build.write().unwrap() = Some(CagraCachedBuild {
+                    flat,
+                    ids,
+                    res,
+                    index_ptr,
+                    lib: Arc::clone(&self.lib),
+                });
                 *self.dirty.write().unwrap() = false;
             }
 
-            let cache = self.cached_flat_data.read().unwrap();
+            // Use the cached build.
+            let cache = self.cached_build.read().unwrap();
             let cached = cache.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("CAGRA index has no cached data")
             })?;
@@ -1669,39 +1766,12 @@ mod gpu {
             let k = limit.0.get().min(n);
             let query = vector.as_ref();
 
-            // If dataset is too small for CAGRA, use CPU brute-force
-            if n < MIN_CAGRA_BUILD_SIZE {
+            // Brute-force fallback for small datasets or failed CAGRA build.
+            if cached.index_ptr.is_null() {
                 return self.search_brute_force(query, &cached.flat, &cached.ids, k);
             }
 
-            // Build CAGRA index from cached flat data
-            let mut flat_copy = cached.flat.clone();
-            let ids_snapshot = cached.ids.clone();
-            drop(cache);
-
-            // Build CAGRA index; if it fails (e.g. unsupported metric), fall
-            // back to CPU brute-force.
-            let build_result = self.build_index(&mut flat_copy, n, d);
-            let (res, index_ptr) = match build_result {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::warn!(
-                        "CAGRA build failed ({e}), falling back to brute-force"
-                    );
-                    return self.search_brute_force(query, &flat_copy, &ids_snapshot, k);
-                }
-            };
-
-            let results = self.search_cagra(res, index_ptr, query, k, &ids_snapshot);
-
-            // Clean up CAGRA index and resources
-            // SAFETY: proper cleanup of cuVS objects created above.
-            unsafe {
-                let _ = (self.lib.cagra_index_destroy)(index_ptr);
-                let _ = (self.lib.resources_destroy)(res);
-            }
-
-            results
+            self.search_cagra(cached.index_ptr, query, k, &cached.ids)
         }
 
         fn size(&self) -> usize {
