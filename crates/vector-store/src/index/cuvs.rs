@@ -1028,6 +1028,7 @@ mod gpu {
     use cudarc::cublas::sys::cublasOperation_t;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
+    use std::collections::HashSet;
     use std::sync::OnceLock;
 
     /// GPU-accelerated brute-force vector index using cuBLAS.
@@ -1557,13 +1558,41 @@ mod gpu {
 
     // ---- CAGRA Index ----
 
+    /// Tracks mutations since the last CAGRA graph build.
+    ///
+    /// Between builds, newly added/updated vectors live here so that
+    /// searches can merge CAGRA results with a small brute-force scan
+    /// over the delta.
+    struct DeltaIndex {
+        /// Vectors added (or updated) since the last CAGRA build.
+        added: BTreeMap<PrimaryId, Vec<f32>>,
+        /// PrimaryIds whose CAGRA-graph entry is stale (removed or
+        /// replaced). These must be filtered out of CAGRA results.
+        removed: HashSet<PrimaryId>,
+    }
+
+    impl DeltaIndex {
+        fn new() -> Self {
+            Self {
+                added: BTreeMap::new(),
+                removed: HashSet::new(),
+            }
+        }
+
+        fn is_empty(&self) -> bool {
+            self.added.is_empty() && self.removed.is_empty()
+        }
+    }
+
     /// GPU-accelerated approximate nearest-neighbor index using CAGRA.
     ///
-    /// **Strategy**: vectors are accumulated in a host-side `BTreeMap`. When a
-    /// search is requested and the dataset has changed since the last build
-    /// (tracked via a dirty flag), the CAGRA graph index is rebuilt from the
-    /// full dataset. Subsequent searches reuse the cached CAGRA graph until
-    /// the next mutation invalidates it.
+    /// **Strategy**: vectors are accumulated in a host-side `BTreeMap`
+    /// (the canonical store).  A CAGRA graph is built explicitly via
+    /// `rebuild()` – typically triggered after the initial full scan.
+    /// Between rebuilds, mutations are tracked in a lightweight
+    /// [`DeltaIndex`]: searches query the (potentially stale) CAGRA
+    /// graph and merge results with a brute-force scan of the delta,
+    /// filtering out removed/replaced entries.
     ///
     /// CAGRA requires a minimum dataset size to build a meaningful graph (at
     /// least `graph_degree + 1` vectors, where `graph_degree` defaults to 64).
@@ -1579,12 +1608,13 @@ mod gpu {
         dimensions: usize,
         /// Loaded cuVS library handle (shared across all CagraIndex instances).
         lib: Arc<cuvs_ffi::CuvsLib>,
-        /// `true` when vectors have been mutated since last CAGRA build.
-        dirty: RwLock<bool>,
-        /// Cached flat data + built CAGRA graph index. Invalidated when dirty.
+        /// Cached flat data + built CAGRA graph index.  Kept alive across
+        /// mutations – only replaced by an explicit `rebuild()`.
         cached_build: RwLock<Option<CagraCachedBuild>>,
-        /// Serializes CAGRA graph builds so only one thread builds at a time
-        /// (prevents thundering-herd when many searches arrive concurrently).
+        /// Mutations since the last CAGRA build.  Must be locked **after**
+        /// `cached_build` to avoid deadlocks (canonical lock ordering).
+        delta: RwLock<DeltaIndex>,
+        /// Serializes CAGRA graph builds so only one thread builds at a time.
         build_lock: std::sync::Mutex<()>,
         /// Cached CUDA context for cudarc memory operations in search.
         /// Created lazily on first search and reused for all subsequent ones.
@@ -1648,8 +1678,8 @@ mod gpu {
                 space_type,
                 dimensions,
                 lib,
-                dirty: RwLock::new(true),
                 cached_build: RwLock::new(None),
+                delta: RwLock::new(DeltaIndex::new()),
                 build_lock: std::sync::Mutex::new(()),
                 cuda_ctx: OnceLock::new(),
             }
@@ -1992,20 +2022,14 @@ mod gpu {
     }
 
     impl CagraIndex {
-        /// Ensure the CAGRA index is up-to-date with the latest mutations.
+        /// Build a fresh CAGRA graph from the canonical vector store and
+        /// atomically swap it in, clearing the delta.
         ///
-        /// Uses double-checked locking: only one thread rebuilds at a time;
-        /// others wait and reuse the result. Called once before a search
-        /// batch so the rebuild cost is amortised across all queries.
-        fn ensure_fresh(&self) {
-            let dirty = *self.dirty.read().unwrap();
-            if !dirty {
-                return;
-            }
+        /// Called explicitly via `rebuild()` (triggered by `Index::Flush`
+        /// after the initial full scan completes). NOT called from the
+        /// search path — searches use the stale graph + delta merge.
+        fn do_rebuild(&self) {
             let _build_guard = self.build_lock.lock().unwrap();
-            if !*self.dirty.read().unwrap() {
-                return;
-            }
 
             let vectors = self.vectors.read().unwrap();
             let n = vectors.len();
@@ -2038,6 +2062,7 @@ mod gpu {
                 (0, std::ptr::null_mut())
             };
 
+            // Atomic swap: lock in canonical order (cached_build → delta).
             *self.cached_build.write().unwrap() = Some(CagraCachedBuild {
                 flat,
                 ids,
@@ -2045,7 +2070,71 @@ mod gpu {
                 index_ptr,
                 lib: Arc::clone(&self.lib),
             });
-            *self.dirty.write().unwrap() = false;
+            *self.delta.write().unwrap() = DeltaIndex::new();
+        }
+
+        /// Brute-force search over the delta's added vectors.
+        fn search_delta(
+            &self,
+            query: &[f32],
+            delta: &DeltaIndex,
+            k: usize,
+        ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+            if delta.added.is_empty() {
+                return Ok(vec![]);
+            }
+            let mut scored: Vec<(PrimaryId, f32)> = delta
+                .added
+                .iter()
+                .map(|(&pid, v)| {
+                    let dist = compute_distance(query, v, self.space_type)
+                        .map(|d| -> f32 { d.into() })
+                        .unwrap_or(f32::MAX);
+                    (pid, dist)
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scored.truncate(k);
+
+            scored
+                .into_iter()
+                .map(|(pid, dist_val)| {
+                    let distance = match self.space_type {
+                        SpaceType::Euclidean => Distance::new_euclidean(dist_val)?,
+                        SpaceType::Cosine => Distance::new_cosine(dist_val)?,
+                        SpaceType::DotProduct => {
+                            Distance::new_dot_product(dist_val)?
+                        }
+                        SpaceType::Hamming => unreachable!(),
+                    };
+                    Ok((pid, distance))
+                })
+                .collect()
+        }
+
+        /// Full brute-force fallback over all vectors (used when no CAGRA
+        /// build exists yet, e.g. before the first `rebuild()`).
+        fn search_all_brute_force(
+            &self,
+            query: &[f32],
+            k: usize,
+        ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+            let vectors = self.vectors.read().unwrap();
+            let n = vectors.len();
+            if n == 0 || k == 0 {
+                return Ok(vec![]);
+            }
+            let d = self.dimensions;
+            let mut flat = Vec::with_capacity(n * d);
+            let mut ids = Vec::with_capacity(n);
+            for (&pid, v) in vectors.iter() {
+                flat.extend_from_slice(v);
+                ids.push(pid);
+            }
+            drop(vectors);
+            self.search_brute_force(query, &flat, &ids, k.min(n))
         }
 
         /// Multi-query CAGRA search: runs all queries in a single GPU kernel.
@@ -2226,26 +2315,27 @@ mod gpu {
 
     impl CuvsVectorIndex for CagraIndex {
         fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
-            self.vectors
-                .write()
-                .unwrap()
-                .insert(primary_id, vector.as_ref().to_vec());
-            // Invalidate cached build — next search will rebuild.
-            *self.cached_build.write().unwrap() = None;
-            *self.dirty.write().unwrap() = true;
+            let v = vector.as_ref().to_vec();
+            self.vectors.write().unwrap().insert(primary_id, v.clone());
+            // Track the mutation in the delta so searches can merge it
+            // with the (potentially stale) CAGRA graph.
+            let mut delta = self.delta.write().unwrap();
+            delta.added.insert(primary_id, v);
+            // Mark the old CAGRA entry (if any) as stale.
+            delta.removed.insert(primary_id);
             Ok(())
         }
 
         fn remove(&self, primary_id: PrimaryId) -> anyhow::Result<()> {
             self.vectors.write().unwrap().remove(&primary_id);
-            // Invalidate cached build — next search will rebuild.
-            *self.cached_build.write().unwrap() = None;
-            *self.dirty.write().unwrap() = true;
+            let mut delta = self.delta.write().unwrap();
+            delta.added.remove(&primary_id);
+            delta.removed.insert(primary_id);
             Ok(())
         }
 
         fn rebuild(&self) {
-            self.ensure_fresh();
+            self.do_rebuild();
         }
 
         fn search(
@@ -2253,37 +2343,84 @@ mod gpu {
             vector: &Vector,
             limit: Limit,
         ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
-            self.ensure_fresh();
+            let query: &[f32] = vector.as_ref().as_ref();
+            let k = limit.0.get();
 
+            // Lock order: cached_build → delta.
             let cache = self.cached_build.read().unwrap();
-            let cached = cache.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("CAGRA index has no cached data")
-            })?;
+            let delta = self.delta.read().unwrap();
+
+            let Some(cached) = cache.as_ref() else {
+                // No CAGRA build yet — full brute-force over all vectors.
+                drop(delta);
+                drop(cache);
+                return self.search_all_brute_force(query, k);
+            };
 
             let n = cached.ids.len();
-            if n == 0 {
+            if n == 0 && delta.added.is_empty() {
                 return Ok(vec![]);
             }
 
-            let k = limit.0.get().min(n);
-            let query = vector.as_ref();
-
-            if cached.index_ptr.is_null() {
-                return self.search_brute_force(
+            if delta.is_empty() {
+                // Fast path: no mutations since last build.
+                let k = k.min(n);
+                if k == 0 {
+                    return Ok(vec![]);
+                }
+                if cached.index_ptr.is_null() {
+                    return self.search_brute_force(
+                        query,
+                        &cached.flat,
+                        &cached.ids,
+                        k,
+                    );
+                }
+                return self.search_cagra(
+                    cached.res,
+                    cached.index_ptr,
                     query,
-                    &cached.flat,
-                    &cached.ids,
                     k,
+                    &cached.ids,
                 );
             }
 
-            self.search_cagra(
-                cached.res,
-                cached.index_ptr,
-                query,
-                k,
-                &cached.ids,
-            )
+            // Slow path: merge CAGRA results with delta brute-force.
+            // Request extra results from CAGRA to compensate for
+            // removed entries that will be filtered out.
+            let cagra_k = (k + delta.removed.len()).min(n);
+            let mut merged = if cagra_k == 0 || cached.index_ptr.is_null() {
+                if n > 0 && cagra_k > 0 {
+                    self.search_brute_force(
+                        query,
+                        &cached.flat,
+                        &cached.ids,
+                        cagra_k,
+                    )?
+                } else {
+                    vec![]
+                }
+            } else {
+                self.search_cagra(
+                    cached.res,
+                    cached.index_ptr,
+                    query,
+                    cagra_k,
+                    &cached.ids,
+                )?
+            };
+
+            // Filter out stale entries.
+            merged.retain(|(pid, _)| !delta.removed.contains(pid));
+
+            // Merge with delta brute-force results.
+            let delta_results = self.search_delta(query, &delta, k)?;
+            merged.extend(delta_results);
+
+            // Sort combined results by distance and truncate to k.
+            merged.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            merged.truncate(k);
+            Ok(merged)
         }
 
         fn search_batch(
@@ -2294,79 +2431,164 @@ mod gpu {
                 return vec![];
             }
 
-            // Rebuild once for the whole batch.
-            self.ensure_fresh();
-
+            // Lock order: cached_build → delta.
             let cache = self.cached_build.read().unwrap();
+            let delta = self.delta.read().unwrap();
+
             let Some(cached) = cache.as_ref() else {
+                // No CAGRA build yet — full brute-force per query.
+                drop(delta);
+                drop(cache);
                 return queries
                     .iter()
-                    .map(|_| {
-                        Err(anyhow::anyhow!("CAGRA index has no cached data"))
+                    .map(|(v, l)| {
+                        let q: &[f32] = v.as_ref().as_ref();
+                        self.search_all_brute_force(q, l.0.get())
                     })
                     .collect();
             };
 
             let n = cached.ids.len();
-            if n == 0 {
+            if n == 0 && delta.added.is_empty() {
                 return queries.iter().map(|_| Ok(vec![])).collect();
             }
 
-            // Brute-force fallback for small datasets.
-            if cached.index_ptr.is_null() {
-                return queries
+            if delta.is_empty() {
+                // Fast path: no mutations since last build.
+                if cached.index_ptr.is_null() {
+                    return queries
+                        .iter()
+                        .map(|(v, l)| {
+                            let k = l.0.get().min(n);
+                            self.search_brute_force(
+                                v.as_ref(),
+                                &cached.flat,
+                                &cached.ids,
+                                k,
+                            )
+                        })
+                        .collect();
+                }
+                let max_k = queries
                     .iter()
-                    .map(|(v, l)| {
-                        let k = l.0.get().min(n);
-                        self.search_brute_force(
-                            v.as_ref(),
-                            &cached.flat,
-                            &cached.ids,
-                            k,
-                        )
-                    })
-                    .collect();
+                    .map(|(_, l)| l.0.get().min(n))
+                    .max()
+                    .unwrap_or(0);
+                let query_slices: Vec<&[f32]> =
+                    queries.iter().map(|(v, _)| {
+                        let r: &Vec<f32> = v.as_ref();
+                        r.as_slice()
+                    }).collect();
+
+                return match self.search_cagra_batch(
+                    cached.res,
+                    cached.index_ptr,
+                    &query_slices,
+                    max_k,
+                    &cached.ids,
+                ) {
+                    Ok(mut batch_results) => batch_results
+                        .iter_mut()
+                        .zip(queries.iter())
+                        .map(|(results, (_, limit))| {
+                            results.truncate(limit.0.get().min(n));
+                            Ok(std::mem::take(results))
+                        })
+                        .collect(),
+                    Err(e) => {
+                        warn!(
+                            "CAGRA batch search failed ({e:#}), \
+                             falling back to individual searches"
+                        );
+                        drop(delta);
+                        drop(cache);
+                        queries
+                            .iter()
+                            .map(|(v, l)| self.search(v, l.clone()))
+                            .collect()
+                    }
+                };
             }
 
-            // Multi-query CAGRA search in a single GPU call.
+            // Slow path: CAGRA + delta merge per query.
             let max_k = queries
                 .iter()
-                .map(|(_, l)| l.0.get().min(n))
+                .map(|(_, l)| (l.0.get() + delta.removed.len()).min(n))
                 .max()
                 .unwrap_or(0);
-            let query_slices: Vec<&[f32]> =
-                queries.iter().map(|(v, _)| {
-                    let r: &Vec<f32> = v.as_ref();
-                    r.as_slice()
-                }).collect();
 
-            match self.search_cagra_batch(
-                cached.res,
-                cached.index_ptr,
-                &query_slices,
-                max_k,
-                &cached.ids,
-            ) {
-                Ok(mut batch_results) => batch_results
-                    .iter_mut()
-                    .zip(queries.iter())
-                    .map(|(results, (_, limit))| {
-                        results.truncate(limit.0.get().min(n));
-                        Ok(std::mem::take(results))
-                    })
-                    .collect(),
-                Err(e) => {
-                    warn!(
-                        "CAGRA batch search failed ({e:#}), \
-                         falling back to individual searches"
-                    );
-                    drop(cache);
-                    queries
-                        .iter()
-                        .map(|(v, l)| self.search(v, l.clone()))
-                        .collect()
+            let use_cagra_batch = max_k > 0 && !cached.index_ptr.is_null();
+
+            let cagra_batch_results = if use_cagra_batch {
+                let query_slices: Vec<&[f32]> =
+                    queries.iter().map(|(v, _)| {
+                        let r: &Vec<f32> = v.as_ref();
+                        r.as_slice()
+                    }).collect();
+                match self.search_cagra_batch(
+                    cached.res,
+                    cached.index_ptr,
+                    &query_slices,
+                    max_k,
+                    &cached.ids,
+                ) {
+                    Ok(results) => Some(results),
+                    Err(e) => {
+                        warn!(
+                            "CAGRA batch search failed ({e:#}), \
+                             falling back to individual searches"
+                        );
+                        None
+                    }
                 }
-            }
+            } else {
+                None
+            };
+
+            queries
+                .iter()
+                .enumerate()
+                .map(|(i, (v, l))| {
+                    let q: &[f32] = v.as_ref().as_ref();
+                    let k = l.0.get();
+
+                    let mut merged = match &cagra_batch_results {
+                        Some(batch) => batch[i].clone(),
+                        None => {
+                            let cagra_k = (k + delta.removed.len()).min(n);
+                            if n > 0 && cagra_k > 0 {
+                                if cached.index_ptr.is_null() {
+                                    self.search_brute_force(
+                                        q,
+                                        &cached.flat,
+                                        &cached.ids,
+                                        cagra_k,
+                                    )?
+                                } else {
+                                    self.search_cagra(
+                                        cached.res,
+                                        cached.index_ptr,
+                                        q,
+                                        cagra_k,
+                                        &cached.ids,
+                                    )?
+                                }
+                            } else {
+                                vec![]
+                            }
+                        }
+                    };
+
+                    merged.retain(|(pid, _)| !delta.removed.contains(pid));
+                    let delta_results = self.search_delta(q, &delta, k)?;
+                    merged.extend(delta_results);
+                    merged.sort_by(|(_, a), (_, b)| {
+                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    merged.truncate(k);
+                    Ok(merged)
+                })
+                .collect()
         }
 
         fn size(&self) -> usize {
