@@ -1458,9 +1458,12 @@ mod gpu {
 
         /// Execute a CAGRA search on a pre-built index.
         ///
-        /// Creates a fresh `cuvsResources_t` (CUDA stream) for each search
-        /// so that searches are independent of the build stream and can
-        /// safely be called from different threads.
+        /// Uses the same `cuvsResources_t` that was used to build the CAGRA
+        /// graph. The CAGRA index stores internal references to the build
+        /// resource's memory pool and stream, so using a different resources
+        /// handle causes "unknown error" from `cuvsCagraSearch`. Since the
+        /// actor serializes all index operations, reusing the build `res` is
+        /// safe.
         ///
         /// The cuVS CAGRA search API requires query, neighbors, and distances
         /// tensors on a CUDA device (`kDLCUDA`). We use cudarc to allocate
@@ -1468,6 +1471,7 @@ mod gpu {
         /// copy results back.
         fn search_cagra(
             &self,
+            res: cuvs_ffi::CuvsResources,
             index_ptr: cuvs_ffi::CuvsCagraIndexPtr,
             query: &[f32],
             k: usize,
@@ -1475,17 +1479,6 @@ mod gpu {
         ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
             let lib = &self.lib;
             let d = self.dimensions;
-
-            // Create per-search cuVS resources (own CUDA stream).
-            let mut res: cuvs_ffi::CuvsResources = 0;
-            // SAFETY: cuvsResourcesCreate creates a fresh CUDA stream.
-            unsafe {
-                cuvs_ffi::check(
-                    lib,
-                    (lib.resources_create)(&mut res),
-                    "cuvsResourcesCreate (search)",
-                )?;
-            }
 
             // Create search params
             let mut search_params: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -1519,6 +1512,12 @@ mod gpu {
                 device_type: cuvs_ffi::KDL_CUDA,
                 device_id: 0,
             };
+
+            // Synchronize the cudarc stream so that the H2D copy of the
+            // query and the zero-fill of neighbors/distances are complete
+            // before cuVS accesses this memory on the build stream.
+            ctx.synchronize()
+                .map_err(|e| anyhow!("CAGRA search: CUDA ctx sync failed: {e}"))?;
 
             // Get raw device pointers. The SyncOnDrop guards ensure the stream
             // is synchronized when they are dropped.
@@ -1586,14 +1585,20 @@ mod gpu {
                     &mut distances_tensor,
                     filter,
                 );
-                let _ = (lib.cagra_search_params_destroy)(search_params);
+                // Check status BEFORE destroying params — the destroy call
+                // clears cuVS's thread-local error text.
                 cuvs_ffi::check(lib, status, "cuvsCagraSearch")?;
+                let _ = (lib.cagra_search_params_destroy)(search_params);
                 cuvs_ffi::check(
                     lib,
                     (lib.stream_sync)(res),
                     "cuvsStreamSync after search",
                 )?;
             }
+
+            // Synchronize device so cuVS results are visible to cudarc.
+            ctx.synchronize()
+                .map_err(|e| anyhow!("CAGRA search: CUDA ctx sync after search failed: {e}"))?;
 
             // Release mutable borrow guards before copying data back.
             drop(_query_guard);
@@ -1607,12 +1612,6 @@ mod gpu {
             let distances_data = stream
                 .clone_dtoh(&d_distances)
                 .map_err(|e| anyhow!("CAGRA search: failed to copy distances: {e}"))?;
-
-            // Destroy per-search resources (CUDA stream).
-            // SAFETY: res was created above and is no longer needed.
-            unsafe {
-                let _ = (lib.resources_destroy)(res);
-            }
 
             // Convert results to (PrimaryId, Distance) pairs.
             // CAGRA returns u32 indices into the flat dataset array.
@@ -1771,7 +1770,7 @@ mod gpu {
                 return self.search_brute_force(query, &cached.flat, &cached.ids, k);
             }
 
-            self.search_cagra(cached.index_ptr, query, k, &cached.ids)
+            self.search_cagra(cached.res, cached.index_ptr, query, k, &cached.ids)
         }
 
         fn size(&self) -> usize {
