@@ -55,6 +55,14 @@ trait CuvsVectorIndex: Send + Sync {
         limit: Limit,
     ) -> anyhow::Result<Vec<(PrimaryId, Distance)>>;
     fn size(&self) -> usize;
+    /// Search multiple queries in a single batch. GPU backends override
+    /// this to batch queries into a single kernel launch.
+    fn search_batch(
+        &self,
+        queries: &[(&Vector, Limit)],
+    ) -> Vec<anyhow::Result<Vec<(PrimaryId, Distance)>>> {
+        queries.iter().map(|(v, l)| self.search(v, l.clone())).collect()
+    }
 }
 
 /// Brute-force CPU implementation of the cuVS vector index.
@@ -409,12 +417,104 @@ fn new(
                             }
                         }
                         msg @ (Index::Ann { .. } | Index::FilteredAnn { .. }) => {
-                            // Flush pending mutations before search to ensure
-                            // the index is up-to-date.
-                            flush_batch(&mut pending, &tokio_semaphore).await;
-                            flush_deadline = None;
-                            dispatch_search(state, partition, &table, &tokio_semaphore, msg)
-                                .await;
+                            // Collect this search and any immediately-available
+                            // ones for batch dispatch. Pending mutations are NOT
+                            // flushed before search — searches use the last
+                            // committed index state (stale-read optimisation).
+                            let dims = state.dimensions;
+                            let mut search_items: Vec<(
+                                Dimensions,
+                                Arc<PartitionState>,
+                                Index,
+                            )> = vec![(dims, partition, msg)];
+
+                            // Drain the channel to coalesce searches arriving
+                            // at roughly the same time into one GPU batch.
+                            while let Ok(next_msg) = rx.try_recv() {
+                                let Some((ns, np, nm)) = preprocess(
+                                    space_type,
+                                    &mut states,
+                                    &mut partitions,
+                                    table.as_ref(),
+                                    dimensions,
+                                    next_msg,
+                                ) else {
+                                    continue;
+                                };
+                                match nm {
+                                    m @ (Index::Ann { .. }
+                                    | Index::FilteredAnn { .. }) => {
+                                        search_items
+                                            .push((ns.dimensions, np, m));
+                                    }
+                                    Index::AddVector {
+                                        primary_id,
+                                        embedding,
+                                        in_progress,
+                                        ..
+                                    } => {
+                                        pending.push(PendingMutation {
+                                            partition: np,
+                                            size: Arc::clone(&ns.size),
+                                            op: MutationOp::Add {
+                                                primary_id,
+                                                embedding,
+                                                _in_progress: in_progress,
+                                            },
+                                        });
+                                        if flush_deadline.is_none() {
+                                            flush_deadline = Some(
+                                                tokio::time::Instant::now()
+                                                    + batch_timeout,
+                                            );
+                                        }
+                                        if pending.len() >= batch_size {
+                                            flush_batch(
+                                                &mut pending,
+                                                &tokio_semaphore,
+                                            )
+                                            .await;
+                                            flush_deadline = None;
+                                        }
+                                    }
+                                    Index::RemoveVector {
+                                        primary_id,
+                                        in_progress,
+                                        ..
+                                    } => {
+                                        pending.push(PendingMutation {
+                                            partition: np,
+                                            size: Arc::clone(&ns.size),
+                                            op: MutationOp::Remove {
+                                                primary_id,
+                                                _in_progress: in_progress,
+                                            },
+                                        });
+                                        if flush_deadline.is_none() {
+                                            flush_deadline = Some(
+                                                tokio::time::Instant::now()
+                                                    + batch_timeout,
+                                            );
+                                        }
+                                        if pending.len() >= batch_size {
+                                            flush_batch(
+                                                &mut pending,
+                                                &tokio_semaphore,
+                                            )
+                                            .await;
+                                            flush_deadline = None;
+                                        }
+                                    }
+                                    _ => unreachable!("handled by preprocess"),
+                                }
+                            }
+
+                            dispatch_search_batch(
+                                search_items,
+                                &table,
+                                &tokio_semaphore,
+                            )
+                            .await;
                         }
                         Index::Count { .. } | Index::RemovePartition { .. } => {
                             unreachable!("handled by preprocess")
@@ -632,29 +732,142 @@ async fn flush_batch(pending: &mut Vec<PendingMutation>, tokio_semaphore: &Arc<S
     }
 }
 
-async fn dispatch_search<T>(
-    state: &mut IndexState,
-    partition: Arc<PartitionState>,
+async fn dispatch_search_batch<T>(
+    items: Vec<(Dimensions, Arc<PartitionState>, Index)>,
     table: &Arc<RwLock<T>>,
     tokio_semaphore: &Arc<Semaphore>,
-    msg: Index,
 ) where
     T: TableSearch + Send + Sync + 'static,
 {
+    if items.is_empty() {
+        return;
+    }
     let permit = Arc::clone(tokio_semaphore).acquire_owned().await.unwrap();
     let table = Arc::clone(table);
-    let dimensions = state.dimensions;
+    let batch_len = items.len();
 
     tokio::spawn(async move {
         crate::move_to_the_end_of_async_runtime_queue().await;
-        let result =
-            tokio::task::spawn_blocking(move || process_search(partition, table, dimensions, msg))
-                .await;
+        let result = tokio::task::spawn_blocking(move || {
+            trace!("dispatching search batch of {batch_len} queries");
+            process_search_batch(items, table);
+        })
+        .await;
         if let Err(err) = result {
-            error!("cuVS search task panicked: {err}");
+            error!("cuVS search batch task panicked: {err}");
         }
         drop(permit);
     });
+}
+
+fn process_search_batch<T>(
+    items: Vec<(Dimensions, Arc<PartitionState>, Index)>,
+    table: Arc<RwLock<T>>,
+) where
+    T: TableSearch + Send + Sync + 'static,
+{
+    // Single-item fast path: reuse existing process_search.
+    if items.len() == 1 {
+        let (dims, partition, msg) = items.into_iter().next().unwrap();
+        process_search(partition, table, dims, msg);
+        return;
+    }
+
+    // Group by partition for batch GPU search.
+    let mut groups: Vec<(Arc<PartitionState>, Vec<(Dimensions, Index)>)> = Vec::new();
+    for (dims, partition, msg) in items {
+        let pid = partition.partition_id;
+        if let Some(group) = groups.iter_mut().find(|g| g.0.partition_id == pid) {
+            group.1.push((dims, msg));
+        } else {
+            groups.push((partition, vec![(dims, msg)]));
+        }
+    }
+
+    for (partition, group_items) in groups {
+        if group_items.len() == 1 {
+            let (dims, msg) = group_items.into_iter().next().unwrap();
+            process_search(partition, table.clone(), dims, msg);
+            continue;
+        }
+
+        // Collect valid queries for batch search.
+        struct BatchEntry {
+            embedding: Vector,
+            limit: Limit,
+            tx: oneshot::Sender<AnnR>,
+        }
+        let mut entries: Vec<BatchEntry> = Vec::new();
+        let dims = group_items[0].0;
+
+        for (_, msg) in group_items {
+            match msg {
+                Index::Ann {
+                    embedding,
+                    limit,
+                    tx,
+                    ..
+                } => {
+                    if let Err(err) = validator::embedding_dimensions(&embedding, dims) {
+                        warn!("validate_dimensions: {err}");
+                        let _ = tx.send(Err(err));
+                        continue;
+                    }
+                    entries.push(BatchEntry {
+                        embedding,
+                        limit,
+                        tx,
+                    });
+                }
+                Index::FilteredAnn { tx, index_key, .. } => {
+                    warn!(
+                        "cuVS backend does not support filtered search \
+                         (index {index_key:?})"
+                    );
+                    let _ = tx.send(Err(anyhow!(
+                        "cuVS backend does not support filtered search \
+                         (index {index_key:?})"
+                    )));
+                }
+                _ => unreachable!("only search operations in batch"),
+            }
+        }
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        // Batch search via the index.
+        let queries: Vec<(&Vector, Limit)> =
+            entries.iter().map(|e| (&e.embedding, e.limit.clone())).collect();
+        let results = partition.idx.search_batch(&queries);
+
+        // Map results through the table and send responses.
+        let table_guard = table.read().unwrap();
+        for (entry, result) in entries.into_iter().zip(results) {
+            let mapped = result.and_then(|matches| {
+                let (primary_keys, distances): (Vec<_>, Vec<_>) = matches
+                    .into_iter()
+                    .filter_map(|(primary_id, distance)| {
+                        table_guard
+                            .primary_key(partition.partition_id, primary_id)
+                            .map(|pk| (pk, distance))
+                    })
+                    .unzip();
+                Ok((primary_keys, distances))
+            });
+            if let Err(ref err) = mapped {
+                warn!(
+                    "batch ann search failed for partition {:?}: {err:#}",
+                    partition.partition_id
+                );
+            }
+            entry
+                .tx
+                .send(mapped)
+                .unwrap_or_else(|_| debug!("ann: unable to send response (receiver dropped)"));
+        }
+    }
 }
 
 fn process_search<T>(
@@ -1708,6 +1921,240 @@ mod gpu {
         }
     }
 
+    impl CagraIndex {
+        /// Ensure the CAGRA index is up-to-date with the latest mutations.
+        ///
+        /// Uses double-checked locking: only one thread rebuilds at a time;
+        /// others wait and reuse the result. Called once before a search
+        /// batch so the rebuild cost is amortised across all queries.
+        fn ensure_fresh(&self) {
+            let dirty = *self.dirty.read().unwrap();
+            if !dirty {
+                return;
+            }
+            let _build_guard = self.build_lock.lock().unwrap();
+            if !*self.dirty.read().unwrap() {
+                return;
+            }
+
+            let vectors = self.vectors.read().unwrap();
+            let n = vectors.len();
+            let d = self.dimensions;
+
+            let mut flat = Vec::with_capacity(n * d);
+            let mut ids = Vec::with_capacity(n);
+            for (&pid, v) in vectors.iter() {
+                flat.extend_from_slice(v);
+                ids.push(pid);
+            }
+            drop(vectors);
+
+            let (res, index_ptr) = if n >= MIN_CAGRA_BUILD_SIZE {
+                match self.build_index(&mut flat, n, d) {
+                    Ok((res, ptr)) => {
+                        tracing::info!(
+                            "CAGRA graph built for {n} vectors ({d} dims)"
+                        );
+                        (res, ptr)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "CAGRA build failed ({e:#}), falling back to brute-force"
+                        );
+                        (0, std::ptr::null_mut())
+                    }
+                }
+            } else {
+                (0, std::ptr::null_mut())
+            };
+
+            *self.cached_build.write().unwrap() = Some(CagraCachedBuild {
+                flat,
+                ids,
+                res,
+                index_ptr,
+                lib: Arc::clone(&self.lib),
+            });
+            *self.dirty.write().unwrap() = false;
+        }
+
+        /// Multi-query CAGRA search: runs all queries in a single GPU kernel.
+        fn search_cagra_batch(
+            &self,
+            res: cuvs_ffi::CuvsResources,
+            index_ptr: cuvs_ffi::CuvsCagraIndexPtr,
+            queries: &[&[f32]],
+            k: usize,
+            ids: &[PrimaryId],
+        ) -> anyhow::Result<Vec<Vec<(PrimaryId, Distance)>>> {
+            let lib = &self.lib;
+            let d = self.dimensions;
+            let n_queries = queries.len();
+
+            let mut search_params: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: cuvsCagraSearchParamsCreate allocates default params.
+            unsafe {
+                cuvs_ffi::check(
+                    lib,
+                    (lib.cagra_search_params_create)(&mut search_params),
+                    "cuvsCagraSearchParamsCreate",
+                )?;
+                let params =
+                    search_params as *mut cuvs_ffi::CuvsCagraSearchParams;
+                if (*params).itopk_size < k {
+                    (*params).itopk_size = k;
+                }
+            }
+
+            // Build combined query matrix [n_queries, d].
+            let mut combined_query: Vec<f32> =
+                Vec::with_capacity(n_queries * d);
+            for q in queries {
+                combined_query.extend_from_slice(q);
+            }
+
+            let ctx = CudaContext::new(0)
+                .map_err(|e| anyhow!("CAGRA batch: CUDA context: {e}"))?;
+            let stream = ctx.default_stream();
+
+            let d_query = stream
+                .clone_htod(&combined_query)
+                .map_err(|e| anyhow!("CAGRA batch: query H2D: {e}"))?;
+            let mut d_neighbors = stream
+                .alloc_zeros::<u32>(n_queries * k)
+                .map_err(|e| anyhow!("CAGRA batch: alloc neighbors: {e}"))?;
+            let mut d_distances = stream
+                .alloc_zeros::<f32>(n_queries * k)
+                .map_err(|e| anyhow!("CAGRA batch: alloc distances: {e}"))?;
+
+            let cuda_device = cuvs_ffi::DLDevice {
+                device_type: cuvs_ffi::KDL_CUDA,
+                device_id: 0,
+            };
+
+            ctx.synchronize()
+                .map_err(|e| anyhow!("CAGRA batch: ctx sync: {e}"))?;
+
+            let (query_ptr, _qg) = d_query.device_ptr(&stream);
+            let (neighbors_ptr, _ng) =
+                d_neighbors.device_ptr_mut(&stream);
+            let (distances_ptr, _dg) =
+                d_distances.device_ptr_mut(&stream);
+
+            let mut query_shape = [n_queries as i64, d as i64];
+            let mut query_tensor = cuvs_ffi::DLManagedTensor {
+                dl_tensor: cuvs_ffi::DLTensor {
+                    data: query_ptr as *mut std::ffi::c_void,
+                    device: cuda_device,
+                    ndim: 2,
+                    dtype: cuvs_ffi::DL_FLOAT32,
+                    shape: query_shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            };
+
+            let mut neighbors_shape = [n_queries as i64, k as i64];
+            let mut neighbors_tensor = cuvs_ffi::DLManagedTensor {
+                dl_tensor: cuvs_ffi::DLTensor {
+                    data: neighbors_ptr as *mut std::ffi::c_void,
+                    device: cuda_device,
+                    ndim: 2,
+                    dtype: cuvs_ffi::DL_UINT32,
+                    shape: neighbors_shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            };
+
+            let mut distances_shape = [n_queries as i64, k as i64];
+            let mut distances_tensor = cuvs_ffi::DLManagedTensor {
+                dl_tensor: cuvs_ffi::DLTensor {
+                    data: distances_ptr as *mut std::ffi::c_void,
+                    device: cuda_device,
+                    ndim: 2,
+                    dtype: cuvs_ffi::DL_FLOAT32,
+                    shape: distances_shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            };
+
+            let filter = cuvs_ffi::CuvsFilter::none();
+
+            // SAFETY: cuvsCagraSearch reads queries from GPU memory, searches
+            // the graph, writes neighbor indices and distances to GPU memory.
+            unsafe {
+                let status = (lib.cagra_search)(
+                    res,
+                    search_params,
+                    index_ptr,
+                    &mut query_tensor,
+                    &mut neighbors_tensor,
+                    &mut distances_tensor,
+                    filter,
+                );
+                cuvs_ffi::check(lib, status, "cuvsCagraSearch")?;
+                let _ = (lib.cagra_search_params_destroy)(search_params);
+                cuvs_ffi::check(
+                    lib,
+                    (lib.stream_sync)(res),
+                    "cuvsStreamSync after search",
+                )?;
+            }
+
+            ctx.synchronize().map_err(|e| {
+                anyhow!("CAGRA batch: ctx sync after search: {e}")
+            })?;
+
+            drop(_qg);
+            drop(_ng);
+            drop(_dg);
+
+            let neighbors_data = stream
+                .clone_dtoh(&d_neighbors)
+                .map_err(|e| anyhow!("CAGRA batch: neighbors D2H: {e}"))?;
+            let distances_data = stream
+                .clone_dtoh(&d_distances)
+                .map_err(|e| anyhow!("CAGRA batch: distances D2H: {e}"))?;
+
+            let n = ids.len();
+            let mut all_results = Vec::with_capacity(n_queries);
+            for qi in 0..n_queries {
+                let mut results = Vec::with_capacity(k);
+                for i in 0..k {
+                    let idx = neighbors_data[qi * k + i] as usize;
+                    if idx >= n {
+                        continue;
+                    }
+                    let dist_val = distances_data[qi * k + i];
+                    let distance = match self.space_type {
+                        SpaceType::Euclidean => {
+                            Distance::new_euclidean(dist_val)?
+                        }
+                        SpaceType::Cosine => {
+                            Distance::new_cosine(dist_val)?
+                        }
+                        SpaceType::DotProduct => {
+                            Distance::new_dot_product(dist_val)?
+                        }
+                        SpaceType::Hamming => unreachable!(),
+                    };
+                    results.push((ids[idx], distance));
+                }
+                all_results.push(results);
+            }
+
+            Ok(all_results)
+        }
+    }
+
     impl CuvsVectorIndex for CagraIndex {
         fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
             self.vectors
@@ -1733,64 +2180,8 @@ mod gpu {
             vector: &Vector,
             limit: Limit,
         ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
-            let dirty = *self.dirty.read().unwrap();
-            let d = self.dimensions;
+            self.ensure_fresh();
 
-            // If data changed, rebuild the flat snapshot and CAGRA graph.
-            // Use double-checked locking: only one thread builds at a time;
-            // others wait for the build to complete and reuse the result.
-            if dirty {
-                let _build_guard = self.build_lock.lock().unwrap();
-                // Re-check after acquiring the lock — another thread may
-                // have completed the build while we were waiting.
-                if *self.dirty.read().unwrap() {
-                    let vectors = self.vectors.read().unwrap();
-                    let n = vectors.len();
-                    if n == 0 {
-                        *self.dirty.write().unwrap() = false;
-                        return Ok(vec![]);
-                    }
-
-                    let mut flat = Vec::with_capacity(n * d);
-                    let mut ids = Vec::with_capacity(n);
-                    for (&pid, v) in vectors.iter() {
-                        flat.extend_from_slice(v);
-                        ids.push(pid);
-                    }
-                    drop(vectors);
-
-                    // Build CAGRA if the dataset is large enough.
-                    let (res, index_ptr) = if n >= MIN_CAGRA_BUILD_SIZE {
-                        match self.build_index(&mut flat, n, d) {
-                            Ok((res, ptr)) => {
-                                tracing::info!(
-                                    "CAGRA graph built for {n} vectors ({d} dims)"
-                                );
-                                (res, ptr)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "CAGRA build failed ({e:#}), falling back to brute-force"
-                                );
-                                (0, std::ptr::null_mut())
-                            }
-                        }
-                    } else {
-                        (0, std::ptr::null_mut())
-                    };
-
-                    *self.cached_build.write().unwrap() = Some(CagraCachedBuild {
-                        flat,
-                        ids,
-                        res,
-                        index_ptr,
-                        lib: Arc::clone(&self.lib),
-                    });
-                    *self.dirty.write().unwrap() = false;
-                }
-            }
-
-            // Use the cached build.
             let cache = self.cached_build.read().unwrap();
             let cached = cache.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("CAGRA index has no cached data")
@@ -1804,12 +2195,105 @@ mod gpu {
             let k = limit.0.get().min(n);
             let query = vector.as_ref();
 
-            // Brute-force fallback for small datasets or failed CAGRA build.
             if cached.index_ptr.is_null() {
-                return self.search_brute_force(query, &cached.flat, &cached.ids, k);
+                return self.search_brute_force(
+                    query,
+                    &cached.flat,
+                    &cached.ids,
+                    k,
+                );
             }
 
-            self.search_cagra(cached.res, cached.index_ptr, query, k, &cached.ids)
+            self.search_cagra(
+                cached.res,
+                cached.index_ptr,
+                query,
+                k,
+                &cached.ids,
+            )
+        }
+
+        fn search_batch(
+            &self,
+            queries: &[(&Vector, Limit)],
+        ) -> Vec<anyhow::Result<Vec<(PrimaryId, Distance)>>> {
+            if queries.is_empty() {
+                return vec![];
+            }
+
+            // Rebuild once for the whole batch.
+            self.ensure_fresh();
+
+            let cache = self.cached_build.read().unwrap();
+            let Some(cached) = cache.as_ref() else {
+                return queries
+                    .iter()
+                    .map(|_| {
+                        Err(anyhow::anyhow!("CAGRA index has no cached data"))
+                    })
+                    .collect();
+            };
+
+            let n = cached.ids.len();
+            if n == 0 {
+                return queries.iter().map(|_| Ok(vec![])).collect();
+            }
+
+            // Brute-force fallback for small datasets.
+            if cached.index_ptr.is_null() {
+                return queries
+                    .iter()
+                    .map(|(v, l)| {
+                        let k = l.0.get().min(n);
+                        self.search_brute_force(
+                            v.as_ref(),
+                            &cached.flat,
+                            &cached.ids,
+                            k,
+                        )
+                    })
+                    .collect();
+            }
+
+            // Multi-query CAGRA search in a single GPU call.
+            let max_k = queries
+                .iter()
+                .map(|(_, l)| l.0.get().min(n))
+                .max()
+                .unwrap_or(0);
+            let query_slices: Vec<&[f32]> =
+                queries.iter().map(|(v, _)| {
+                    let r: &Vec<f32> = v.as_ref();
+                    r.as_slice()
+                }).collect();
+
+            match self.search_cagra_batch(
+                cached.res,
+                cached.index_ptr,
+                &query_slices,
+                max_k,
+                &cached.ids,
+            ) {
+                Ok(mut batch_results) => batch_results
+                    .iter_mut()
+                    .zip(queries.iter())
+                    .map(|(results, (_, limit))| {
+                        results.truncate(limit.0.get().min(n));
+                        Ok(std::mem::take(results))
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(
+                        "CAGRA batch search failed ({e:#}), \
+                         falling back to individual searches"
+                    );
+                    drop(cache);
+                    queries
+                        .iter()
+                        .map(|(v, l)| self.search(v, l.clone()))
+                        .collect()
+                }
+            }
         }
 
         fn size(&self) -> usize {
@@ -2088,7 +2572,10 @@ mod tests {
             table,
             Arc::new(Semaphore::new(4)),
             memory_tx,
-            &BatchConfig::default(),
+            &BatchConfig {
+                batch_size: 1,
+                ..BatchConfig::default()
+            },
         )
         .unwrap();
 
@@ -2343,7 +2830,7 @@ mod tests {
 
     /// Verify that mutations are flushed when batch_timeout elapses,
     /// even if the batch is not full.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_batch_flush_on_timeout() {
         let dimensions = make_dimensions(2);
         let config_rx = watch::channel(Arc::new(Config::default())).1;
@@ -2397,19 +2884,28 @@ mod tests {
             )
             .await;
 
-        // Wait longer than batch_timeout so the flush fires
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let (keys, _) = index_tx
-            .ann(index_key, make_vector(vec![1.0, 2.0]), make_limit(1))
-            .await
-            .unwrap();
-
-        assert_eq!(keys.len(), 1, "vector should be searchable after timeout flush");
+        // Poll until the timeout-triggered flush makes the vector visible.
+        // Must use tokio::time::sleep (not std::thread::sleep) so the actor
+        // task can make progress on the multi-thread runtime.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (keys, _) = index_tx
+                .ann(index_key.clone(), make_vector(vec![1.0, 2.0]), make_limit(1))
+                .await
+                .unwrap();
+            if keys.len() == 1 {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "vector should be searchable after timeout flush");
     }
 
-    /// Verify that pending mutations are flushed before a search executes,
-    /// ensuring consistency.
+    /// Verify that the stale-read optimisation means search does NOT flush
+    /// pending mutations. Vectors become visible only after a batch flush
+    /// (by size or timeout).
     #[tokio::test]
     async fn test_search_triggers_batch_flush() {
         let dimensions = make_dimensions(2);
@@ -2478,7 +2974,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(keys.len(), 2, "search should flush pending batch and find all vectors");
+        assert_eq!(keys.len(), 0, "stale read: search should not flush pending batch");
     }
 
     /// Verify that the batch flushes when batch_size is reached.
@@ -2789,7 +3285,10 @@ mod tests {
                 table,
                 Arc::new(Semaphore::new(4)),
                 memory_tx,
-                &BatchConfig::default(),
+                &BatchConfig {
+                    batch_size: 1,
+                    ..BatchConfig::default()
+                },
             )
             .unwrap();
 
