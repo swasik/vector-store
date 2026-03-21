@@ -18,6 +18,7 @@ required-features = ["dev-tools"]
 [features]
 default = []
 dev-tools = []
+gpu = ["dep:cudarc"]
 
 [dependencies]
 anyhow.workspace = true
@@ -56,6 +57,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 usearch.workspace = true
+cudarc = { workspace = true, optional = true }
 utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true

@@ -62,12 +62,14 @@ trait CuvsVectorIndex: Send + Sync {
 /// Stores vectors in memory and performs exhaustive nearest-neighbor search.
 /// This is the initial implementation used for integration testing and
 /// development. A GPU-accelerated implementation (CAGRA/IVF) will replace
-/// the inner search logic when the `cuvs` feature is enabled.
+/// the inner search logic when the `gpu` feature is enabled.
+#[cfg_attr(feature = "gpu", allow(dead_code))]
 struct BruteForceIndex {
     vectors: RwLock<BTreeMap<PrimaryId, Vec<f32>>>,
     space_type: SpaceType,
 }
 
+#[cfg_attr(feature = "gpu", allow(dead_code))]
 impl BruteForceIndex {
     fn new(space_type: SpaceType) -> Self {
         Self {
@@ -120,6 +122,30 @@ impl CuvsVectorIndex for BruteForceIndex {
     }
 }
 
+/// Creates the appropriate vector index implementation for a new partition.
+///
+/// When the `gpu` feature is enabled, returns a GPU-accelerated brute-force
+/// index using cuBLAS SGEMM for distance computation. Otherwise falls back
+/// to the CPU implementation.
+fn create_partition_index(
+    space_type: SpaceType,
+    dimensions: Dimensions,
+) -> Arc<dyn CuvsVectorIndex> {
+    #[cfg(feature = "gpu")]
+    {
+        Arc::new(gpu::GpuBruteForceIndex::new(
+            space_type,
+            dimensions.0.get(),
+        ))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = dimensions;
+        Arc::new(BruteForceIndex::new(space_type))
+    }
+}
+
+#[cfg_attr(feature = "gpu", allow(dead_code))]
 fn compute_distance(a: &[f32], b: &[f32], space_type: SpaceType) -> anyhow::Result<Distance> {
     match space_type {
         SpaceType::Euclidean => {
@@ -218,7 +244,14 @@ impl IndexFactory for CuvsIndexFactory {
     }
 
     fn index_engine_version(&self) -> String {
-        "cuvs-brute-force-v1".to_string()
+        #[cfg(feature = "gpu")]
+        {
+            "cuvs-gpu-brute-force-v1".to_string()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            "cuvs-brute-force-v1".to_string()
+        }
     }
 }
 
@@ -406,7 +439,7 @@ where
                 };
                 return Some((state, Arc::clone(partition), msg));
             }
-            let idx = Arc::new(BruteForceIndex::new(space_type));
+            let idx = create_partition_index(space_type, dimensions);
             let partition = Arc::new(PartitionState::new(partition_id, idx));
             let state = states
                 .entry(index_id)
@@ -664,6 +697,204 @@ async fn check_memory_allocation(
     true
 }
 
+/// GPU-accelerated brute-force search backend using cuBLAS SGEMM.
+///
+/// When compiled with `--features gpu`, this module provides a
+/// `GpuBruteForceIndex` that accelerates exhaustive nearest-neighbor search
+/// on NVIDIA GPUs. Vectors are stored in host memory and transferred to the
+/// GPU for each search. All-pairs inner products are computed via a single
+/// cuBLAS SGEMM call (`dataset × query^T`), then distances are derived on
+/// the host from the inner products.
+///
+/// The `cudarc` crate dynamically loads CUDA libraries at runtime via
+/// `fallback-dynamic-loading`, so the binary compiles without any CUDA
+/// toolkit installed and fails gracefully at runtime if no GPU is available.
+#[cfg(feature = "gpu")]
+mod gpu {
+    use super::*;
+    use cudarc::cublas::sys::cublasOperation_t;
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+    use cudarc::driver::CudaContext;
+
+    /// GPU-accelerated brute-force vector index using cuBLAS.
+    ///
+    /// Stores vectors in host memory. On search, copies the full dataset and
+    /// query to the GPU, computes inner products via SGEMM, copies results
+    /// back, and derives final distances on the CPU.
+    pub(super) struct GpuBruteForceIndex {
+        vectors: RwLock<BTreeMap<PrimaryId, Vec<f32>>>,
+        space_type: SpaceType,
+        dimensions: usize,
+    }
+
+    impl GpuBruteForceIndex {
+        pub fn new(space_type: SpaceType, dimensions: usize) -> Self {
+            Self {
+                vectors: RwLock::new(BTreeMap::new()),
+                space_type,
+                dimensions,
+            }
+        }
+    }
+
+    impl CuvsVectorIndex for GpuBruteForceIndex {
+        fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
+            self.vectors
+                .write()
+                .unwrap()
+                .insert(primary_id, vector.as_ref().to_vec());
+            Ok(())
+        }
+
+        fn remove(&self, primary_id: PrimaryId) -> anyhow::Result<()> {
+            self.vectors.write().unwrap().remove(&primary_id);
+            Ok(())
+        }
+
+        fn search(
+            &self,
+            vector: &Vector,
+            limit: Limit,
+        ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+            let vectors = self.vectors.read().unwrap();
+            if vectors.is_empty() {
+                return Ok(vec![]);
+            }
+
+            let n = vectors.len();
+            let d = self.dimensions;
+            let k = limit.0.get().min(n);
+
+            // Build contiguous dataset row-major [n, d] and PrimaryId map.
+            let mut flat = Vec::with_capacity(n * d);
+            let mut ids: Vec<PrimaryId> = Vec::with_capacity(n);
+            for (&pid, v) in vectors.iter() {
+                flat.extend_from_slice(v);
+                ids.push(pid);
+            }
+            drop(vectors);
+
+            let query = vector.as_ref();
+
+            // --- GPU: compute inner products via cuBLAS SGEMM ---
+            //
+            // Row-major dataset[n,d] viewed as column-major is A_cm[d,n].
+            // Row-major query[1,d] viewed as column-major is B_cm[d,1].
+            //
+            // We want: inner[n,1] = dataset[n,d] * query[d,1]
+            //        = A_cm^T[n,d] * B_cm[d,1]
+            //
+            // SGEMM: C = alpha * op(A)[m,k] * op(B)[k,n_blas] + beta * C
+            //   transa=T → op(A) = A^T = [n, d]  (A is [d, n] col-major)
+            //   transb=N → op(B) = B   = [d, 1]  (B is [d, 1] col-major)
+            //   m=n, n_blas=1, k=d
+            let ctx = CudaContext::new(0)
+                .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+            let stream = ctx.default_stream();
+
+            let d_dataset = stream
+                .clone_htod(&flat)
+                .map_err(|e| anyhow!("failed to copy dataset to GPU: {e}"))?;
+            let d_query = stream
+                .clone_htod(query)
+                .map_err(|e| anyhow!("failed to copy query to GPU: {e}"))?;
+            let mut d_inner = stream
+                .alloc_zeros::<f32>(n)
+                .map_err(|e| anyhow!("failed to allocate GPU output: {e}"))?;
+
+            let blas = CudaBlas::new(stream.clone())
+                .map_err(|e| anyhow!("failed to create cuBLAS handle: {e}"))?;
+
+            let cfg = GemmConfig {
+                transa: cublasOperation_t::CUBLAS_OP_T,
+                transb: cublasOperation_t::CUBLAS_OP_N,
+                m: n as i32,
+                n: 1,
+                k: d as i32,
+                alpha: 1.0f32,
+                lda: d as i32,
+                ldb: d as i32,
+                beta: 0.0f32,
+                ldc: n as i32,
+            };
+
+            // SAFETY: cuBLAS SGEMM operates on device memory allocated above.
+            unsafe {
+                blas.gemm(cfg, &d_dataset, &d_query, &mut d_inner)
+                    .map_err(|e| anyhow!("cuBLAS SGEMM failed: {e}"))?;
+            }
+
+            let inner_products = stream
+                .clone_dtoh(&d_inner)
+                .map_err(|e| anyhow!("failed to copy results from GPU: {e}"))?;
+
+            // --- Derive distances from inner products on the CPU ---
+            let mut indexed: Vec<(usize, f32)> = match self.space_type {
+                SpaceType::Euclidean => {
+                    // L2² = ||q||² + ||d_i||² − 2·(q·d_i)
+                    let q_norm_sq: f32 = query.iter().map(|x| x * x).sum();
+                    (0..n)
+                        .map(|i| {
+                            let d_norm_sq: f32 =
+                                flat[i * d..(i + 1) * d].iter().map(|x| x * x).sum();
+                            (i, q_norm_sq + d_norm_sq - 2.0 * inner_products[i])
+                        })
+                        .collect()
+                }
+                SpaceType::Cosine => {
+                    // cosine_distance = 1 − (q·d_i) / (||q|| · ||d_i||)
+                    let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    (0..n)
+                        .map(|i| {
+                            let d_norm: f32 = flat[i * d..(i + 1) * d]
+                                .iter()
+                                .map(|x| x * x)
+                                .sum::<f32>()
+                                .sqrt();
+                            let dist = if q_norm == 0.0 || d_norm == 0.0 {
+                                1.0
+                            } else {
+                                1.0 - inner_products[i] / (q_norm * d_norm)
+                            };
+                            (i, dist)
+                        })
+                        .collect()
+                }
+                SpaceType::DotProduct => {
+                    (0..n).map(|i| (i, 1.0 - inner_products[i])).collect()
+                }
+                SpaceType::Hamming => {
+                    anyhow::bail!("GPU backend does not support Hamming distance")
+                }
+            };
+
+            // Sort by distance and take top-k.
+            indexed.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            indexed.truncate(k);
+
+            let mut results = Vec::with_capacity(k);
+            for (idx, dist_val) in indexed {
+                let pid = ids[idx];
+                let distance = match self.space_type {
+                    SpaceType::Euclidean => Distance::new_euclidean(dist_val)?,
+                    SpaceType::Cosine => Distance::new_cosine(dist_val)?,
+                    SpaceType::DotProduct => Distance::new_dot_product(dist_val)?,
+                    SpaceType::Hamming => unreachable!(),
+                };
+                results.push((pid, distance));
+            }
+
+            Ok(results)
+        }
+
+        fn size(&self) -> usize {
+            self.vectors.read().unwrap().len()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +1102,12 @@ mod tests {
             tokio_semaphore: Arc::new(Semaphore::new(1)),
             batch_config: BatchConfig::default(),
         };
+        #[cfg(feature = "gpu")]
+        assert_eq!(
+            factory.index_engine_version(),
+            "cuvs-gpu-brute-force-v1"
+        );
+        #[cfg(not(feature = "gpu"))]
         assert_eq!(factory.index_engine_version(), "cuvs-brute-force-v1");
     }
 
@@ -1366,5 +1603,278 @@ mod tests {
 
         let count = index_tx.count(index_key).await.unwrap();
         assert_eq!(count, 3, "batch should have flushed when batch_size reached");
+    }
+
+    // --- GPU brute-force tests (require `gpu` feature and NVIDIA GPU) ---
+
+    #[cfg(feature = "gpu")]
+    mod gpu_tests {
+        use super::*;
+        use crate::index::cuvs::gpu::GpuBruteForceIndex;
+
+        #[test]
+        fn test_gpu_add_and_size() {
+            let index = GpuBruteForceIndex::new(SpaceType::Euclidean, 3);
+            assert_eq!(index.size(), 0);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![1.0, 2.0, 3.0]))
+                .unwrap();
+            assert_eq!(index.size(), 1);
+
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![4.0, 5.0, 6.0]))
+                .unwrap();
+            assert_eq!(index.size(), 2);
+        }
+
+        #[test]
+        fn test_gpu_add_and_remove() {
+            let index = GpuBruteForceIndex::new(SpaceType::Euclidean, 3);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![1.0, 2.0, 3.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![4.0, 5.0, 6.0]))
+                .unwrap();
+            assert_eq!(index.size(), 2);
+
+            index.remove(PrimaryId::from(1u64)).unwrap();
+            assert_eq!(index.size(), 1);
+        }
+
+        #[test]
+        fn test_gpu_search_euclidean() {
+            let index = GpuBruteForceIndex::new(SpaceType::Euclidean, 2);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![0.0, 0.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![1.0, 0.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(3u64), &make_vector(vec![10.0, 10.0]))
+                .unwrap();
+
+            let results = index
+                .search(&make_vector(vec![0.0, 0.0]), make_limit(2))
+                .unwrap();
+
+            assert_eq!(results.len(), 2);
+            // Closest should be the origin (distance 0)
+            assert_eq!(results[0].0, PrimaryId::from(1u64));
+            let d0: f32 = results[0].1.into();
+            assert_eq!(d0, 0.0);
+            // Second closest: (1,0), squared L2 = 1.0
+            assert_eq!(results[1].0, PrimaryId::from(2u64));
+            let d1: f32 = results[1].1.into();
+            assert_eq!(d1, 1.0);
+        }
+
+        #[test]
+        fn test_gpu_search_cosine() {
+            let index = GpuBruteForceIndex::new(SpaceType::Cosine, 2);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![1.0, 0.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![0.0, 1.0]))
+                .unwrap();
+
+            let results = index
+                .search(&make_vector(vec![1.0, 0.0]), make_limit(2))
+                .unwrap();
+
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].0, PrimaryId::from(1u64));
+            let d0: f32 = results[0].1.into();
+            assert!(d0.abs() < 1e-6, "expected ~0.0, got {d0}");
+            assert_eq!(results[1].0, PrimaryId::from(2u64));
+            let d1: f32 = results[1].1.into();
+            assert!((d1 - 1.0).abs() < 1e-6, "expected ~1.0, got {d1}");
+        }
+
+        #[test]
+        fn test_gpu_search_dot_product() {
+            let index = GpuBruteForceIndex::new(SpaceType::DotProduct, 2);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![1.0, 0.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![0.5, 0.0]))
+                .unwrap();
+
+            let results = index
+                .search(&make_vector(vec![1.0, 0.0]), make_limit(2))
+                .unwrap();
+
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].0, PrimaryId::from(1u64));
+            let d0: f32 = results[0].1.into();
+            assert!(d0.abs() < 1e-6, "expected ~0.0, got {d0}");
+        }
+
+        #[test]
+        fn test_gpu_search_empty() {
+            let index = GpuBruteForceIndex::new(SpaceType::Euclidean, 2);
+
+            let results = index
+                .search(&make_vector(vec![1.0, 2.0]), make_limit(5))
+                .unwrap();
+
+            assert!(results.is_empty());
+        }
+
+        #[test]
+        fn test_gpu_search_limit_larger_than_size() {
+            let index = GpuBruteForceIndex::new(SpaceType::Euclidean, 2);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![1.0, 2.0]))
+                .unwrap();
+
+            let results = index
+                .search(&make_vector(vec![1.0, 2.0]), make_limit(100))
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn test_gpu_update_vector() {
+            let index = GpuBruteForceIndex::new(SpaceType::Euclidean, 2);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![0.0, 0.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![10.0, 10.0]))
+                .unwrap();
+
+            assert_eq!(index.size(), 1);
+
+            let results = index
+                .search(&make_vector(vec![10.0, 10.0]), make_limit(1))
+                .unwrap();
+            let d: f32 = results[0].1.into();
+            assert_eq!(d, 0.0);
+        }
+
+        #[test]
+        fn test_gpu_engine_version() {
+            let factory = CuvsIndexFactory {
+                tokio_semaphore: Arc::new(Semaphore::new(1)),
+                batch_config: BatchConfig::default(),
+            };
+            assert_eq!(
+                factory.index_engine_version(),
+                "cuvs-gpu-brute-force-v1"
+            );
+        }
+
+        /// Verify GPU results match CPU BruteForceIndex for the same data.
+        #[test]
+        fn test_gpu_matches_cpu_euclidean() {
+            let cpu = BruteForceIndex::new(SpaceType::Euclidean);
+            let gpu = GpuBruteForceIndex::new(SpaceType::Euclidean, 3);
+
+            let vectors = vec![
+                (1u64, vec![1.0, 0.0, 0.0]),
+                (2u64, vec![0.0, 1.0, 0.0]),
+                (3u64, vec![0.0, 0.0, 1.0]),
+                (4u64, vec![0.5, 0.5, 0.0]),
+            ];
+
+            for (id, v) in &vectors {
+                let vec = make_vector(v.clone());
+                cpu.add(PrimaryId::from(*id), &vec).unwrap();
+                gpu.add(PrimaryId::from(*id), &vec).unwrap();
+            }
+
+            let query = make_vector(vec![1.0, 0.0, 0.0]);
+            let cpu_results = cpu.search(&query, make_limit(4)).unwrap();
+            let gpu_results = gpu.search(&query, make_limit(4)).unwrap();
+
+            assert_eq!(cpu_results.len(), gpu_results.len());
+            for (cpu_r, gpu_r) in cpu_results.iter().zip(gpu_results.iter()) {
+                assert_eq!(cpu_r.0, gpu_r.0, "PrimaryId mismatch");
+                let cpu_d: f32 = cpu_r.1.into();
+                let gpu_d: f32 = gpu_r.1.into();
+                assert!(
+                    (cpu_d - gpu_d).abs() < 1e-5,
+                    "distance mismatch: cpu={cpu_d} gpu={gpu_d}"
+                );
+            }
+        }
+
+        /// Integration test: GPU index through the actor with batching.
+        #[tokio::test]
+        async fn test_gpu_add_and_search_via_actor() {
+            let dimensions = make_dimensions(3);
+            let config_rx = watch::channel(Arc::new(Config::default())).1;
+            let memory_tx = memory::new(config_rx.clone());
+
+            let mut id_gen = IndexIdGenerator::new();
+            let index_id = id_gen.next(true).unwrap();
+            let partition_id = PartitionId::global(index_id);
+            let primary_id = PrimaryId::from(0u64);
+
+            let index_key = IndexKey::new(&"test_ks".into(), &"test_idx".into());
+
+            let mut mock_table = MockTableSearch::new();
+            let ik = index_key.clone();
+            mock_table
+                .expect_partition_id()
+                .withf(move |key, _| *key == ik)
+                .returning(move |_, _| Some((partition_id, None)));
+            mock_table
+                .expect_index_id()
+                .returning(move |_| Some(index_id));
+            mock_table
+                .expect_primary_key()
+                .returning(move |_, _| Some(crate::PrimaryKey::from(vec![CqlValue::Int(0)])));
+
+            let table = Arc::new(RwLock::new(mock_table));
+
+            let index_tx = new(
+                SpaceType::Euclidean,
+                index_key.clone(),
+                dimensions,
+                table,
+                Arc::new(Semaphore::new(4)),
+                memory_tx,
+                &BatchConfig::default(),
+            )
+            .unwrap();
+
+            index_tx
+                .add_vector(
+                    partition_id,
+                    primary_id,
+                    make_vector(vec![1.0, 2.0, 3.0]),
+                    None,
+                )
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let (keys, distances) = index_tx
+                .ann(
+                    index_key.clone(),
+                    make_vector(vec![1.0, 2.0, 3.0]),
+                    make_limit(1),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(keys.len(), 1);
+            assert_eq!(distances.len(), 1);
+            let d: f32 = distances[0].into();
+            assert_eq!(d, 0.0);
+        }
     }
 }
