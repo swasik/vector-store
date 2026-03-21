@@ -84,6 +84,8 @@ pub struct Config {
     pub opensearch_addr: Option<String>,
     pub credentials: Option<Credentials>,
     pub backend: Option<String>,
+    pub cuvs_batch_size: Option<usize>,
+    pub cuvs_batch_timeout: Option<Duration>,
     pub usearch_simulator: Option<Vec<Duration>>,
     pub cql_keepalive_interval: Option<Duration>,
     pub cql_keepalive_timeout: Option<Duration>,
@@ -109,6 +111,8 @@ impl Default for Config {
             opensearch_addr: None,
             credentials: None,
             backend: None,
+            cuvs_batch_size: None,
+            cuvs_batch_timeout: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,
@@ -679,10 +683,17 @@ pub fn new_index_factory_opensearch(
     )?))
 }
 
-pub fn new_index_factory_cuvs() -> anyhow::Result<Box<dyn IndexFactory + Send + Sync>> {
+pub fn new_index_factory_cuvs(
+    config_rx: watch::Receiver<Arc<Config>>,
+) -> anyhow::Result<Box<dyn IndexFactory + Send + Sync>> {
+    let config = config_rx.borrow().clone();
     let search_concurrency = Handle::current().metrics().num_workers();
     let tokio_semaphore = Arc::new(Semaphore::new(search_concurrency));
-    Ok(Box::new(index::cuvs::new_cuvs(tokio_semaphore)))
+    let batch_config = index::cuvs::BatchConfig {
+        batch_size: config.cuvs_batch_size.unwrap_or(1024),
+        batch_timeout: config.cuvs_batch_timeout.unwrap_or(Duration::from_millis(5)),
+    };
+    Ok(Box::new(index::cuvs::new_cuvs(tokio_semaphore, batch_config)))
 }
 
 pub async fn wait_for_shutdown() {

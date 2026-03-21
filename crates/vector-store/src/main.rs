@@ -96,7 +96,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 Some("cuvs") => {
                     tracing::info!("Using cuVS index factory");
-                    vector_store::new_index_factory_cuvs()?
+                    vector_store::new_index_factory_cuvs(config_rx.clone())?
                 }
                 Some("usearch") | None => {
                     if let Some(addr) = config.opensearch_addr.as_ref() {

@@ -288,6 +288,18 @@ where
         config.backend = Some(backend);
     }
 
+    if let Ok(val) = env("VECTOR_STORE_CUVS_BATCH_SIZE") {
+        config.cuvs_batch_size = Some(val.parse().map_err(|err| {
+            anyhow!("Unable to parse VECTOR_STORE_CUVS_BATCH_SIZE: {err}")
+        })?);
+    }
+    if let Ok(val) = env("VECTOR_STORE_CUVS_BATCH_TIMEOUT_MS") {
+        let ms: u64 = val.parse().map_err(|err| {
+            anyhow!("Unable to parse VECTOR_STORE_CUVS_BATCH_TIMEOUT_MS: {err}")
+        })?;
+        config.cuvs_batch_timeout = Some(Duration::from_millis(ms));
+    }
+
     config.usearch_simulator = env("VECTOR_STORE_USEARCH_SIMULATOR")
         .ok()
         .map(|v| v.split(':').map(|s| s.parse::<humantime::Duration>()).map_ok(|v| v.into()).collect::<Result<Vec<_>, _>>().map_err(|err| {
@@ -534,6 +546,8 @@ mod tests {
             opensearch_addr: None,
             credentials: None,
             backend: None,
+            cuvs_batch_size: None,
+            cuvs_batch_timeout: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,

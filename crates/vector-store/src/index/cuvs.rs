@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -148,8 +149,47 @@ fn compute_distance(a: &[f32], b: &[f32], space_type: SpaceType) -> anyhow::Resu
     }
 }
 
+/// Configuration for batching mutations before dispatching to the index.
+///
+/// GPU-accelerated backends achieve peak throughput when operations are batched
+/// into a single kernel launch. Mutations are accumulated until either
+/// `batch_size` is reached or `batch_timeout` elapses, then flushed together
+/// in one blocking task.
+pub(crate) struct BatchConfig {
+    pub batch_size: usize,
+    pub batch_timeout: Duration,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1024,
+            batch_timeout: Duration::from_millis(5),
+        }
+    }
+}
+
+struct PendingMutation {
+    partition: Arc<PartitionState>,
+    size: Arc<AtomicUsize>,
+    op: MutationOp,
+}
+
+enum MutationOp {
+    Add {
+        primary_id: PrimaryId,
+        embedding: Vector,
+        _in_progress: Option<crate::AsyncInProgress>,
+    },
+    Remove {
+        primary_id: PrimaryId,
+        _in_progress: Option<crate::AsyncInProgress>,
+    },
+}
+
 pub struct CuvsIndexFactory {
     tokio_semaphore: Arc<Semaphore>,
+    batch_config: BatchConfig,
 }
 
 impl IndexFactory for CuvsIndexFactory {
@@ -173,6 +213,7 @@ impl IndexFactory for CuvsIndexFactory {
             table,
             Arc::clone(&self.tokio_semaphore),
             memory,
+            &self.batch_config,
         )
     }
 
@@ -181,8 +222,11 @@ impl IndexFactory for CuvsIndexFactory {
     }
 }
 
-pub fn new_cuvs(tokio_semaphore: Arc<Semaphore>) -> CuvsIndexFactory {
-    CuvsIndexFactory { tokio_semaphore }
+pub fn new_cuvs(tokio_semaphore: Arc<Semaphore>, batch_config: BatchConfig) -> CuvsIndexFactory {
+    CuvsIndexFactory {
+        tokio_semaphore,
+        batch_config,
+    }
 }
 
 struct PartitionState {
@@ -217,20 +261,43 @@ fn new(
     table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
     tokio_semaphore: Arc<Semaphore>,
     memory: mpsc::Sender<Memory>,
+    batch_config: &BatchConfig,
 ) -> anyhow::Result<mpsc::Sender<Index>> {
     const CHANNEL_SIZE: usize = 10;
     let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
+    let batch_size = batch_config.batch_size;
+    let batch_timeout = batch_config.batch_timeout;
 
     tokio::spawn(
         {
             let index_key = index_key.clone();
             async move {
-                debug!("starting");
+                debug!("starting (batch_size={batch_size}, batch_timeout={batch_timeout:?})");
                 let mut states: BTreeMap<IndexId, IndexState> = BTreeMap::new();
                 let mut partitions: BTreeMap<PartitionId, Arc<PartitionState>> = BTreeMap::new();
                 let mut allocate_prev = Allocate::Can;
+                let mut pending: Vec<PendingMutation> = Vec::new();
+                let mut flush_deadline: Option<tokio::time::Instant> = None;
 
-                while let Some(msg) = rx.recv().await {
+                loop {
+                    let msg = tokio::select! {
+                        biased;
+                        msg = rx.recv() => {
+                            match msg {
+                                Some(msg) => msg,
+                                None => {
+                                    flush_batch(&mut pending, &tokio_semaphore).await;
+                                    break;
+                                }
+                            }
+                        }
+                        _ = sleep_until_deadline(flush_deadline) => {
+                            flush_batch(&mut pending, &tokio_semaphore).await;
+                            flush_deadline = None;
+                            continue;
+                        }
+                    };
+
                     if !check_memory_allocation(&msg, &memory, &mut allocate_prev, &index_key)
                         .await
                     {
@@ -248,7 +315,65 @@ fn new(
                         continue;
                     };
 
-                    dispatch_task(state, partition, &table, &tokio_semaphore, msg).await;
+                    match msg {
+                        Index::AddVector {
+                            primary_id,
+                            embedding,
+                            in_progress,
+                            ..
+                        } => {
+                            pending.push(PendingMutation {
+                                partition,
+                                size: Arc::clone(&state.size),
+                                op: MutationOp::Add {
+                                    primary_id,
+                                    embedding,
+                                    _in_progress: in_progress,
+                                },
+                            });
+                            if flush_deadline.is_none() {
+                                flush_deadline =
+                                    Some(tokio::time::Instant::now() + batch_timeout);
+                            }
+                            if pending.len() >= batch_size {
+                                flush_batch(&mut pending, &tokio_semaphore).await;
+                                flush_deadline = None;
+                            }
+                        }
+                        Index::RemoveVector {
+                            primary_id,
+                            in_progress,
+                            ..
+                        } => {
+                            pending.push(PendingMutation {
+                                partition,
+                                size: Arc::clone(&state.size),
+                                op: MutationOp::Remove {
+                                    primary_id,
+                                    _in_progress: in_progress,
+                                },
+                            });
+                            if flush_deadline.is_none() {
+                                flush_deadline =
+                                    Some(tokio::time::Instant::now() + batch_timeout);
+                            }
+                            if pending.len() >= batch_size {
+                                flush_batch(&mut pending, &tokio_semaphore).await;
+                                flush_deadline = None;
+                            }
+                        }
+                        msg @ (Index::Ann { .. } | Index::FilteredAnn { .. }) => {
+                            // Flush pending mutations before search to ensure
+                            // the index is up-to-date.
+                            flush_batch(&mut pending, &tokio_semaphore).await;
+                            flush_deadline = None;
+                            dispatch_search(state, partition, &table, &tokio_semaphore, msg)
+                                .await;
+                        }
+                        Index::Count { .. } | Index::RemovePartition { .. } => {
+                            unreachable!("handled by preprocess")
+                        }
+                    }
                 }
 
                 debug!("finished");
@@ -363,7 +488,61 @@ where
     }
 }
 
-async fn dispatch_task<T>(
+async fn sleep_until_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Flush all pending mutations in a single blocking task.
+///
+/// This batching approach is designed for GPU acceleration: when a real GPU
+/// backend is used, the entire batch is transferred to device memory and
+/// processed in one kernel launch, amortizing the host-device transfer cost.
+async fn flush_batch(pending: &mut Vec<PendingMutation>, tokio_semaphore: &Arc<Semaphore>) {
+    if pending.is_empty() {
+        return;
+    }
+    let ops = std::mem::take(pending);
+    let batch_len = ops.len();
+    let permit = Arc::clone(tokio_semaphore).acquire_owned().await.unwrap();
+
+    let result = tokio::task::spawn_blocking(move || {
+        trace!("flushing batch of {batch_len} mutations");
+        for op in ops {
+            match op.op {
+                MutationOp::Add {
+                    primary_id,
+                    embedding,
+                    _in_progress,
+                } => {
+                    if let Err(err) = op.partition.idx.add(primary_id, &embedding) {
+                        warn!("batch add: unable to add embedding: {err}");
+                    } else {
+                        op.size.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                MutationOp::Remove {
+                    primary_id,
+                    _in_progress,
+                } => {
+                    if let Err(err) = op.partition.idx.remove(primary_id) {
+                        warn!("batch remove: unable to remove embedding: {err}");
+                    } else {
+                        op.size.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        drop(permit);
+    });
+    if let Err(err) = result.await {
+        error!("cuVS batch flush task panicked: {err}");
+    }
+}
+
+async fn dispatch_search<T>(
     state: &mut IndexState,
     partition: Arc<PartitionState>,
     table: &Arc<RwLock<T>>,
@@ -375,40 +554,28 @@ async fn dispatch_task<T>(
     let permit = Arc::clone(tokio_semaphore).acquire_owned().await.unwrap();
     let table = Arc::clone(table);
     let dimensions = state.dimensions;
-    let size = Arc::clone(&state.size);
 
     tokio::spawn(async move {
         crate::move_to_the_end_of_async_runtime_queue().await;
-        // cuVS operations are dispatched via spawn_blocking to avoid blocking
-        // the tokio runtime. In future GPU implementation, these will map to
-        // CUDA kernel launches.
         let result =
-            tokio::task::spawn_blocking(move || process(partition, table, dimensions, size, msg))
+            tokio::task::spawn_blocking(move || process_search(partition, table, dimensions, msg))
                 .await;
         if let Err(err) = result {
-            error!("cuVS task panicked: {err}");
+            error!("cuVS search task panicked: {err}");
         }
         drop(permit);
     });
 }
 
-fn process<T>(
+fn process_search<T>(
     partition: Arc<PartitionState>,
     table: Arc<RwLock<T>>,
     dimensions: Dimensions,
-    size: Arc<AtomicUsize>,
     msg: Index,
 ) where
     T: TableSearch + Send + Sync + 'static,
 {
     match msg {
-        Index::AddVector {
-            primary_id,
-            embedding,
-            in_progress: _in_progress,
-            ..
-        } => add(partition.idx.as_ref(), primary_id, &embedding, &size),
-
         Index::Ann {
             embedding,
             limit,
@@ -426,31 +593,7 @@ fn process<T>(
             )));
         }
 
-        Index::Count { .. } => unreachable!(),
-
-        Index::RemoveVector {
-            primary_id,
-            in_progress: _in_progress,
-            ..
-        } => remove(partition.idx.as_ref(), primary_id, &size),
-
-        Index::RemovePartition { .. } => unreachable!(),
-    }
-}
-
-fn add(idx: &dyn CuvsVectorIndex, primary_id: PrimaryId, embedding: &Vector, size: &AtomicUsize) {
-    if let Err(err) = idx.add(primary_id, embedding) {
-        warn!("add: unable to add embedding: {err}");
-    } else {
-        size.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn remove(idx: &dyn CuvsVectorIndex, primary_id: PrimaryId, size: &AtomicUsize) {
-    if let Err(err) = idx.remove(primary_id) {
-        warn!("remove: unable to remove embedding: {err}");
-    } else {
-        size.fetch_sub(1, Ordering::Relaxed);
+        _ => unreachable!("only search operations should be dispatched here"),
     }
 }
 
@@ -726,6 +869,7 @@ mod tests {
     fn test_engine_version() {
         let factory = CuvsIndexFactory {
             tokio_semaphore: Arc::new(Semaphore::new(1)),
+            batch_config: BatchConfig::default(),
         };
         assert_eq!(factory.index_engine_version(), "cuvs-brute-force-v1");
     }
@@ -767,6 +911,7 @@ mod tests {
             table,
             Arc::new(Semaphore::new(4)),
             memory_tx,
+            &BatchConfig::default(),
         )
         .unwrap();
 
@@ -829,6 +974,7 @@ mod tests {
             table,
             Arc::new(Semaphore::new(4)),
             memory_tx,
+            &BatchConfig::default(),
         )
         .unwrap();
 
@@ -883,6 +1029,7 @@ mod tests {
             table,
             Arc::new(Semaphore::new(4)),
             memory_tx,
+            &BatchConfig::default(),
         )
         .unwrap();
 
@@ -927,6 +1074,7 @@ mod tests {
             table,
             Arc::new(Semaphore::new(4)),
             memory_tx,
+            &BatchConfig::default(),
         )
         .unwrap();
 
@@ -975,6 +1123,7 @@ mod tests {
             table,
             Arc::new(Semaphore::new(4)),
             memory_tx,
+            &BatchConfig::default(),
         )
         .unwrap();
 
@@ -1004,5 +1153,218 @@ mod tests {
 
         let count = index_tx.count(index_key).await.unwrap();
         assert_eq!(count, 2);
+    }
+
+    // --- Batching tests ---
+
+    #[test]
+    fn test_batch_config_default() {
+        let config = BatchConfig::default();
+        assert_eq!(config.batch_size, 1024);
+        assert_eq!(config.batch_timeout, Duration::from_millis(5));
+    }
+
+    /// Verify that mutations are flushed when batch_timeout elapses,
+    /// even if the batch is not full.
+    #[tokio::test]
+    async fn test_batch_flush_on_timeout() {
+        let dimensions = make_dimensions(2);
+        let config_rx = watch::channel(Arc::new(Config::default())).1;
+        let memory_tx = memory::new(config_rx.clone());
+
+        let mut id_gen = IndexIdGenerator::new();
+        let index_id = id_gen.next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+
+        let index_key = IndexKey::new(&"test_ks".into(), &"test_idx".into());
+
+        let mut mock_table = MockTableSearch::new();
+        let ik = index_key.clone();
+        mock_table
+            .expect_partition_id()
+            .withf(move |key, _| *key == ik)
+            .returning(move |_, _| Some((partition_id, None)));
+        mock_table
+            .expect_index_id()
+            .returning(move |_| Some(index_id));
+        mock_table
+            .expect_primary_key()
+            .returning(move |_, _| Some(crate::PrimaryKey::from(vec![CqlValue::Int(0)])));
+
+        let table = Arc::new(RwLock::new(mock_table));
+
+        // Large batch_size so the batch won't fill, short timeout to trigger flush
+        let batch_config = BatchConfig {
+            batch_size: 10000,
+            batch_timeout: Duration::from_millis(20),
+        };
+
+        let index_tx = new(
+            SpaceType::Euclidean,
+            index_key.clone(),
+            dimensions,
+            table,
+            Arc::new(Semaphore::new(4)),
+            memory_tx,
+            &batch_config,
+        )
+        .unwrap();
+
+        // Add a single vector (well below batch_size)
+        index_tx
+            .add_vector(
+                partition_id,
+                PrimaryId::from(0u64),
+                make_vector(vec![1.0, 2.0]),
+                None,
+            )
+            .await;
+
+        // Wait longer than batch_timeout so the flush fires
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (keys, _) = index_tx
+            .ann(index_key, make_vector(vec![1.0, 2.0]), make_limit(1))
+            .await
+            .unwrap();
+
+        assert_eq!(keys.len(), 1, "vector should be searchable after timeout flush");
+    }
+
+    /// Verify that pending mutations are flushed before a search executes,
+    /// ensuring consistency.
+    #[tokio::test]
+    async fn test_search_triggers_batch_flush() {
+        let dimensions = make_dimensions(2);
+        let config_rx = watch::channel(Arc::new(Config::default())).1;
+        let memory_tx = memory::new(config_rx.clone());
+
+        let mut id_gen = IndexIdGenerator::new();
+        let index_id = id_gen.next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+
+        let index_key = IndexKey::new(&"test_ks".into(), &"test_idx".into());
+
+        let mut mock_table = MockTableSearch::new();
+        let ik = index_key.clone();
+        mock_table
+            .expect_partition_id()
+            .withf(move |key, _| *key == ik)
+            .returning(move |_, _| Some((partition_id, None)));
+        mock_table
+            .expect_index_id()
+            .returning(move |_| Some(index_id));
+        mock_table
+            .expect_primary_key()
+            .returning(move |_, _| Some(crate::PrimaryKey::from(vec![CqlValue::Int(0)])));
+
+        let table = Arc::new(RwLock::new(mock_table));
+
+        // Very large batch_size and timeout so neither trigger
+        let batch_config = BatchConfig {
+            batch_size: 10000,
+            batch_timeout: Duration::from_secs(60),
+        };
+
+        let index_tx = new(
+            SpaceType::Euclidean,
+            index_key.clone(),
+            dimensions,
+            table,
+            Arc::new(Semaphore::new(4)),
+            memory_tx,
+            &batch_config,
+        )
+        .unwrap();
+
+        // Add vectors (they will sit in the pending batch)
+        index_tx
+            .add_vector(
+                partition_id,
+                PrimaryId::from(0u64),
+                make_vector(vec![1.0, 0.0]),
+                None,
+            )
+            .await;
+        index_tx
+            .add_vector(
+                partition_id,
+                PrimaryId::from(1u64),
+                make_vector(vec![0.0, 1.0]),
+                None,
+            )
+            .await;
+
+        // Search should flush the batch first, then return results
+        let (keys, _) = index_tx
+            .ann(index_key, make_vector(vec![1.0, 0.0]), make_limit(10))
+            .await
+            .unwrap();
+
+        assert_eq!(keys.len(), 2, "search should flush pending batch and find all vectors");
+    }
+
+    /// Verify that the batch flushes when batch_size is reached.
+    #[tokio::test]
+    async fn test_batch_flush_on_size() {
+        let dimensions = make_dimensions(2);
+        let config_rx = watch::channel(Arc::new(Config::default())).1;
+        let memory_tx = memory::new(config_rx.clone());
+
+        let mut id_gen = IndexIdGenerator::new();
+        let index_id = id_gen.next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+
+        let index_key = IndexKey::new(&"test_ks".into(), &"test_idx".into());
+
+        let mut mock_table = MockTableSearch::new();
+        let ik = index_key.clone();
+        mock_table
+            .expect_partition_id()
+            .withf(move |key, _| *key == ik)
+            .returning(move |_, _| Some((partition_id, None)));
+        mock_table
+            .expect_index_id()
+            .returning(move |_| Some(index_id));
+        mock_table
+            .expect_primary_key()
+            .returning(move |_, _| Some(crate::PrimaryKey::from(vec![CqlValue::Int(0)])));
+
+        let table = Arc::new(RwLock::new(mock_table));
+
+        // Small batch_size = 3, long timeout so only size triggers flush
+        let batch_config = BatchConfig {
+            batch_size: 3,
+            batch_timeout: Duration::from_secs(60),
+        };
+
+        let index_tx = new(
+            SpaceType::Euclidean,
+            index_key.clone(),
+            dimensions,
+            table,
+            Arc::new(Semaphore::new(4)),
+            memory_tx,
+            &batch_config,
+        )
+        .unwrap();
+
+        // Add exactly batch_size vectors
+        for i in 0..3u64 {
+            index_tx
+                .add_vector(
+                    partition_id,
+                    PrimaryId::from(i),
+                    make_vector(vec![i as f32, 0.0]),
+                    None,
+                )
+                .await;
+        }
+
+        // Give the flush time to complete (it should fire immediately at size=3)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let count = index_tx.count(index_key).await.unwrap();
+        assert_eq!(count, 3, "batch should have flushed when batch_size reached");
     }
 }
