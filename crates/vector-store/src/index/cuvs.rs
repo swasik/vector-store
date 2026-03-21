@@ -996,6 +996,7 @@ mod gpu {
     use cudarc::cublas::sys::cublasOperation_t;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
+    use std::sync::OnceLock;
 
     /// GPU-accelerated brute-force vector index using cuBLAS.
     ///
@@ -1006,6 +1007,8 @@ mod gpu {
         vectors: RwLock<BTreeMap<PrimaryId, Vec<f32>>>,
         space_type: SpaceType,
         dimensions: usize,
+        /// Cached CUDA context, created once on first search and reused.
+        cuda_ctx: OnceLock<Arc<CudaContext>>,
     }
 
     impl GpuBruteForceIndex {
@@ -1014,7 +1017,24 @@ mod gpu {
                 vectors: RwLock::new(BTreeMap::new()),
                 space_type,
                 dimensions,
+                cuda_ctx: OnceLock::new(),
             }
+        }
+
+        /// Returns a cached CUDA context, creating it on first call.
+        /// Binds the context to the current thread so cudarc/cuBLAS
+        /// operations work correctly from any blocking-pool thread.
+        fn cuda_ctx(&self) -> anyhow::Result<&Arc<CudaContext>> {
+            let ctx = if let Some(ctx) = self.cuda_ctx.get() {
+                ctx
+            } else {
+                let new_ctx = CudaContext::new(0)
+                    .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+                self.cuda_ctx.get_or_init(|| new_ctx)
+            };
+            ctx.bind_to_thread()
+                .map_err(|e| anyhow!("failed to bind CUDA context: {e}"))?;
+            Ok(ctx)
         }
     }
 
@@ -1069,8 +1089,7 @@ mod gpu {
             //   transa=T → op(A) = A^T = [n, d]  (A is [d, n] col-major)
             //   transb=N → op(B) = B   = [d, 1]  (B is [d, 1] col-major)
             //   m=n, n_blas=1, k=d
-            let ctx = CudaContext::new(0)
-                .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+            let ctx = self.cuda_ctx()?;
             let stream = ctx.default_stream();
 
             let d_dataset = stream
@@ -1535,6 +1554,9 @@ mod gpu {
         /// Serializes CAGRA graph builds so only one thread builds at a time
         /// (prevents thundering-herd when many searches arrive concurrently).
         build_lock: std::sync::Mutex<()>,
+        /// Cached CUDA context for cudarc memory operations in search.
+        /// Created lazily on first search and reused for all subsequent ones.
+        cuda_ctx: OnceLock<Arc<CudaContext>>,
     }
 
     /// Cached CAGRA build: flat data snapshot, PrimaryId mapping, and the
@@ -1597,7 +1619,24 @@ mod gpu {
                 dirty: RwLock::new(true),
                 cached_build: RwLock::new(None),
                 build_lock: std::sync::Mutex::new(()),
+                cuda_ctx: OnceLock::new(),
             }
+        }
+
+        /// Returns a cached CUDA context, creating it on first call.
+        /// Binds the context to the current thread so cudarc operations
+        /// work correctly from any blocking-pool thread.
+        fn cuda_ctx(&self) -> anyhow::Result<&Arc<CudaContext>> {
+            let ctx = if let Some(ctx) = self.cuda_ctx.get() {
+                ctx
+            } else {
+                let new_ctx = CudaContext::new(0)
+                    .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+                self.cuda_ctx.get_or_init(|| new_ctx)
+            };
+            ctx.bind_to_thread()
+                .map_err(|e| anyhow!("failed to bind CUDA context: {e}"))?;
+            Ok(ctx)
         }
 
         /// Map our `SpaceType` to the cuVS `cuvsDistanceType` enum value.
@@ -1737,8 +1776,7 @@ mod gpu {
             }
 
             // Allocate GPU memory for query, neighbors, distances via cudarc.
-            let ctx = CudaContext::new(0)
-                .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+            let ctx = self.cuda_ctx()?;
             let stream = ctx.default_stream();
 
             let d_query = stream
@@ -2013,8 +2051,7 @@ mod gpu {
                 combined_query.extend_from_slice(q);
             }
 
-            let ctx = CudaContext::new(0)
-                .map_err(|e| anyhow!("CAGRA batch: CUDA context: {e}"))?;
+            let ctx = self.cuda_ctx()?;
             let stream = ctx.default_stream();
 
             let d_query = stream

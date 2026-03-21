@@ -1,8 +1,8 @@
 # cuVS Performance: Remaining Optimisations
 
 These items were identified as root causes for the cuVS throughput gap
-versus usearch but have **not yet been implemented**. Fixes #3 (stale reads)
-and #4 (query batching) are already applied.
+versus usearch but have **not yet been implemented**. Fixes #2 (cache
+CudaContext), #3 (stale reads), and #4 (query batching) are already applied.
 
 ---
 
@@ -32,24 +32,12 @@ every search.
 
 ---
 
-## Fix #2 — Cache CudaContext per index (HIGH)
+## ~~Fix #2 — Cache CudaContext per index (HIGH)~~ ✅ DONE
 
-**Problem:** `CudaContext::new(0)` is called on every CAGRA search and
-every GPU brute-force search. CUDA context creation involves driver-level
-bookkeeping that takes 100–500 µs each time.
-
-**Suggested approach:**
-
-1. Store a `CudaContext` (+ default stream) inside `CagraIndex` and
-   `GpuBruteForceIndex` (created once in `::new()`).
-2. Reuse the same context/stream for all searches.
-3. Because searches already run inside `spawn_blocking` on the same thread
-   pool, and the actor serialises access, there is no thread-safety issue.
-
-**Files to modify:**
-
-- `crates/vector-store/src/index/cuvs.rs` — `CagraIndex`, `GpuBruteForceIndex`,
-  `search_cagra`, `search_cagra_batch`
+Implemented: `OnceLock<Arc<CudaContext>>` in both `CagraIndex` and
+`GpuBruteForceIndex`, created lazily on first search and reused.
+`bind_to_thread()` called on each search to ensure correctness across
+blocking-pool threads.
 
 ---
 
