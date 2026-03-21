@@ -86,6 +86,7 @@ pub struct Config {
     pub backend: Option<String>,
     pub cuvs_batch_size: Option<usize>,
     pub cuvs_batch_timeout: Option<Duration>,
+    pub cuvs_channel_size: Option<usize>,
     pub usearch_simulator: Option<Vec<Duration>>,
     pub cql_keepalive_interval: Option<Duration>,
     pub cql_keepalive_timeout: Option<Duration>,
@@ -113,6 +114,7 @@ impl Default for Config {
             backend: None,
             cuvs_batch_size: None,
             cuvs_batch_timeout: None,
+            cuvs_channel_size: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,
@@ -579,6 +581,16 @@ pub struct DbEmbedding {
 #[allow(dead_code)]
 pub struct AsyncInProgress(mpsc::Sender<()>);
 
+/// Messages sent through the embeddings channel from db_index/db_cdc to monitor_items.
+pub enum EmbeddingMessage {
+    /// A regular embedding to be indexed.
+    Embedding(DbEmbedding, Option<AsyncInProgress>),
+    /// Signal that the initial full scan has finished. All embeddings from
+    /// the full scan have been sent before this message, so the index actor
+    /// can safely rebuild (e.g. CAGRA graph build) after processing them.
+    FullScanFinished,
+}
+
 pub fn block_on<Output>(threads: Option<usize>, f: impl AsyncFnOnce() -> Output) -> Output {
     if let Some(threads @ 1..) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -692,6 +704,7 @@ pub fn new_index_factory_cuvs(
     let batch_config = index::cuvs::BatchConfig {
         batch_size: config.cuvs_batch_size.unwrap_or(1024),
         batch_timeout: config.cuvs_batch_timeout.unwrap_or(Duration::from_millis(5)),
+        channel_size: config.cuvs_channel_size.unwrap_or(128),
     };
     Ok(Box::new(index::cuvs::new_cuvs(tokio_semaphore, batch_config)))
 }

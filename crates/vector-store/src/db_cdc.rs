@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-use crate::AsyncInProgress;
 use crate::ColumnName;
 use crate::Config;
 use crate::DbEmbedding;
+use crate::EmbeddingMessage;
 use crate::IndexMetadata;
 use crate::internals::Internals;
 use crate::internals::InternalsExt;
@@ -122,7 +122,7 @@ pub(crate) fn new(
     mut session_rx: watch::Receiver<Option<Arc<Session>>>,
     metadata: IndexMetadata,
     internals: Sender<Internals>,
-    tx_embeddings: mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+    tx_embeddings: mpsc::Sender<EmbeddingMessage>,
     config: CdcReaderConfig,
 ) -> mpsc::Sender<DbCdc> {
     // TODO: The value of channel size was taken from initial benchmarks. Needs more testing
@@ -267,7 +267,7 @@ impl CdcReaderState {
         params: CdcReaderParams,
         session: &Arc<Session>,
         metadata: &IndexMetadata,
-        tx_embeddings: &mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+        tx_embeddings: &mpsc::Sender<EmbeddingMessage>,
         internals: &Sender<Internals>,
     ) {
         self.stop().await;
@@ -314,7 +314,7 @@ impl CdcReaderState {
         session: Option<Arc<Session>>,
         config_rx: &watch::Receiver<Arc<Config>>,
         metadata: &IndexMetadata,
-        tx_embeddings: &mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+        tx_embeddings: &mpsc::Sender<EmbeddingMessage>,
         internals: &Sender<Internals>,
     ) {
         match session {
@@ -383,7 +383,7 @@ impl CdcReaderState {
         session_rx: &watch::Receiver<Option<Arc<Session>>>,
         config_rx: &watch::Receiver<Arc<Config>>,
         metadata: &IndexMetadata,
-        tx_embeddings: &mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+        tx_embeddings: &mpsc::Sender<EmbeddingMessage>,
         internals: &Sender<Internals>,
     ) {
         self.backoff_deadline = None;
@@ -420,7 +420,7 @@ async fn create_cdc_reader(
     params: CdcReaderParams,
     session: Arc<Session>,
     metadata: IndexMetadata,
-    tx_embeddings: mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+    tx_embeddings: mpsc::Sender<EmbeddingMessage>,
     reader_name: &str,
 ) -> anyhow::Result<(
     scylla_cdc::log_reader::CDCLogReader,
@@ -485,7 +485,7 @@ fn spawn_handler_task(
 struct CdcConsumerData {
     primary_key_columns: Vec<ColumnName>,
     target_column: ColumnName,
-    tx: mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+    tx: mpsc::Sender<EmbeddingMessage>,
     gregorian_epoch: PrimitiveDateTime,
 }
 
@@ -554,7 +554,7 @@ impl Consumer for CdcConsumer {
         _ = self
             .0
             .tx
-            .send((
+            .send(EmbeddingMessage::Embedding(
                 DbEmbedding {
                     primary_key,
                     embedding,
@@ -580,7 +580,7 @@ impl CdcConsumerFactory {
     fn new(
         session: Arc<Session>,
         metadata: &IndexMetadata,
-        tx: mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+        tx: mpsc::Sender<EmbeddingMessage>,
     ) -> anyhow::Result<Self> {
         let cluster_state = session.get_cluster_state();
         let table = cluster_state

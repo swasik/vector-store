@@ -50,6 +50,9 @@ pub enum Index {
         index_key: IndexKey,
         tx: oneshot::Sender<CountR>,
     },
+    /// Flush any pending mutations and eagerly rebuild the index
+    /// (e.g. CAGRA graph). Sent after the initial full scan completes.
+    Flush,
 }
 
 pub(crate) trait IndexExt {

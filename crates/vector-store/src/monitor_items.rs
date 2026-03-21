@@ -5,6 +5,7 @@
 
 use crate::AsyncInProgress;
 use crate::DbEmbedding;
+use crate::EmbeddingMessage;
 use crate::IndexKey;
 use crate::Metrics;
 use crate::index::Index;
@@ -26,7 +27,7 @@ pub(crate) enum MonitorItems {}
 pub(crate) async fn new(
     key: IndexKey,
     table: Arc<RwLock<impl TableAdd + Send + Sync + 'static>>,
-    mut embeddings: Receiver<(DbEmbedding, Option<AsyncInProgress>)>,
+    mut embeddings: Receiver<EmbeddingMessage>,
     index: Sender<Index>,
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<Sender<MonitorItems>> {
@@ -41,11 +42,18 @@ pub(crate) async fn new(
 
             while !rx.is_closed() {
                 tokio::select! {
-                    embedding = embeddings.recv() => {
-                        let Some((embedding, in_progress)) = embedding else {
+                    msg = embeddings.recv() => {
+                        let Some(msg) = msg else {
                             break;
                         };
-                        add(&table, &index, embedding, in_progress, &metrics, &key).await;
+                        match msg {
+                            EmbeddingMessage::Embedding(embedding, in_progress) => {
+                                add(&table, &index, embedding, in_progress, &metrics, &key).await;
+                            }
+                            EmbeddingMessage::FullScanFinished => {
+                                _ = index.send(Index::Flush).await;
+                            }
+                        }
                     }
                     _ = rx.recv() => { }
                 }
@@ -185,7 +193,7 @@ mod tests {
             .with(eq(index_key), eq(embedding.clone()))
             .once()
             .returning(|_, _| Err(anyhow!("some error")));
-        tx_embeddings.send((embedding, None)).await.unwrap();
+        tx_embeddings.send(EmbeddingMessage::Embedding(embedding, None)).await.unwrap();
 
         drop(tx_embeddings);
         assert!(rx_index.recv().await.is_none());
@@ -229,7 +237,7 @@ mod tests {
                 }])
             });
         tx_embeddings
-            .send((embedding, Some(AsyncInProgress(tx_progress))))
+            .send(EmbeddingMessage::Embedding(embedding, Some(AsyncInProgress(tx_progress))))
             .await
             .unwrap();
         let Index::AddVector {
@@ -287,7 +295,7 @@ mod tests {
                     is_update: false,
                 }])
             });
-        tx_embeddings.send((embedding, None)).await.unwrap();
+        tx_embeddings.send(EmbeddingMessage::Embedding(embedding, None)).await.unwrap();
         let Some(Index::AddVector {
             partition_id,
             primary_id,
@@ -349,7 +357,7 @@ mod tests {
                     },
                 ])
             });
-        tx_embeddings.send((embedding, None)).await.unwrap();
+        tx_embeddings.send(EmbeddingMessage::Embedding(embedding, None)).await.unwrap();
 
         let Some(Index::RemoveVector {
             partition_id,
@@ -430,7 +438,7 @@ mod tests {
                     },
                 ])
             });
-        tx_embeddings.send((embedding, None)).await.unwrap();
+        tx_embeddings.send(EmbeddingMessage::Embedding(embedding, None)).await.unwrap();
 
         // First: plain insert
         let Some(Index::AddVector {
@@ -512,7 +520,7 @@ mod tests {
                     partition_id: 6.into(),
                 }])
             });
-        tx_embeddings.send((embedding, None)).await.unwrap();
+        tx_embeddings.send(EmbeddingMessage::Embedding(embedding, None)).await.unwrap();
 
         let Some(Index::RemoveVector {
             partition_id,
@@ -563,7 +571,7 @@ mod tests {
                     partition_id: 6.into(),
                 }])
             });
-        tx_embeddings.send((embedding, None)).await.unwrap();
+        tx_embeddings.send(EmbeddingMessage::Embedding(embedding, None)).await.unwrap();
 
         let Some(Index::RemovePartition { partition_id }) = rx_index.recv().await else {
             unreachable!();

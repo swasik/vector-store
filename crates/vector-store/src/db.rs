@@ -3,15 +3,14 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-use crate::AsyncInProgress;
 use crate::ColumnName;
 use crate::Config;
 use crate::Connectivity;
 use crate::Credentials;
 use crate::DbCustomIndex;
-use crate::DbEmbedding;
 use crate::DbIndexType;
 use crate::Dimensions;
+use crate::EmbeddingMessage;
 use crate::ExpansionAdd;
 use crate::ExpansionSearch;
 use crate::IndexMetadata;
@@ -66,7 +65,7 @@ use uuid::Uuid;
 
 type GetDbIndexR = anyhow::Result<(
     mpsc::Sender<DbIndex>,
-    mpsc::Receiver<(DbEmbedding, Option<AsyncInProgress>)>,
+    mpsc::Receiver<EmbeddingMessage>,
 )>;
 pub(crate) type LatestSchemaVersionR = anyhow::Result<Option<CqlTimeuuid>>;
 type GetIndexesR = anyhow::Result<Vec<DbCustomIndex>>;

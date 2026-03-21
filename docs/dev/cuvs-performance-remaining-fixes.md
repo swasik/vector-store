@@ -41,24 +41,11 @@ blocking-pool threads.
 
 ---
 
-## Fix #5 — Increase actor channel size (LOW-MEDIUM)
+## Fix #5 — Increase actor channel size (LOW-MEDIUM) ✅ DONE
 
-**Problem:** `CHANNEL_SIZE = 10` is small for GPU workloads where each
-operation has higher latency than CPU usearch. Under load the channel fills
-up and HTTP handlers block on `tx.send()`, creating back-pressure that
-limits throughput.
-
-**Suggested approach:**
-
-- Make `CHANNEL_SIZE` configurable via `BatchConfig` (or a new config
-  field) and default to a larger value, e.g. 128 or 256.
-- Expose via env var `VECTOR_STORE_CUVS_CHANNEL_SIZE`.
-
-**Files to modify:**
-
-- `crates/vector-store/src/index/cuvs.rs` — `fn new()`, `BatchConfig`
-- `crates/vector-store/src/config_manager.rs` — new env var
-- `crates/vector-store/src/lib.rs` — wire through to `new_index_factory_cuvs`
+Channel size is now configurable via `BatchConfig::channel_size` (default 128,
+up from the old hardcoded 10). Exposed as env var
+`VECTOR_STORE_CUVS_CHANNEL_SIZE`.
 
 ---
 

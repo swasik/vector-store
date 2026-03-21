@@ -17,13 +17,13 @@ use std::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use uuid::Uuid;
-use vector_store::AsyncInProgress;
 use vector_store::ColumnName;
 use vector_store::Connectivity;
 use vector_store::DbCustomIndex;
 use vector_store::DbEmbedding;
 use vector_store::DbIndexType;
 use vector_store::Dimensions;
+use vector_store::EmbeddingMessage;
 use vector_store::ExpansionAdd;
 use vector_store::ExpansionSearch;
 use vector_store::IndexMetadata;
@@ -392,7 +392,7 @@ fn process_db(db: &DbBasic, msg: Db, node_state: Sender<NodeState>) {
     }
 }
 
-type RxEmbeddings = mpsc::Receiver<(DbEmbedding, Option<AsyncInProgress>)>;
+type RxEmbeddings = mpsc::Receiver<EmbeddingMessage>;
 pub(crate) fn new_db_index(
     db: DbBasic,
     metadata: IndexMetadata,
@@ -423,7 +423,7 @@ pub(crate) fn new_db_index(
                         tokio::spawn({
                             let tx_embeddings = tx_embeddings.clone();
                             async move {
-                                _ = tx_embeddings.send((item, None)).await;
+                                _ = tx_embeddings.send(EmbeddingMessage::Embedding(item, None)).await;
                             }
                         });
                     }

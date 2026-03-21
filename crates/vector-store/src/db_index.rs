@@ -7,6 +7,7 @@ use crate::AsyncInProgress;
 use crate::ColumnName;
 use crate::Config;
 use crate::DbEmbedding;
+use crate::EmbeddingMessage;
 use crate::IndexMetadata;
 use crate::KeyspaceName;
 use crate::Percentage;
@@ -136,7 +137,7 @@ pub(crate) async fn new(
     cdc_error_notify: Arc<Notify>,
 ) -> anyhow::Result<(
     mpsc::Sender<DbIndex>,
-    mpsc::Receiver<(DbEmbedding, Option<AsyncInProgress>)>,
+    mpsc::Receiver<EmbeddingMessage>,
 )> {
     let key = metadata.key();
 
@@ -209,6 +210,10 @@ pub(crate) async fn new(
                         node_state
                             .send_event(Event::FullScanFinished(metadata.clone()))
                             .await;
+                        // Signal the index actor (via monitor_items) that all
+                        // full-scan embeddings have been sent, so it can
+                        // eagerly rebuild (e.g. CAGRA graph).
+                        _ = tx_embeddings.send(EmbeddingMessage::FullScanFinished).await;
                         break;
                     }
 
@@ -405,7 +410,7 @@ impl Statements {
     /// to send read embeddings into the pipeline.
     async fn initial_scan(
         &self,
-        tx: mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
+        tx: mpsc::Sender<EmbeddingMessage>,
         completed_scan_length: Arc<AtomicU64>,
     ) {
         let semaphore_capacity = self.nr_parallel_queries().get();
@@ -426,7 +431,7 @@ impl Statements {
                             let tx_in_progress = tx_in_progress.clone();
                             async move {
                                 _ = tx
-                                    .send((embedding, Some(AsyncInProgress(tx_in_progress))))
+                                    .send(EmbeddingMessage::Embedding(embedding, Some(AsyncInProgress(tx_in_progress))))
                                     .await;
                             }
                         })

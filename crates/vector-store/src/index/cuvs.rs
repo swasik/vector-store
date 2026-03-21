@@ -63,6 +63,11 @@ trait CuvsVectorIndex: Send + Sync {
     ) -> Vec<anyhow::Result<Vec<(PrimaryId, Distance)>>> {
         queries.iter().map(|(v, l)| self.search(v, l.clone())).collect()
     }
+    /// Eagerly rebuild the index. Called after the initial full scan
+    /// completes so the index is ready for queries without waiting for
+    /// the first search. The default is a no-op (brute-force needs no
+    /// rebuild).
+    fn rebuild(&self) {}
 }
 
 /// Brute-force CPU implementation of the cuVS vector index.
@@ -205,6 +210,7 @@ fn compute_distance(a: &[f32], b: &[f32], space_type: SpaceType) -> anyhow::Resu
 pub(crate) struct BatchConfig {
     pub batch_size: usize,
     pub batch_timeout: Duration,
+    pub channel_size: usize,
 }
 
 impl Default for BatchConfig {
@@ -212,6 +218,7 @@ impl Default for BatchConfig {
         Self {
             batch_size: 1024,
             batch_timeout: Duration::from_millis(5),
+            channel_size: 128,
         }
     }
 }
@@ -317,8 +324,7 @@ fn new(
     memory: mpsc::Sender<Memory>,
     batch_config: &BatchConfig,
 ) -> anyhow::Result<mpsc::Sender<Index>> {
-    const CHANNEL_SIZE: usize = 10;
-    let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
+    let (tx, mut rx) = mpsc::channel(batch_config.channel_size);
     let batch_size = batch_config.batch_size;
     let batch_timeout = batch_config.batch_timeout;
 
@@ -355,6 +361,27 @@ fn new(
                     if !check_memory_allocation(&msg, &memory, &mut allocate_prev, &index_key)
                         .await
                     {
+                        continue;
+                    }
+
+                    // Handle Flush before preprocess — it has no partition.
+                    if matches!(msg, Index::Flush) {
+                        flush_batch(&mut pending, &tokio_semaphore).await;
+                        flush_deadline = None;
+                        let permit = Arc::clone(&tokio_semaphore)
+                            .acquire_owned()
+                            .await
+                            .unwrap();
+                        let parts: Vec<Arc<PartitionState>> =
+                            partitions.values().cloned().collect();
+                        tokio::task::spawn_blocking(move || {
+                            for p in &parts {
+                                p.idx.rebuild();
+                            }
+                            drop(permit);
+                        })
+                        .await
+                        .expect("rebuild task panicked");
                         continue;
                     }
 
@@ -516,7 +543,9 @@ fn new(
                             )
                             .await;
                         }
-                        Index::Count { .. } | Index::RemovePartition { .. } => {
+                        Index::Count { .. }
+                        | Index::RemovePartition { .. }
+                        | Index::Flush => {
                             unreachable!("handled by preprocess")
                         }
                     }
@@ -675,6 +704,9 @@ where
             partitions.remove(&partition_id);
             None
         }
+
+        // Flush is handled before preprocess in the actor loop.
+        Index::Flush => None,
     }
 }
 
@@ -2212,6 +2244,10 @@ mod gpu {
             Ok(())
         }
 
+        fn rebuild(&self) {
+            self.ensure_fresh();
+        }
+
         fn search(
             &self,
             vector: &Vector,
@@ -2863,6 +2899,7 @@ mod tests {
         let config = BatchConfig::default();
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.batch_timeout, Duration::from_millis(5));
+        assert_eq!(config.channel_size, 128);
     }
 
     /// Verify that mutations are flushed when batch_timeout elapses,
@@ -2898,6 +2935,7 @@ mod tests {
         let batch_config = BatchConfig {
             batch_size: 10000,
             batch_timeout: Duration::from_millis(20),
+            ..BatchConfig::default()
         };
 
         let index_tx = new(
@@ -2974,6 +3012,7 @@ mod tests {
         let batch_config = BatchConfig {
             batch_size: 10000,
             batch_timeout: Duration::from_secs(60),
+            ..BatchConfig::default()
         };
 
         let index_tx = new(
@@ -3046,6 +3085,7 @@ mod tests {
         let batch_config = BatchConfig {
             batch_size: 3,
             batch_timeout: Duration::from_secs(60),
+            ..BatchConfig::default()
         };
 
         let index_tx = new(

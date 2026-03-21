@@ -537,6 +537,7 @@ mod operation {
                 Index::Ann { .. } | Index::FilteredAnn { .. } => Mode::Search,
                 Index::RemovePartition { .. } => todo!(),
                 Index::Count { .. } => unreachable!(),
+                Index::Flush => unreachable!(),
             }
         }
     }
@@ -886,6 +887,8 @@ where
             };
             None
         }
+
+        Index::Flush => None,
     }
 }
 
@@ -995,6 +998,8 @@ fn process<I, T>(
         } => remove(partition.idx.as_ref(), primary_id, &size),
 
         Index::RemovePartition { .. } => unreachable!(),
+
+        Index::Flush => {},
     }
 }
 

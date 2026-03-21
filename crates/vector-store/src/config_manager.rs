@@ -299,6 +299,11 @@ where
         })?;
         config.cuvs_batch_timeout = Some(Duration::from_millis(ms));
     }
+    if let Ok(val) = env("VECTOR_STORE_CUVS_CHANNEL_SIZE") {
+        config.cuvs_channel_size = Some(val.parse().map_err(|err| {
+            anyhow!("Unable to parse VECTOR_STORE_CUVS_CHANNEL_SIZE: {err}")
+        })?);
+    }
 
     config.usearch_simulator = env("VECTOR_STORE_USEARCH_SIMULATOR")
         .ok()
@@ -548,6 +553,7 @@ mod tests {
             backend: None,
             cuvs_batch_size: None,
             cuvs_batch_timeout: None,
+            cuvs_channel_size: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,
