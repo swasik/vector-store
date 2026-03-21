@@ -495,14 +495,54 @@ where
             ))
         }
 
-        // Filtered search is not supported in v1 of the cuVS backend.
         Index::FilteredAnn {
-            index_key, tx, ..
+            index_key,
+            embedding,
+            filter,
+            limit,
+            tx,
         } => {
-            _ = tx.send(Err(anyhow!(
-                "cuVS backend does not support filtered search (index {index_key:?})"
-            )));
-            None
+            let Some((partition_id, restrictions)) = table
+                .read()
+                .unwrap()
+                .partition_id(&index_key, Some(filter.restrictions))
+            else {
+                warn!(
+                    "partition id not found for index key {index_key:?} during filtered ann"
+                );
+                _ = tx.send(Ok((vec![], vec![])));
+                return None;
+            };
+            let index_id = partition_id.index_id();
+            let Some((state, partition)) = states
+                .get_mut(&index_id)
+                .zip(partitions.get(&partition_id))
+                .map(|(state, partition)| (state, Arc::clone(partition)))
+            else {
+                warn!(
+                    "state or partition not found for index key {index_key:?} \
+                        during filtered ann"
+                );
+                _ = tx.send(Ok((vec![], vec![])));
+                return None;
+            };
+            // If all restrictions were resolved by the partition lookup
+            // (e.g. partition key equality), downgrade to a plain Ann.
+            // Otherwise reject: cuVS does not support filtered search.
+            let msg = if let Some(_restrictions) = restrictions {
+                _ = tx.send(Err(anyhow!(
+                    "cuVS backend does not support filtered search (index {index_key:?})"
+                )));
+                return None;
+            } else {
+                Index::Ann {
+                    embedding,
+                    limit,
+                    tx,
+                    index_key,
+                }
+            };
+            Some((state, partition, msg))
         }
 
         Index::Count { index_key, tx } => {
