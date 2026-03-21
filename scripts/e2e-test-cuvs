@@ -77,8 +77,9 @@ ON e2e_cuvs.vectors(data) USING 'vector_index'
 WITH OPTIONS = {'similarity_function': 'cosine'};
 CQL
 
-# 4. Insert test vectors
+# 4. Insert test vectors (150+ to trigger CAGRA graph build, threshold=128)
 echo "--- Step 4: Insert test vectors ---"
+# Insert 5 known vectors for search validation
 docker exec -i "$SCYLLA_CONTAINER" cqlsh <<'CQL'
 INSERT INTO e2e_cuvs.vectors (id, data) VALUES (1, [1.0, 0.0, 0.0]);
 INSERT INTO e2e_cuvs.vectors (id, data) VALUES (2, [0.0, 1.0, 0.0]);
@@ -87,13 +88,28 @@ INSERT INTO e2e_cuvs.vectors (id, data) VALUES (4, [0.707, 0.707, 0.0]);
 INSERT INTO e2e_cuvs.vectors (id, data) VALUES (5, [0.577, 0.577, 0.577]);
 CQL
 
+# Insert additional vectors (ids 100..249) to exceed MIN_CAGRA_BUILD_SIZE=128.
+# Each vector is a unique unit-ish direction derived from its id.
+echo "Inserting 150 additional vectors to trigger CAGRA..."
+CQL_BATCH=""
+for i in $(seq 100 249); do
+    # Generate 3 pseudo-random floats from the id
+    a=$(echo "scale=4; ($i * 17 % 97) / 97" | bc)
+    b=$(echo "scale=4; ($i * 31 % 89) / 89" | bc)
+    c=$(echo "scale=4; ($i * 53 % 79) / 79" | bc)
+    CQL_BATCH="${CQL_BATCH}INSERT INTO e2e_cuvs.vectors (id, data) VALUES ($i, [$a, $b, $c]);"$'\n'
+done
+echo "$CQL_BATCH" | docker exec -i "$SCYLLA_CONTAINER" cqlsh
+
 # 5. Start vector-store with cuVS backend
 echo "--- Step 5: Start vector-store with cuVS backend ---"
+VS_LOG=$(mktemp /tmp/vs-e2e-cuvs-XXXXXXXX.log)
 VECTOR_STORE_URI="$VS_ADDR" \
 VECTOR_STORE_SCYLLADB_URI="$SCYLLA_ADDR:$SCYLLA_PORT" \
 VECTOR_STORE_BACKEND="cuvs" \
 RUST_LOG="info" \
-"$VS_BIN" &
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${HOME}/miniforge3/envs/cuvs/lib" \
+"$VS_BIN" >"$VS_LOG" 2>&1 &
 VS_PID=$!
 
 echo "Waiting for vector-store to start (PID=$VS_PID)..."
@@ -113,12 +129,14 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# 6. Check info endpoint (should report cuVS engine)
+# 6. Check info endpoint (should report cuVS CAGRA engine)
 echo "--- Step 6: Check /api/v1/info ---"
 INFO=$(curl -s "http://$VS_ADDR/api/v1/info")
 echo "Info: $INFO"
-if echo "$INFO" | grep -q "cuvs"; then
-    pass "Info endpoint reports cuVS engine"
+if echo "$INFO" | grep -q "cagra"; then
+    pass "Info endpoint reports CAGRA engine"
+elif echo "$INFO" | grep -q "cuvs"; then
+    pass "Info endpoint reports cuVS engine (non-CAGRA)"
 else
     fail "Info endpoint does not mention cuVS (got: $INFO)"
 fi
@@ -169,7 +187,17 @@ else
     fail "ANN search results do not contain id=1 (body: $BODY)"
 fi
 
-# 9. Summary
+# 9. Check logs for CAGRA graph build (proves CAGRA was used, not just brute-force)
+echo "--- Step 9: Verify CAGRA graph build in logs ---"
+echo "vector-store log tail:"
+tail -30 "$VS_LOG"
+if grep -q "CAGRA graph build" "$VS_LOG"; then
+    pass "CAGRA graph build triggered (>128 vectors)"
+else
+    fail "CAGRA graph build not found in logs (check $VS_LOG)"
+fi
+
+# 10. Summary
 echo ""
 echo "=== cuVS Backend E2E Test Complete ==="
 echo "Results: $PASS passed, $FAIL failed"

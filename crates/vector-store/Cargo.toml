@@ -18,7 +18,7 @@ required-features = ["dev-tools"]
 [features]
 default = []
 dev-tools = []
-gpu = ["dep:cudarc"]
+gpu = ["dep:cudarc", "dep:libloading"]
 
 [dependencies]
 anyhow.workspace = true
@@ -58,6 +58,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 usearch.workspace = true
 cudarc = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
 utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true

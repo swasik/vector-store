@@ -4225,6 +4225,7 @@ dependencies = [
  "httpclient",
  "humantime",
  "itertools 0.14.0",
+ "libloading 0.9.0",
  "macros",
  "mimalloc",
  "mockall",

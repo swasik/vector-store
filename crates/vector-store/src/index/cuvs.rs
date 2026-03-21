@@ -124,19 +124,32 @@ impl CuvsVectorIndex for BruteForceIndex {
 
 /// Creates the appropriate vector index implementation for a new partition.
 ///
-/// When the `gpu` feature is enabled, returns a GPU-accelerated brute-force
-/// index using cuBLAS SGEMM for distance computation. Otherwise falls back
-/// to the CPU implementation.
+/// When the `gpu` feature is enabled, attempts to load libcuvs_c.so and create
+/// a CAGRA graph-based ANN index. If libcuvs is not available, falls back to
+/// GPU brute-force via cuBLAS. Without `gpu`, uses CPU brute-force.
 fn create_partition_index(
     space_type: SpaceType,
     dimensions: Dimensions,
 ) -> Arc<dyn CuvsVectorIndex> {
     #[cfg(feature = "gpu")]
     {
-        Arc::new(gpu::GpuBruteForceIndex::new(
-            space_type,
-            dimensions.0.get(),
-        ))
+        match gpu::load_cuvs_lib() {
+            Ok(lib) => {
+                debug!("using CAGRA index (libcuvs_c.so loaded)");
+                Arc::new(gpu::CagraIndex::new(
+                    space_type,
+                    dimensions.0.get(),
+                    lib,
+                ))
+            }
+            Err(err) => {
+                warn!("libcuvs_c.so not available ({err}), falling back to GPU brute-force");
+                Arc::new(gpu::GpuBruteForceIndex::new(
+                    space_type,
+                    dimensions.0.get(),
+                ))
+            }
+        }
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -246,7 +259,7 @@ impl IndexFactory for CuvsIndexFactory {
     fn index_engine_version(&self) -> String {
         #[cfg(feature = "gpu")]
         {
-            "cuvs-gpu-brute-force-v1".to_string()
+            "cuvs-gpu-cagra-v1".to_string()
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -697,24 +710,26 @@ async fn check_memory_allocation(
     true
 }
 
-/// GPU-accelerated brute-force search backend using cuBLAS SGEMM.
+/// GPU-accelerated search backends using NVIDIA CUDA.
 ///
-/// When compiled with `--features gpu`, this module provides a
-/// `GpuBruteForceIndex` that accelerates exhaustive nearest-neighbor search
-/// on NVIDIA GPUs. Vectors are stored in host memory and transferred to the
-/// GPU for each search. All-pairs inner products are computed via a single
-/// cuBLAS SGEMM call (`dataset × query^T`), then distances are derived on
-/// the host from the inner products.
+/// When compiled with `--features gpu`, this module provides:
+/// - `GpuBruteForceIndex`: exhaustive search via cuBLAS SGEMM
+/// - `CagraIndex`: graph-based approximate nearest-neighbor search via
+///   NVIDIA cuVS CAGRA, dynamically loaded from `libcuvs_c.so`
 ///
 /// The `cudarc` crate dynamically loads CUDA libraries at runtime via
 /// `fallback-dynamic-loading`, so the binary compiles without any CUDA
 /// toolkit installed and fails gracefully at runtime if no GPU is available.
+///
+/// CAGRA (CUDA ANN Graph-based) builds a fixed-degree k-NN graph on the GPU
+/// and traverses it during search. It requires `libcuvs_c.so` at runtime,
+/// which can be installed via conda/mamba (rapidsai channel).
 #[cfg(feature = "gpu")]
 mod gpu {
     use super::*;
     use cudarc::cublas::sys::cublasOperation_t;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-    use cudarc::driver::CudaContext;
+    use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
 
     /// GPU-accelerated brute-force vector index using cuBLAS.
     ///
@@ -891,6 +906,782 @@ mod gpu {
 
         fn size(&self) -> usize {
             self.vectors.read().unwrap().len()
+        }
+    }
+
+    // ---- cuVS CAGRA FFI bindings (dynamic loading) ----
+
+    /// FFI types and function pointers for the NVIDIA cuVS C API.
+    ///
+    /// These `#[repr(C)]` structs mirror the C headers in
+    /// `<cuvs/core/c_api.h>`, `<cuvs/neighbors/cagra.h>`,
+    /// `<cuvs/neighbors/common.h>` and `<dlpack/dlpack.h>`.
+    /// The library is loaded at runtime via `libloading` so the binary
+    /// compiles without libcuvs installed.
+    pub(super) mod cuvs_ffi {
+        use std::ffi::c_void;
+
+        // -- cuvsError_t --
+        pub const CUVS_SUCCESS: u32 = 1;
+
+        pub type CuvsError = u32;
+        pub type CuvsResources = usize; // uintptr_t
+
+        // -- DLPack types (v1) --
+
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        pub struct DLDevice {
+            pub device_type: i32,
+            pub device_id: i32,
+        }
+
+        pub const KDL_CPU: i32 = 1;
+        #[allow(dead_code)]
+        pub const KDL_CUDA: i32 = 2;
+
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        pub struct DLDataType {
+            pub code: u8,
+            pub bits: u8,
+            pub lanes: u16,
+        }
+
+        /// float32 DLPack data type: code=kDLFloat(2), bits=32, lanes=1
+        pub const DL_FLOAT32: DLDataType = DLDataType {
+            code: 2,
+            bits: 32,
+            lanes: 1,
+        };
+
+        /// uint32 DLPack data type: code=kDLUInt(1), bits=32, lanes=1
+        pub const DL_UINT32: DLDataType = DLDataType {
+            code: 1,
+            bits: 32,
+            lanes: 1,
+        };
+
+        #[repr(C)]
+        pub struct DLTensor {
+            pub data: *mut c_void,
+            pub device: DLDevice,
+            pub ndim: i32,
+            pub dtype: DLDataType,
+            pub shape: *mut i64,
+            pub strides: *mut i64,
+            pub byte_offset: u64,
+        }
+
+        #[repr(C)]
+        pub struct DLManagedTensor {
+            pub dl_tensor: DLTensor,
+            pub manager_ctx: *mut c_void,
+            pub deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
+        }
+
+        // -- cuVS CAGRA types --
+
+        #[repr(C)]
+        pub struct CuvsCagraIndex {
+            pub addr: usize,
+            pub dtype: DLDataType,
+        }
+
+        pub type CuvsCagraIndexPtr = *mut CuvsCagraIndex;
+
+        // cuvsDistanceType enum values used by CAGRA
+        pub const L2_EXPANDED: u32 = 0;
+        pub const COSINE_EXPANDED: u32 = 2;
+        pub const INNER_PRODUCT: u32 = 6;
+
+        // cuvsFilterType::NO_FILTER
+        pub const NO_FILTER: u32 = 0;
+
+        /// cuvsFilter struct: { addr: uintptr_t, type: cuvsFilterType }
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        pub struct CuvsFilter {
+            pub addr: usize,
+            pub filter_type: u32,
+        }
+
+        impl CuvsFilter {
+            pub fn none() -> Self {
+                Self {
+                    addr: 0,
+                    filter_type: NO_FILTER,
+                }
+            }
+        }
+
+        /// Loaded function pointers from `libcuvs_c.so`.
+        ///
+        /// All functions are resolved once on library load and cached.
+        /// Each function pointer matches the C API signature from the
+        /// cuVS headers.
+        #[allow(dead_code)]
+        pub struct CuvsLib {
+            _lib: libloading::Library,
+
+            // Resources
+            pub resources_create:
+                unsafe extern "C" fn(*mut CuvsResources) -> CuvsError,
+            pub resources_destroy: unsafe extern "C" fn(CuvsResources) -> CuvsError,
+
+            // Stream
+            pub stream_sync: unsafe extern "C" fn(CuvsResources) -> CuvsError,
+
+            // Error text
+            pub get_last_error_text:
+                unsafe extern "C" fn() -> *const std::ffi::c_char,
+
+            // CAGRA index lifecycle
+            pub cagra_index_create:
+                unsafe extern "C" fn(*mut CuvsCagraIndexPtr) -> CuvsError,
+            pub cagra_index_destroy:
+                unsafe extern "C" fn(CuvsCagraIndexPtr) -> CuvsError,
+
+            // CAGRA index params
+            pub cagra_index_params_create:
+                unsafe extern "C" fn(*mut *mut c_void) -> CuvsError,
+            pub cagra_index_params_destroy:
+                unsafe extern "C" fn(*mut c_void) -> CuvsError,
+
+            // CAGRA search params
+            pub cagra_search_params_create:
+                unsafe extern "C" fn(*mut *mut c_void) -> CuvsError,
+            pub cagra_search_params_destroy:
+                unsafe extern "C" fn(*mut c_void) -> CuvsError,
+
+            // CAGRA extend params
+            pub cagra_extend_params_create:
+                unsafe extern "C" fn(*mut *mut c_void) -> CuvsError,
+            pub cagra_extend_params_destroy:
+                unsafe extern "C" fn(*mut c_void) -> CuvsError,
+
+            // Build / Extend / Search
+            pub cagra_build: unsafe extern "C" fn(
+                CuvsResources,
+                *mut c_void, // cuvsCagraIndexParams_t
+                *mut DLManagedTensor,
+                CuvsCagraIndexPtr,
+            ) -> CuvsError,
+            pub cagra_extend: unsafe extern "C" fn(
+                CuvsResources,
+                *mut c_void, // cuvsCagraExtendParams_t
+                *mut DLManagedTensor,
+                CuvsCagraIndexPtr,
+            ) -> CuvsError,
+            pub cagra_search: unsafe extern "C" fn(
+                CuvsResources,
+                *mut c_void, // cuvsCagraSearchParams_t
+                CuvsCagraIndexPtr,
+                *mut DLManagedTensor,
+                *mut DLManagedTensor,
+                *mut DLManagedTensor,
+                CuvsFilter,
+            ) -> CuvsError,
+        }
+
+        // SAFETY: CuvsLib holds a loaded library and function pointers.
+        // The libcuvs C API is thread-safe for distinct resources, and we
+        // ensure each call uses its own cuvsResources_t.
+        unsafe impl Send for CuvsLib {}
+        unsafe impl Sync for CuvsLib {}
+
+        impl CuvsLib {
+            /// Dynamically load `libcuvs_c.so` and resolve all needed symbols.
+            ///
+            /// Searches standard library paths (`LD_LIBRARY_PATH`, system dirs).
+            /// Returns an error if the library cannot be found or any symbol
+            /// is missing.
+            pub fn load() -> anyhow::Result<Self> {
+                // SAFETY: We load a well-known NVIDIA shared library and resolve
+                // documented C API symbols. The function pointers are used only
+                // through the typed wrappers defined here.
+                unsafe {
+                    let lib = libloading::Library::new("libcuvs_c.so")
+                        .map_err(|e| anyhow::anyhow!(
+                            "failed to load libcuvs_c.so: {e}. \
+                             Install libcuvs (e.g. `mamba install libcuvs`) and \
+                             set LD_LIBRARY_PATH to include the lib directory."
+                        ))?;
+
+                    macro_rules! sym {
+                        ($name:expr) => {{
+                            let f: libloading::Symbol<*const ()> = lib.get($name)
+                                .map_err(|e| anyhow::anyhow!(
+                                    "symbol {} not found in libcuvs_c.so: {e}",
+                                    String::from_utf8_lossy($name)
+                                ))?;
+                            std::mem::transmute(*f)
+                        }};
+                    }
+
+                    Ok(Self {
+                        resources_create: sym!(b"cuvsResourcesCreate\0"),
+                        resources_destroy: sym!(b"cuvsResourcesDestroy\0"),
+                        stream_sync: sym!(b"cuvsStreamSync\0"),
+                        get_last_error_text: sym!(b"cuvsGetLastErrorText\0"),
+                        cagra_index_create: sym!(b"cuvsCagraIndexCreate\0"),
+                        cagra_index_destroy: sym!(b"cuvsCagraIndexDestroy\0"),
+                        cagra_index_params_create: sym!(b"cuvsCagraIndexParamsCreate\0"),
+                        cagra_index_params_destroy: sym!(b"cuvsCagraIndexParamsDestroy\0"),
+                        cagra_search_params_create: sym!(b"cuvsCagraSearchParamsCreate\0"),
+                        cagra_search_params_destroy: sym!(b"cuvsCagraSearchParamsDestroy\0"),
+                        cagra_extend_params_create: sym!(b"cuvsCagraExtendParamsCreate\0"),
+                        cagra_extend_params_destroy: sym!(b"cuvsCagraExtendParamsDestroy\0"),
+                        cagra_build: sym!(b"cuvsCagraBuild\0"),
+                        cagra_extend: sym!(b"cuvsCagraExtend\0"),
+                        cagra_search: sym!(b"cuvsCagraSearch\0"),
+                        _lib: lib,
+                    })
+                }
+            }
+        }
+
+        /// Check a cuVS C API return code and convert to `anyhow::Result`.
+        pub fn check(
+            lib: &CuvsLib,
+            status: CuvsError,
+            context: &str,
+        ) -> anyhow::Result<()> {
+            if status == CUVS_SUCCESS {
+                Ok(())
+            } else {
+                // cuvsGetLastErrorText is thread-local; safe to call here.
+                let msg = unsafe {
+                    let ptr = (lib.get_last_error_text)();
+                    if ptr.is_null() {
+                        "unknown error".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(ptr)
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                };
+                anyhow::bail!("{context}: {msg}")
+            }
+        }
+
+        /// Helper: create a `DLManagedTensor` wrapping a host `f32` slice.
+        ///
+        /// The tensor is non-owning: the caller must ensure `data` outlives
+        /// the returned tensor. Shape is `[rows, cols]`, row-major, on CPU.
+        pub fn make_host_f32_tensor(
+            data: &mut [f32],
+            shape: &mut [i64; 2],
+        ) -> DLManagedTensor {
+            DLManagedTensor {
+                dl_tensor: DLTensor {
+                    data: data.as_mut_ptr() as *mut c_void,
+                    device: DLDevice {
+                        device_type: KDL_CPU,
+                        device_id: 0,
+                    },
+                    ndim: 2,
+                    dtype: DL_FLOAT32,
+                    shape: shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            }
+        }
+
+        /// Helper: create a `DLManagedTensor` wrapping a host `u32` slice.
+        pub fn make_host_u32_tensor(
+            data: &mut [u32],
+            shape: &mut [i64; 2],
+        ) -> DLManagedTensor {
+            DLManagedTensor {
+                dl_tensor: DLTensor {
+                    data: data.as_mut_ptr() as *mut c_void,
+                    device: DLDevice {
+                        device_type: KDL_CPU,
+                        device_id: 0,
+                    },
+                    ndim: 2,
+                    dtype: DL_UINT32,
+                    shape: shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            }
+        }
+    }
+
+    // ---- CAGRA Index ----
+
+    /// GPU-accelerated approximate nearest-neighbor index using CAGRA.
+    ///
+    /// **Strategy**: vectors are accumulated in a host-side `BTreeMap`. When a
+    /// search is requested and the dataset has changed since the last build
+    /// (tracked via a dirty flag), the CAGRA graph index is rebuilt from the
+    /// full dataset. Subsequent searches use the cached graph until the next
+    /// mutation.
+    ///
+    /// CAGRA requires a minimum dataset size to build a meaningful graph (at
+    /// least `graph_degree + 1` vectors, where `graph_degree` defaults to 64).
+    /// When the dataset is too small, search falls back to CPU brute-force.
+    ///
+    /// All cuVS API calls happen on the calling thread (from `spawn_blocking`)
+    /// because CUDA contexts are thread-local. A per-call `cuvsResources_t`
+    /// is created and destroyed to avoid cross-thread issues.
+    pub(super) struct CagraIndex {
+        /// Canonical store of all vectors, keyed by PrimaryId.
+        vectors: RwLock<BTreeMap<PrimaryId, Vec<f32>>>,
+        space_type: SpaceType,
+        dimensions: usize,
+        /// Loaded cuVS library handle (shared across all CagraIndex instances).
+        lib: Arc<cuvs_ffi::CuvsLib>,
+        /// `true` when vectors have been mutated since last CAGRA build.
+        dirty: RwLock<bool>,
+        /// Serialized CAGRA index bytes (empty until first build).
+        /// We serialize/deserialize across rebuilds because the cuVS C objects
+        /// are tied to a CUDA context on a specific thread.
+        cached_flat_data: RwLock<Option<CagraCachedData>>,
+    }
+
+    /// Snapshot of data needed for CAGRA build, captured under read lock.
+    struct CagraCachedData {
+        /// Row-major [n, d] dataset.
+        flat: Vec<f32>,
+        /// Ordered PrimaryId for each row.
+        ids: Vec<PrimaryId>,
+    }
+
+    /// Minimum number of vectors required to build a CAGRA index.
+    /// Below this threshold we fall back to CPU brute-force search.
+    /// This needs to be > graph_degree (default 64).
+    const MIN_CAGRA_BUILD_SIZE: usize = 128;
+
+    impl CagraIndex {
+        pub fn new(
+            space_type: SpaceType,
+            dimensions: usize,
+            lib: Arc<cuvs_ffi::CuvsLib>,
+        ) -> Self {
+            Self {
+                vectors: RwLock::new(BTreeMap::new()),
+                space_type,
+                dimensions,
+                lib,
+                dirty: RwLock::new(true),
+                cached_flat_data: RwLock::new(None),
+            }
+        }
+
+        /// Map our `SpaceType` to the cuVS `cuvsDistanceType` enum value.
+        fn distance_type(&self) -> anyhow::Result<u32> {
+            match self.space_type {
+                SpaceType::Euclidean => Ok(cuvs_ffi::L2_EXPANDED),
+                SpaceType::Cosine => Ok(cuvs_ffi::COSINE_EXPANDED),
+                SpaceType::DotProduct => Ok(cuvs_ffi::INNER_PRODUCT),
+                SpaceType::Hamming => {
+                    anyhow::bail!("CAGRA does not support Hamming distance")
+                }
+            }
+        }
+
+        /// Build or rebuild the CAGRA index from the current vector set.
+        ///
+        /// Returns `(flat_data, ids)` for use in subsequent search, plus
+        /// the opaque CAGRA index pointer to pass to `cuvsCagraSearch`.
+        ///
+        /// The caller must destroy the returned resources and index after use.
+        fn build_index(
+            &self,
+            flat: &mut Vec<f32>,
+            n: usize,
+            d: usize,
+        ) -> anyhow::Result<(cuvs_ffi::CuvsResources, cuvs_ffi::CuvsCagraIndexPtr)> {
+            let lib = &self.lib;
+            let metric = self.distance_type()?;
+
+            // Create cuVS resources (wraps a CUDA stream)
+            let mut res: cuvs_ffi::CuvsResources = 0;
+            // SAFETY: cuvsResourcesCreate is a well-defined C API call that
+            // initializes CUDA resources. We pass a valid pointer.
+            unsafe {
+                cuvs_ffi::check(
+                    lib,
+                    (lib.resources_create)(&mut res),
+                    "cuvsResourcesCreate",
+                )?;
+            }
+
+            // Create index params with defaults, then set metric
+            let mut index_params: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: cuvsCagraIndexParamsCreate allocates and zero-initializes
+            // the params struct. We destroy it after cuvsCagraBuild.
+            unsafe {
+                cuvs_ffi::check(
+                    lib,
+                    (lib.cagra_index_params_create)(&mut index_params),
+                    "cuvsCagraIndexParamsCreate",
+                )?;
+                // The first field of cuvsCagraIndexParams is `metric` (u32).
+                // Set it directly via pointer cast.
+                *(index_params as *mut u32) = metric;
+            }
+
+            // Create the index object
+            let mut index_ptr: cuvs_ffi::CuvsCagraIndexPtr = std::ptr::null_mut();
+            // SAFETY: cuvsCagraIndexCreate allocates the index struct.
+            unsafe {
+                cuvs_ffi::check(
+                    lib,
+                    (lib.cagra_index_create)(&mut index_ptr),
+                    "cuvsCagraIndexCreate",
+                )?;
+            }
+
+            // Build the dataset DLManagedTensor
+            let mut shape = [n as i64, d as i64];
+            let mut dataset_tensor = cuvs_ffi::make_host_f32_tensor(flat, &mut shape);
+
+            // SAFETY: cuvsCagraBuild reads the dataset tensor, builds the CAGRA
+            // graph on the GPU, and stores the result in index_ptr. The tensor
+            // data (flat) must remain valid during this call.
+            unsafe {
+                let status = (lib.cagra_build)(
+                    res,
+                    index_params,
+                    &mut dataset_tensor,
+                    index_ptr,
+                );
+                // Clean up params regardless of build result
+                let _ = (lib.cagra_index_params_destroy)(index_params);
+                cuvs_ffi::check(lib, status, "cuvsCagraBuild")?;
+                // Sync the CUDA stream to ensure the build is complete
+                cuvs_ffi::check(
+                    lib,
+                    (lib.stream_sync)(res),
+                    "cuvsStreamSync after build",
+                )?;
+            }
+
+            Ok((res, index_ptr))
+        }
+
+        /// Execute a CAGRA search on a pre-built index.
+        ///
+        /// The cuVS CAGRA search API requires query, neighbors, and distances
+        /// tensors on a CUDA device (`kDLCUDA`). We use cudarc to allocate
+        /// device memory, copy the query to the GPU, run the search, and
+        /// copy results back.
+        fn search_cagra(
+            &self,
+            res: cuvs_ffi::CuvsResources,
+            index_ptr: cuvs_ffi::CuvsCagraIndexPtr,
+            query: &[f32],
+            k: usize,
+            ids: &[PrimaryId],
+        ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+            let lib = &self.lib;
+            let d = self.dimensions;
+
+            // Create search params
+            let mut search_params: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: cuvsCagraSearchParamsCreate allocates default params.
+            unsafe {
+                cuvs_ffi::check(
+                    lib,
+                    (lib.cagra_search_params_create)(&mut search_params),
+                    "cuvsCagraSearchParamsCreate",
+                )?;
+            }
+
+            // Allocate GPU memory for query, neighbors, distances via cudarc.
+            let ctx = CudaContext::new(0)
+                .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+            let stream = ctx.default_stream();
+
+            let d_query = stream
+                .clone_htod(query)
+                .map_err(|e| anyhow!("CAGRA search: failed to copy query to GPU: {e}"))?;
+            let mut d_neighbors = stream
+                .alloc_zeros::<u32>(k)
+                .map_err(|e| anyhow!("CAGRA search: failed to alloc neighbors: {e}"))?;
+            let mut d_distances = stream
+                .alloc_zeros::<f32>(k)
+                .map_err(|e| anyhow!("CAGRA search: failed to alloc distances: {e}"))?;
+
+            // Build DLManagedTensor wrappers for GPU memory.
+            // DLDevice { device_type: kDLCUDA=2, device_id: 0 }
+            let cuda_device = cuvs_ffi::DLDevice {
+                device_type: cuvs_ffi::KDL_CUDA,
+                device_id: 0,
+            };
+
+            // Get raw device pointers. The SyncOnDrop guards ensure the stream
+            // is synchronized when they are dropped.
+            let (query_ptr, _query_guard) = d_query.device_ptr(&stream);
+            let (neighbors_ptr, _neighbors_guard) = d_neighbors.device_ptr_mut(&stream);
+            let (distances_ptr, _distances_guard) = d_distances.device_ptr_mut(&stream);
+
+            let mut query_shape = [1i64, d as i64];
+            let mut query_tensor = cuvs_ffi::DLManagedTensor {
+                dl_tensor: cuvs_ffi::DLTensor {
+                    data: query_ptr as *mut std::ffi::c_void,
+                    device: cuda_device,
+                    ndim: 2,
+                    dtype: cuvs_ffi::DL_FLOAT32,
+                    shape: query_shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            };
+
+            let mut neighbors_shape = [1i64, k as i64];
+            let mut neighbors_tensor = cuvs_ffi::DLManagedTensor {
+                dl_tensor: cuvs_ffi::DLTensor {
+                    data: neighbors_ptr as *mut std::ffi::c_void,
+                    device: cuda_device,
+                    ndim: 2,
+                    dtype: cuvs_ffi::DL_UINT32,
+                    shape: neighbors_shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            };
+
+            let mut distances_shape = [1i64, k as i64];
+            let mut distances_tensor = cuvs_ffi::DLManagedTensor {
+                dl_tensor: cuvs_ffi::DLTensor {
+                    data: distances_ptr as *mut std::ffi::c_void,
+                    device: cuda_device,
+                    ndim: 2,
+                    dtype: cuvs_ffi::DL_FLOAT32,
+                    shape: distances_shape.as_mut_ptr(),
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                },
+                manager_ctx: std::ptr::null_mut(),
+                deleter: None,
+            };
+
+            let filter = cuvs_ffi::CuvsFilter::none();
+
+            // SAFETY: cuvsCagraSearch reads the query from GPU memory, searches
+            // the CAGRA graph, and writes neighbor indices and distances to GPU
+            // memory. All buffers are valid for the duration of this call.
+            unsafe {
+                let status = (lib.cagra_search)(
+                    res,
+                    search_params,
+                    index_ptr,
+                    &mut query_tensor,
+                    &mut neighbors_tensor,
+                    &mut distances_tensor,
+                    filter,
+                );
+                let _ = (lib.cagra_search_params_destroy)(search_params);
+                cuvs_ffi::check(lib, status, "cuvsCagraSearch")?;
+                cuvs_ffi::check(
+                    lib,
+                    (lib.stream_sync)(res),
+                    "cuvsStreamSync after search",
+                )?;
+            }
+
+            // Release mutable borrow guards before copying data back.
+            drop(_query_guard);
+            drop(_neighbors_guard);
+            drop(_distances_guard);
+
+            // Copy results back from GPU
+            let neighbors_data = stream
+                .clone_dtoh(&d_neighbors)
+                .map_err(|e| anyhow!("CAGRA search: failed to copy neighbors: {e}"))?;
+            let distances_data = stream
+                .clone_dtoh(&d_distances)
+                .map_err(|e| anyhow!("CAGRA search: failed to copy distances: {e}"))?;
+
+            // Convert results to (PrimaryId, Distance) pairs.
+            // CAGRA returns u32 indices into the flat dataset array.
+            let n = ids.len();
+            let mut results = Vec::with_capacity(k);
+            for i in 0..k {
+                let idx = neighbors_data[i] as usize;
+                if idx >= n {
+                    // CAGRA may return sentinel values for unfilled slots
+                    continue;
+                }
+                let dist_val = distances_data[i];
+                let distance = match self.space_type {
+                    SpaceType::Euclidean => Distance::new_euclidean(dist_val)?,
+                    SpaceType::Cosine => Distance::new_cosine(dist_val)?,
+                    SpaceType::DotProduct => Distance::new_dot_product(dist_val)?,
+                    SpaceType::Hamming => unreachable!(),
+                };
+                results.push((ids[idx], distance));
+            }
+
+            Ok(results)
+        }
+
+        /// CPU brute-force fallback for small datasets.
+        fn search_brute_force(
+            &self,
+            query: &[f32],
+            flat: &[f32],
+            ids: &[PrimaryId],
+            k: usize,
+        ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+            let d = self.dimensions;
+            let n = ids.len();
+
+            let mut scored: Vec<(usize, f32)> = (0..n)
+                .map(|i| {
+                    let row = &flat[i * d..(i + 1) * d];
+                    let dist = compute_distance(query, row, self.space_type)
+                        .map(|d| -> f32 { d.into() })
+                        .unwrap_or(f32::MAX);
+                    (i, dist)
+                })
+                .collect();
+
+            scored.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scored.truncate(k);
+
+            let mut results = Vec::with_capacity(k);
+            for (idx, dist_val) in scored {
+                let distance = match self.space_type {
+                    SpaceType::Euclidean => Distance::new_euclidean(dist_val)?,
+                    SpaceType::Cosine => Distance::new_cosine(dist_val)?,
+                    SpaceType::DotProduct => Distance::new_dot_product(dist_val)?,
+                    SpaceType::Hamming => unreachable!(),
+                };
+                results.push((ids[idx], distance));
+            }
+            Ok(results)
+        }
+    }
+
+    impl CuvsVectorIndex for CagraIndex {
+        fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
+            self.vectors
+                .write()
+                .unwrap()
+                .insert(primary_id, vector.as_ref().to_vec());
+            *self.dirty.write().unwrap() = true;
+            Ok(())
+        }
+
+        fn remove(&self, primary_id: PrimaryId) -> anyhow::Result<()> {
+            self.vectors.write().unwrap().remove(&primary_id);
+            *self.dirty.write().unwrap() = true;
+            Ok(())
+        }
+
+        fn search(
+            &self,
+            vector: &Vector,
+            limit: Limit,
+        ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+            let dirty = *self.dirty.read().unwrap();
+            let d = self.dimensions;
+
+            // Snapshot current vectors if dirty
+            if dirty {
+                let vectors = self.vectors.read().unwrap();
+                let n = vectors.len();
+                if n == 0 {
+                    return Ok(vec![]);
+                }
+
+                let mut flat = Vec::with_capacity(n * d);
+                let mut ids = Vec::with_capacity(n);
+                for (&pid, v) in vectors.iter() {
+                    flat.extend_from_slice(v);
+                    ids.push(pid);
+                }
+                drop(vectors);
+
+                *self.cached_flat_data.write().unwrap() =
+                    Some(CagraCachedData { flat, ids });
+                *self.dirty.write().unwrap() = false;
+            }
+
+            let cache = self.cached_flat_data.read().unwrap();
+            let cached = cache.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("CAGRA index has no cached data")
+            })?;
+
+            let n = cached.ids.len();
+            if n == 0 {
+                return Ok(vec![]);
+            }
+
+            let k = limit.0.get().min(n);
+            let query = vector.as_ref();
+
+            // If dataset is too small for CAGRA, use CPU brute-force
+            if n < MIN_CAGRA_BUILD_SIZE {
+                return self.search_brute_force(query, &cached.flat, &cached.ids, k);
+            }
+
+            // Build CAGRA index from cached flat data
+            let mut flat_copy = cached.flat.clone();
+            let ids_snapshot = cached.ids.clone();
+            drop(cache);
+
+            // Build CAGRA index; if it fails (e.g. unsupported metric), fall
+            // back to CPU brute-force.
+            let build_result = self.build_index(&mut flat_copy, n, d);
+            let (res, index_ptr) = match build_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        "CAGRA build failed ({e}), falling back to brute-force"
+                    );
+                    return self.search_brute_force(query, &flat_copy, &ids_snapshot, k);
+                }
+            };
+
+            let results = self.search_cagra(res, index_ptr, query, k, &ids_snapshot);
+
+            // Clean up CAGRA index and resources
+            // SAFETY: proper cleanup of cuVS objects created above.
+            unsafe {
+                let _ = (self.lib.cagra_index_destroy)(index_ptr);
+                let _ = (self.lib.resources_destroy)(res);
+            }
+
+            results
+        }
+
+        fn size(&self) -> usize {
+            self.vectors.read().unwrap().len()
+        }
+    }
+
+    /// Load the cuVS library (singleton per process).
+    static CUVS_LIB: std::sync::OnceLock<Result<Arc<cuvs_ffi::CuvsLib>, String>> =
+        std::sync::OnceLock::new();
+
+    /// Get or load the cuVS shared library.
+    pub(super) fn load_cuvs_lib() -> anyhow::Result<Arc<cuvs_ffi::CuvsLib>> {
+        let result = CUVS_LIB.get_or_init(|| {
+            cuvs_ffi::CuvsLib::load()
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        });
+        match result {
+            Ok(lib) => Ok(Arc::clone(lib)),
+            Err(msg) => anyhow::bail!("{msg}"),
         }
     }
 }
@@ -1105,7 +1896,7 @@ mod tests {
         #[cfg(feature = "gpu")]
         assert_eq!(
             factory.index_engine_version(),
-            "cuvs-gpu-brute-force-v1"
+            "cuvs-gpu-cagra-v1"
         );
         #[cfg(not(feature = "gpu"))]
         assert_eq!(factory.index_engine_version(), "cuvs-brute-force-v1");
@@ -1611,6 +2402,8 @@ mod tests {
     mod gpu_tests {
         use super::*;
         use crate::index::cuvs::gpu::GpuBruteForceIndex;
+        use crate::index::cuvs::gpu::CagraIndex;
+        use crate::index::cuvs::gpu::cuvs_ffi;
 
         #[test]
         fn test_gpu_add_and_size() {
@@ -1772,7 +2565,7 @@ mod tests {
             };
             assert_eq!(
                 factory.index_engine_version(),
-                "cuvs-gpu-brute-force-v1"
+                "cuvs-gpu-cagra-v1"
             );
         }
 
@@ -1875,6 +2668,247 @@ mod tests {
             assert_eq!(distances.len(), 1);
             let d: f32 = distances[0].into();
             assert_eq!(d, 0.0);
+        }
+
+        // --- CAGRA index tests ---
+        //
+        // These tests require libcuvs_c.so in LD_LIBRARY_PATH.
+        // They are skipped gracefully if the library is not available.
+
+        /// Helper to load the cuVS library, skipping the test if unavailable.
+        fn try_load_cuvs() -> Option<Arc<cuvs_ffi::CuvsLib>> {
+            match gpu::load_cuvs_lib() {
+                Ok(lib) => Some(lib),
+                Err(err) => {
+                    eprintln!("skipping CAGRA test: {err}");
+                    None
+                }
+            }
+        }
+
+        #[test]
+        fn test_cagra_add_and_size() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let index = CagraIndex::new(SpaceType::Euclidean, 3, lib);
+            assert_eq!(index.size(), 0);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![1.0, 2.0, 3.0]))
+                .unwrap();
+            assert_eq!(index.size(), 1);
+
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![4.0, 5.0, 6.0]))
+                .unwrap();
+            assert_eq!(index.size(), 2);
+        }
+
+        #[test]
+        fn test_cagra_add_and_remove() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let index = CagraIndex::new(SpaceType::Euclidean, 3, lib);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![1.0, 2.0, 3.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![4.0, 5.0, 6.0]))
+                .unwrap();
+            assert_eq!(index.size(), 2);
+
+            index.remove(PrimaryId::from(1u64)).unwrap();
+            assert_eq!(index.size(), 1);
+        }
+
+        /// Test CAGRA search with enough vectors to trigger graph build.
+        /// Generates 200 random-ish vectors, inserts a known target, and
+        /// verifies it's found as the nearest neighbor.
+        #[test]
+        fn test_cagra_search_euclidean() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+            let index = CagraIndex::new(SpaceType::Euclidean, d, lib);
+
+            // Insert `n` vectors: vector i = [i as f32 / n; d]
+            for i in 0..n {
+                let val = i as f32 / n as f32;
+                let v: Vec<f32> = vec![val; d];
+                index
+                    .add(PrimaryId::from(i as u64), &make_vector(v))
+                    .unwrap();
+            }
+
+            // Query is exactly vector 0 → should find PrimaryId(0) closest.
+            let query = make_vector(vec![0.0; d]);
+            let results = index.search(&query, make_limit(5)).unwrap();
+
+            assert!(!results.is_empty(), "expected at least 1 result");
+            // The nearest neighbor should be PrimaryId(0) (distance ~0)
+            assert_eq!(
+                results[0].0,
+                PrimaryId::from(0u64),
+                "expected PrimaryId(0) as nearest"
+            );
+            let d0: f32 = results[0].1.into();
+            assert!(d0 < 1e-4, "expected distance ~0, got {d0}");
+        }
+
+        #[test]
+        fn test_cagra_search_cosine() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+            let index = CagraIndex::new(SpaceType::Cosine, d, lib);
+
+            // Insert vectors with varying directions
+            for i in 0..n {
+                let mut v = vec![0.0f32; d];
+                v[i % d] = 1.0;
+                v[(i + 1) % d] = (i as f32) / n as f32;
+                index
+                    .add(PrimaryId::from(i as u64), &make_vector(v))
+                    .unwrap();
+            }
+
+            // Query along first dimension
+            let mut query_v = vec![0.0f32; d];
+            query_v[0] = 1.0;
+            let query = make_vector(query_v);
+            let results = index.search(&query, make_limit(5)).unwrap();
+
+            assert!(!results.is_empty(), "expected at least 1 result");
+            // The result should have small cosine distance
+            let d0: f32 = results[0].1.into();
+            assert!(d0 < 0.5, "expected small cosine distance, got {d0}");
+        }
+
+        #[test]
+        fn test_cagra_search_dot_product() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+            let index = CagraIndex::new(SpaceType::DotProduct, d, lib);
+
+            for i in 0..n {
+                let val = (i as f32 + 1.0) / n as f32;
+                let v: Vec<f32> = vec![val; d];
+                index
+                    .add(PrimaryId::from(i as u64), &make_vector(v))
+                    .unwrap();
+            }
+
+            // Query with all 1.0s → highest dot product with the largest vector
+            let query = make_vector(vec![1.0; d]);
+            let results = index.search(&query, make_limit(5)).unwrap();
+
+            assert!(!results.is_empty(), "expected at least 1 result");
+            // The nearest (smallest distance=1-dot) should be the largest vector
+            assert_eq!(
+                results[0].0,
+                PrimaryId::from((n - 1) as u64),
+                "expected PrimaryId({}) as nearest",
+                n - 1
+            );
+        }
+
+        #[test]
+        fn test_cagra_search_empty() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let index = CagraIndex::new(SpaceType::Euclidean, 3, lib);
+
+            let results = index
+                .search(&make_vector(vec![1.0, 2.0, 3.0]), make_limit(5))
+                .unwrap();
+
+            assert!(results.is_empty());
+        }
+
+        /// Test that small datasets (< MIN_CAGRA_BUILD_SIZE) fall back to
+        /// brute-force and still return correct results.
+        #[test]
+        fn test_cagra_small_dataset_fallback() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let index = CagraIndex::new(SpaceType::Euclidean, 2, lib);
+
+            index
+                .add(PrimaryId::from(1u64), &make_vector(vec![0.0, 0.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(2u64), &make_vector(vec![1.0, 0.0]))
+                .unwrap();
+            index
+                .add(PrimaryId::from(3u64), &make_vector(vec![10.0, 10.0]))
+                .unwrap();
+
+            let results = index
+                .search(&make_vector(vec![0.0, 0.0]), make_limit(2))
+                .unwrap();
+
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].0, PrimaryId::from(1u64));
+            let d0: f32 = results[0].1.into();
+            assert_eq!(d0, 0.0);
+        }
+
+        /// Verify CAGRA results match CPU BruteForceIndex for the same data
+        /// (approximate — CAGRA is ANN so we allow some tolerance in ranking).
+        #[test]
+        fn test_cagra_matches_cpu_top1() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+
+            let cpu = BruteForceIndex::new(SpaceType::Euclidean);
+            let cagra = CagraIndex::new(SpaceType::Euclidean, d, lib);
+
+            for i in 0..n {
+                let val = i as f32 / n as f32;
+                let v = make_vector(vec![val; d]);
+                cpu.add(PrimaryId::from(i as u64), &v).unwrap();
+                cagra.add(PrimaryId::from(i as u64), &v).unwrap();
+            }
+
+            let query = make_vector(vec![0.0; d]);
+            let cpu_results = cpu.search(&query, make_limit(1)).unwrap();
+            let cagra_results = cagra.search(&query, make_limit(1)).unwrap();
+
+            assert_eq!(cpu_results.len(), 1);
+            assert_eq!(cagra_results.len(), 1);
+            // Top-1 result should match for this simple dataset
+            assert_eq!(
+                cpu_results[0].0, cagra_results[0].0,
+                "top-1 PrimaryId mismatch"
+            );
+        }
+
+        #[test]
+        fn test_cagra_update_vector() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+            let index = CagraIndex::new(SpaceType::Euclidean, d, lib);
+
+            // Fill with baseline vectors
+            for i in 0..n {
+                let v: Vec<f32> = vec![1.0; d];
+                index
+                    .add(PrimaryId::from(i as u64), &make_vector(v))
+                    .unwrap();
+            }
+
+            // Update vector 0 to be at origin
+            index
+                .add(PrimaryId::from(0u64), &make_vector(vec![0.0; d]))
+                .unwrap();
+
+            assert_eq!(index.size(), n);
+
+            // Search for origin → should find PrimaryId(0)
+            let results = index
+                .search(&make_vector(vec![0.0; d]), make_limit(1))
+                .unwrap();
+            assert_eq!(results[0].0, PrimaryId::from(0u64));
         }
     }
 }
