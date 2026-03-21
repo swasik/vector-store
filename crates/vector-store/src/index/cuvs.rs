@@ -738,7 +738,7 @@ fn ann<T>(
     }
     tx_ann
         .send(result)
-        .unwrap_or_else(|_| warn!("ann: unable to send response (receiver dropped)"));
+        .unwrap_or_else(|_| debug!("ann: unable to send response (receiver dropped)"));
 }
 
 async fn check_memory_allocation(
@@ -1319,6 +1319,9 @@ mod gpu {
         dirty: RwLock<bool>,
         /// Cached flat data + built CAGRA graph index. Invalidated when dirty.
         cached_build: RwLock<Option<CagraCachedBuild>>,
+        /// Serializes CAGRA graph builds so only one thread builds at a time
+        /// (prevents thundering-herd when many searches arrive concurrently).
+        build_lock: std::sync::Mutex<()>,
     }
 
     /// Cached CAGRA build: flat data snapshot, PrimaryId mapping, and the
@@ -1380,6 +1383,7 @@ mod gpu {
                 lib,
                 dirty: RwLock::new(true),
                 cached_build: RwLock::new(None),
+                build_lock: std::sync::Mutex::new(()),
             }
         }
 
@@ -1733,50 +1737,57 @@ mod gpu {
             let d = self.dimensions;
 
             // If data changed, rebuild the flat snapshot and CAGRA graph.
+            // Use double-checked locking: only one thread builds at a time;
+            // others wait for the build to complete and reuse the result.
             if dirty {
-                let vectors = self.vectors.read().unwrap();
-                let n = vectors.len();
-                if n == 0 {
-                    *self.dirty.write().unwrap() = false;
-                    return Ok(vec![]);
-                }
-
-                let mut flat = Vec::with_capacity(n * d);
-                let mut ids = Vec::with_capacity(n);
-                for (&pid, v) in vectors.iter() {
-                    flat.extend_from_slice(v);
-                    ids.push(pid);
-                }
-                drop(vectors);
-
-                // Build CAGRA if the dataset is large enough.
-                let (res, index_ptr) = if n >= MIN_CAGRA_BUILD_SIZE {
-                    match self.build_index(&mut flat, n, d) {
-                        Ok((res, ptr)) => {
-                            tracing::info!(
-                                "CAGRA graph built for {n} vectors ({d} dims)"
-                            );
-                            (res, ptr)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "CAGRA build failed ({e:#}), falling back to brute-force"
-                            );
-                            (0, std::ptr::null_mut())
-                        }
+                let _build_guard = self.build_lock.lock().unwrap();
+                // Re-check after acquiring the lock — another thread may
+                // have completed the build while we were waiting.
+                if *self.dirty.read().unwrap() {
+                    let vectors = self.vectors.read().unwrap();
+                    let n = vectors.len();
+                    if n == 0 {
+                        *self.dirty.write().unwrap() = false;
+                        return Ok(vec![]);
                     }
-                } else {
-                    (0, std::ptr::null_mut())
-                };
 
-                *self.cached_build.write().unwrap() = Some(CagraCachedBuild {
-                    flat,
-                    ids,
-                    res,
-                    index_ptr,
-                    lib: Arc::clone(&self.lib),
-                });
-                *self.dirty.write().unwrap() = false;
+                    let mut flat = Vec::with_capacity(n * d);
+                    let mut ids = Vec::with_capacity(n);
+                    for (&pid, v) in vectors.iter() {
+                        flat.extend_from_slice(v);
+                        ids.push(pid);
+                    }
+                    drop(vectors);
+
+                    // Build CAGRA if the dataset is large enough.
+                    let (res, index_ptr) = if n >= MIN_CAGRA_BUILD_SIZE {
+                        match self.build_index(&mut flat, n, d) {
+                            Ok((res, ptr)) => {
+                                tracing::info!(
+                                    "CAGRA graph built for {n} vectors ({d} dims)"
+                                );
+                                (res, ptr)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "CAGRA build failed ({e:#}), falling back to brute-force"
+                                );
+                                (0, std::ptr::null_mut())
+                            }
+                        }
+                    } else {
+                        (0, std::ptr::null_mut())
+                    };
+
+                    *self.cached_build.write().unwrap() = Some(CagraCachedBuild {
+                        flat,
+                        ids,
+                        res,
+                        index_ptr,
+                        lib: Arc::clone(&self.lib),
+                    });
+                    *self.dirty.write().unwrap() = false;
+                }
             }
 
             // Use the cached build.
