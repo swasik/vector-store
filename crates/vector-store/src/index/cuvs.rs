@@ -1043,6 +1043,28 @@ mod gpu {
 
         pub type CuvsCagraIndexPtr = *mut CuvsCagraIndex;
 
+        // -- CAGRA search params (mirrors struct cuvsCagraSearchParams) --
+
+        #[repr(C)]
+        pub struct CuvsCagraSearchParams {
+            pub max_queries: usize,
+            pub itopk_size: usize,
+            pub max_iterations: usize,
+            pub algo: i32, // cuvsCagraSearchAlgo
+            pub team_size: usize,
+            pub search_width: usize,
+            pub min_iterations: usize,
+            pub thread_block_size: usize,
+            pub hashmap_mode: i32, // cuvsCagraHashMode
+            pub hashmap_min_bitlen: usize,
+            pub hashmap_max_fill_rate: f32,
+            pub num_random_samplings: u32,
+            pub rand_xor_mask: u64,
+            pub persistent: bool,
+            pub persistent_lifetime: f32,
+            pub persistent_device_usage: f32,
+        }
+
         // cuvsDistanceType enum values used by CAGRA
         pub const L2_EXPANDED: u32 = 0;
         pub const COSINE_EXPANDED: u32 = 2;
@@ -1489,6 +1511,12 @@ mod gpu {
                     (lib.cagra_search_params_create)(&mut search_params),
                     "cuvsCagraSearchParamsCreate",
                 )?;
+                // Ensure itopk_size >= k. The default is 64, which is too
+                // small for large top-k queries (e.g. VectorDBBench k=100).
+                let params = search_params as *mut cuvs_ffi::CuvsCagraSearchParams;
+                if (*params).itopk_size < k {
+                    (*params).itopk_size = k;
+                }
             }
 
             // Allocate GPU memory for query, neighbors, distances via cudarc.
