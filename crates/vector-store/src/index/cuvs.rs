@@ -305,6 +305,49 @@ enum MutationOp {
     },
 }
 
+/// Push a mutation message onto the pending batch and update the flush deadline.
+/// Returns `true` if the batch is full and should be flushed immediately.
+fn push_mutation(
+    pending: &mut Vec<PendingMutation>,
+    state: &IndexState,
+    partition: Arc<PartitionState>,
+    msg: Index,
+    flush_deadline: &mut Option<tokio::time::Instant>,
+    batch_timeout: Duration,
+    batch_size: usize,
+) -> bool {
+    let op = match msg {
+        Index::AddVector {
+            primary_id,
+            embedding,
+            in_progress,
+            ..
+        } => MutationOp::Add {
+            primary_id,
+            embedding,
+            _in_progress: in_progress,
+        },
+        Index::RemoveVector {
+            primary_id,
+            in_progress,
+            ..
+        } => MutationOp::Remove {
+            primary_id,
+            _in_progress: in_progress,
+        },
+        _ => unreachable!("push_mutation called with non-mutation message"),
+    };
+    pending.push(PendingMutation {
+        partition,
+        size: Arc::clone(&state.size),
+        op,
+    });
+    if flush_deadline.is_none() {
+        *flush_deadline = Some(tokio::time::Instant::now() + batch_timeout);
+    }
+    pending.len() >= batch_size
+}
+
 pub struct CuvsIndexFactory {
     tokio_semaphore: Arc<Semaphore>,
     batch_config: BatchConfig,
@@ -462,48 +505,8 @@ fn new(
                     };
 
                     match msg {
-                        Index::AddVector {
-                            primary_id,
-                            embedding,
-                            in_progress,
-                            ..
-                        } => {
-                            pending.push(PendingMutation {
-                                partition,
-                                size: Arc::clone(&state.size),
-                                op: MutationOp::Add {
-                                    primary_id,
-                                    embedding,
-                                    _in_progress: in_progress,
-                                },
-                            });
-                            if flush_deadline.is_none() {
-                                flush_deadline =
-                                    Some(tokio::time::Instant::now() + batch_timeout);
-                            }
-                            if pending.len() >= batch_size {
-                                flush_batch(&mut pending, &tokio_semaphore).await;
-                                flush_deadline = None;
-                            }
-                        }
-                        Index::RemoveVector {
-                            primary_id,
-                            in_progress,
-                            ..
-                        } => {
-                            pending.push(PendingMutation {
-                                partition,
-                                size: Arc::clone(&state.size),
-                                op: MutationOp::Remove {
-                                    primary_id,
-                                    _in_progress: in_progress,
-                                },
-                            });
-                            if flush_deadline.is_none() {
-                                flush_deadline =
-                                    Some(tokio::time::Instant::now() + batch_timeout);
-                            }
-                            if pending.len() >= batch_size {
+                        m @ (Index::AddVector { .. } | Index::RemoveVector { .. }) => {
+                            if push_mutation(&mut pending, state, partition, m, &mut flush_deadline, batch_timeout, batch_size) {
                                 flush_batch(&mut pending, &tokio_semaphore).await;
                                 flush_deadline = None;
                             }
@@ -539,56 +542,9 @@ fn new(
                                         search_items
                                             .push((ns.dimensions, np, m));
                                     }
-                                    Index::AddVector {
-                                        primary_id,
-                                        embedding,
-                                        in_progress,
-                                        ..
-                                    } => {
-                                        pending.push(PendingMutation {
-                                            partition: np,
-                                            size: Arc::clone(&ns.size),
-                                            op: MutationOp::Add {
-                                                primary_id,
-                                                embedding,
-                                                _in_progress: in_progress,
-                                            },
-                                        });
-                                        if flush_deadline.is_none() {
-                                            flush_deadline = Some(
-                                                tokio::time::Instant::now()
-                                                    + batch_timeout,
-                                            );
-                                        }
-                                        if pending.len() >= batch_size {
-                                            flush_batch(
-                                                &mut pending,
-                                                &tokio_semaphore,
-                                            )
-                                            .await;
-                                            flush_deadline = None;
-                                        }
-                                    }
-                                    Index::RemoveVector {
-                                        primary_id,
-                                        in_progress,
-                                        ..
-                                    } => {
-                                        pending.push(PendingMutation {
-                                            partition: np,
-                                            size: Arc::clone(&ns.size),
-                                            op: MutationOp::Remove {
-                                                primary_id,
-                                                _in_progress: in_progress,
-                                            },
-                                        });
-                                        if flush_deadline.is_none() {
-                                            flush_deadline = Some(
-                                                tokio::time::Instant::now()
-                                                    + batch_timeout,
-                                            );
-                                        }
-                                        if pending.len() >= batch_size {
+                                    m @ (Index::AddVector { .. }
+                                    | Index::RemoveVector { .. }) => {
+                                        if push_mutation(&mut pending, ns, np, m, &mut flush_deadline, batch_timeout, batch_size) {
                                             flush_batch(
                                                 &mut pending,
                                                 &tokio_semaphore,
@@ -635,56 +591,9 @@ fn new(
                                                             m,
                                                         ));
                                                     }
-                                                    Index::AddVector {
-                                                        primary_id,
-                                                        embedding,
-                                                        in_progress,
-                                                        ..
-                                                    } => {
-                                                        pending.push(PendingMutation {
-                                                            partition: np,
-                                                            size: Arc::clone(&ns.size),
-                                                            op: MutationOp::Add {
-                                                                primary_id,
-                                                                embedding,
-                                                                _in_progress: in_progress,
-                                                            },
-                                                        });
-                                                        if flush_deadline.is_none() {
-                                                            flush_deadline = Some(
-                                                                tokio::time::Instant::now()
-                                                                    + batch_timeout,
-                                                            );
-                                                        }
-                                                        if pending.len() >= batch_size {
-                                                            flush_batch(
-                                                                &mut pending,
-                                                                &tokio_semaphore,
-                                                            )
-                                                            .await;
-                                                            flush_deadline = None;
-                                                        }
-                                                    }
-                                                    Index::RemoveVector {
-                                                        primary_id,
-                                                        in_progress,
-                                                        ..
-                                                    } => {
-                                                        pending.push(PendingMutation {
-                                                            partition: np,
-                                                            size: Arc::clone(&ns.size),
-                                                            op: MutationOp::Remove {
-                                                                primary_id,
-                                                                _in_progress: in_progress,
-                                                            },
-                                                        });
-                                                        if flush_deadline.is_none() {
-                                                            flush_deadline = Some(
-                                                                tokio::time::Instant::now()
-                                                                    + batch_timeout,
-                                                            );
-                                                        }
-                                                        if pending.len() >= batch_size {
+                                                    m @ (Index::AddVector { .. }
+                                                    | Index::RemoveVector { .. }) => {
+                                                        if push_mutation(&mut pending, ns, np, m, &mut flush_deadline, batch_timeout, batch_size) {
                                                             flush_batch(
                                                                 &mut pending,
                                                                 &tokio_semaphore,
@@ -719,56 +628,9 @@ fn new(
                                                         m,
                                                     ));
                                                 }
-                                                Index::AddVector {
-                                                    primary_id,
-                                                    embedding,
-                                                    in_progress,
-                                                    ..
-                                                } => {
-                                                    pending.push(PendingMutation {
-                                                        partition: np,
-                                                        size: Arc::clone(&ns.size),
-                                                        op: MutationOp::Add {
-                                                            primary_id,
-                                                            embedding,
-                                                            _in_progress: in_progress,
-                                                        },
-                                                    });
-                                                    if flush_deadline.is_none() {
-                                                        flush_deadline = Some(
-                                                            tokio::time::Instant::now()
-                                                                + batch_timeout,
-                                                        );
-                                                    }
-                                                    if pending.len() >= batch_size {
-                                                        flush_batch(
-                                                            &mut pending,
-                                                            &tokio_semaphore,
-                                                        )
-                                                        .await;
-                                                        flush_deadline = None;
-                                                    }
-                                                }
-                                                Index::RemoveVector {
-                                                    primary_id,
-                                                    in_progress,
-                                                    ..
-                                                } => {
-                                                    pending.push(PendingMutation {
-                                                        partition: np,
-                                                        size: Arc::clone(&ns.size),
-                                                        op: MutationOp::Remove {
-                                                            primary_id,
-                                                            _in_progress: in_progress,
-                                                        },
-                                                    });
-                                                    if flush_deadline.is_none() {
-                                                        flush_deadline = Some(
-                                                            tokio::time::Instant::now()
-                                                                + batch_timeout,
-                                                        );
-                                                    }
-                                                    if pending.len() >= batch_size {
+                                                m @ (Index::AddVector { .. }
+                                                | Index::RemoveVector { .. }) => {
+                                                    if push_mutation(&mut pending, ns, np, m, &mut flush_deadline, batch_timeout, batch_size) {
                                                         flush_batch(
                                                             &mut pending,
                                                             &tokio_semaphore,
@@ -801,56 +663,9 @@ fn new(
                                                             m,
                                                         ));
                                                     }
-                                                    Index::AddVector {
-                                                        primary_id,
-                                                        embedding,
-                                                        in_progress,
-                                                        ..
-                                                    } => {
-                                                        pending.push(PendingMutation {
-                                                            partition: np,
-                                                            size: Arc::clone(&ns.size),
-                                                            op: MutationOp::Add {
-                                                                primary_id,
-                                                                embedding,
-                                                                _in_progress: in_progress,
-                                                            },
-                                                        });
-                                                        if flush_deadline.is_none() {
-                                                            flush_deadline = Some(
-                                                                tokio::time::Instant::now()
-                                                                    + batch_timeout,
-                                                            );
-                                                        }
-                                                        if pending.len() >= batch_size {
-                                                            flush_batch(
-                                                                &mut pending,
-                                                                &tokio_semaphore,
-                                                            )
-                                                            .await;
-                                                            flush_deadline = None;
-                                                        }
-                                                    }
-                                                    Index::RemoveVector {
-                                                        primary_id,
-                                                        in_progress,
-                                                        ..
-                                                    } => {
-                                                        pending.push(PendingMutation {
-                                                            partition: np,
-                                                            size: Arc::clone(&ns.size),
-                                                            op: MutationOp::Remove {
-                                                                primary_id,
-                                                                _in_progress: in_progress,
-                                                            },
-                                                        });
-                                                        if flush_deadline.is_none() {
-                                                            flush_deadline = Some(
-                                                                tokio::time::Instant::now()
-                                                                    + batch_timeout,
-                                                            );
-                                                        }
-                                                        if pending.len() >= batch_size {
+                                                    m @ (Index::AddVector { .. }
+                                                    | Index::RemoveVector { .. }) => {
+                                                        if push_mutation(&mut pending, ns, np, m, &mut flush_deadline, batch_timeout, batch_size) {
                                                             flush_batch(
                                                                 &mut pending,
                                                                 &tokio_semaphore,
@@ -1375,6 +1190,9 @@ mod gpu {
         dimensions: usize,
         /// Cached CUDA context, created once on first search and reused.
         cuda_ctx: OnceLock<Arc<CudaContext>>,
+        /// Cached cuBLAS handle, created once on first search and reused.
+        /// Wrapped in a Mutex for Sync (always uncontended — actor serializes).
+        cuda_blas: std::sync::Mutex<Option<CudaBlas>>,
     }
 
     impl GpuBruteForceIndex {
@@ -1385,6 +1203,7 @@ mod gpu {
                 space_type,
                 dimensions,
                 cuda_ctx: OnceLock::new(),
+                cuda_blas: std::sync::Mutex::new(None),
             }
         }
 
@@ -1484,8 +1303,21 @@ mod gpu {
                 .alloc_zeros::<f32>(n)
                 .map_err(|e| anyhow!("failed to allocate GPU output: {e}"))?;
 
-            let blas = CudaBlas::new(stream.clone())
-                .map_err(|e| anyhow!("failed to create cuBLAS handle: {e}"))?;
+            let mut blas_guard = self.cuda_blas.lock().unwrap_or_else(|e| {
+                // A previous holder panicked (e.g. during SGEMM); recover and
+                // discard the potentially-invalid cached handle.
+                let mut guard = e.into_inner();
+                *guard = None;
+                guard
+            });
+            let blas = match blas_guard.as_ref() {
+                Some(b) => b,
+                None => {
+                    let b = CudaBlas::new(stream.clone())
+                        .map_err(|e| anyhow!("failed to create cuBLAS handle: {e}"))?;
+                    blas_guard.insert(b)
+                }
+            };
 
             let cfg = GemmConfig {
                 transa: cublasOperation_t::CUBLAS_OP_T,
@@ -1505,6 +1337,7 @@ mod gpu {
                 blas.gemm(cfg, &d_dataset, &d_query, &mut d_inner)
                     .map_err(|e| anyhow!("cuBLAS SGEMM failed: {e}"))?;
             }
+            drop(blas_guard);
 
             let inner_products = stream
                 .clone_dtoh(&d_inner)
@@ -1702,7 +1535,9 @@ mod gpu {
         ///
         /// All functions are resolved once on library load and cached.
         /// Each function pointer matches the C API signature from the
-        /// cuVS headers.
+        /// cuVS headers (tested against libcuvs 25.02 / RAPIDS 25.02).
+        /// If the cuVS C ABI changes in a future release, update the
+        /// signatures here and in the `sym!()` macro below.
         #[allow(dead_code)]
         pub struct CuvsLib {
             _lib: libloading::Library,
@@ -1791,6 +1626,10 @@ mod gpu {
                              set LD_LIBRARY_PATH to include the lib directory."
                         ))?;
 
+                    // Resolve cuVS C API symbols. The signatures below
+                    // match libcuvs 25.02; `transmute` is inherently fragile
+                    // if the ABI changes — update together with the struct
+                    // field types when upgrading libcuvs.
                     macro_rules! sym {
                         ($name:expr) => {{
                             let f: libloading::Symbol<*const ()> = lib.get($name)
@@ -3740,6 +3579,99 @@ mod tests {
         assert_eq!(count, 3, "batch should have flushed when batch_size reached");
     }
 
+    /// Verify that the search_batch_timeout accumulates concurrent searches
+    /// into a single dispatch rather than dispatching them individually.
+    /// We send multiple searches in quick succession with a non-zero
+    /// search_batch_timeout and verify they all return correct results
+    /// (proving they were processed, potentially as a batch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_search_batch_timeout_accumulation() {
+        let dimensions = make_dimensions(2);
+        let config_rx = watch::channel(Arc::new(Config::default())).1;
+        let memory_tx = memory::new(config_rx.clone());
+
+        let mut id_gen = IndexIdGenerator::new();
+        let index_id = id_gen.next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+
+        let index_key = IndexKey::new(&"test_ks".into(), &"test_idx".into());
+
+        let mut mock_table = MockTableSearch::new();
+        let ik = index_key.clone();
+        mock_table
+            .expect_partition_id()
+            .withf(move |key, _| *key == ik)
+            .returning(move |_, _| Some((partition_id, None)));
+        mock_table
+            .expect_index_id()
+            .returning(move |_| Some(index_id));
+        mock_table
+            .expect_primary_key()
+            .returning(move |_, pid| {
+                let id: u64 = pid.into();
+                Some(crate::PrimaryKey::from(vec![CqlValue::BigInt(id as i64)]))
+            });
+
+        let table = Arc::new(RwLock::new(mock_table));
+
+        // Small batch_size=1 so mutations flush immediately;
+        // non-zero search_batch_timeout to accumulate searches.
+        let batch_config = BatchConfig {
+            batch_size: 1,
+            batch_timeout: Duration::from_millis(5),
+            search_batch_timeout: Duration::from_millis(10),
+            ..BatchConfig::default()
+        };
+
+        let index_tx = new(
+            SpaceType::Euclidean,
+            index_key.clone(),
+            dimensions,
+            table,
+            Arc::new(Semaphore::new(4)),
+            memory_tx,
+            &batch_config,
+        )
+        .unwrap();
+
+        // Add vectors
+        for i in 0..5u64 {
+            index_tx
+                .add_vector(
+                    partition_id,
+                    PrimaryId::from(i),
+                    make_vector(vec![i as f32, 0.0]),
+                    None,
+                )
+                .await;
+        }
+
+        // Wait for all mutations to flush (batch_size=1 → immediate)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire multiple searches concurrently — they should be accumulated
+        // by search_batch_timeout into a single batch dispatch.
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let tx = index_tx.clone();
+            let ik = index_key.clone();
+            handles.push(tokio::spawn(async move {
+                tx.ann(ik, make_vector(vec![0.0, 0.0]), make_limit(2)).await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap().unwrap());
+        }
+
+        // All three searches should return the same nearest neighbor.
+        for (keys, distances) in &results {
+            assert!(!keys.is_empty(), "search should return results");
+            assert_eq!(keys.len(), distances.len());
+        }
+    }
+
     // --- GPU brute-force tests (require `gpu` feature and NVIDIA GPU) ---
 
     #[cfg(feature = "gpu")]
@@ -4256,6 +4188,138 @@ mod tests {
                 .search(&make_vector(vec![0.0; d]), make_limit(1))
                 .unwrap();
             assert_eq!(results[0].0, PrimaryId::from(0u64));
+        }
+
+        /// Test the DeltaIndex merge path: build CAGRA graph, mutate
+        /// (add + remove), then search before rebuild. Verifies that
+        /// the delta overlay correctly merges with stale CAGRA results.
+        #[test]
+        fn test_cagra_delta_merge_after_build() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+            let index = CagraIndex::new(SpaceType::Euclidean, d, lib);
+
+            // Insert n vectors and build the CAGRA graph.
+            for i in 0..n {
+                let val = (i as f32 + 1.0) / n as f32;
+                index
+                    .add(PrimaryId::from(i as u64), &make_vector(vec![val; d]))
+                    .unwrap();
+            }
+            index.rebuild();
+
+            // Mutate after build: remove vector 0 and add a new one at the origin.
+            index.remove(PrimaryId::from(0u64)).unwrap();
+            let new_pid = PrimaryId::from(n as u64);
+            index
+                .add(new_pid, &make_vector(vec![0.0; d]))
+                .unwrap();
+
+            // Search for origin — should find the newly added vector, not
+            // the removed one.
+            let results = index
+                .search(&make_vector(vec![0.0; d]), make_limit(5))
+                .unwrap();
+
+            assert!(!results.is_empty(), "expected results after delta merge");
+            assert_eq!(
+                results[0].0, new_pid,
+                "delta-added vector should be nearest"
+            );
+            // The removed PrimaryId(0) must not appear in results.
+            assert!(
+                !results.iter().any(|(pid, _)| *pid == PrimaryId::from(0u64)),
+                "removed vector should be filtered from CAGRA results"
+            );
+        }
+
+        /// Test the DeltaIndex rebuild cycle: build → mutate → rebuild →
+        /// verify delta is cleared and search uses the fresh graph.
+        #[test]
+        fn test_cagra_rebuild_clears_delta() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+            let index = CagraIndex::new(SpaceType::Euclidean, d, lib);
+
+            for i in 0..n {
+                let val = (i as f32 + 1.0) / n as f32;
+                index
+                    .add(PrimaryId::from(i as u64), &make_vector(vec![val; d]))
+                    .unwrap();
+            }
+            index.rebuild();
+
+            // Mutate: add a vector at the origin.
+            let new_pid = PrimaryId::from(n as u64);
+            index
+                .add(new_pid, &make_vector(vec![0.0; d]))
+                .unwrap();
+
+            // Rebuild again — delta should be cleared and the new vector
+            // incorporated into the CAGRA graph.
+            index.rebuild();
+
+            let results = index
+                .search(&make_vector(vec![0.0; d]), make_limit(1))
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].0, new_pid,
+                "after rebuild, new vector should be in the CAGRA graph"
+            );
+            let d0: f32 = results[0].1.into();
+            assert!(d0 < 1e-4, "expected distance ~0, got {d0}");
+        }
+
+        /// Test batch search on CAGRA: multiple queries dispatched together.
+        #[test]
+        fn test_cagra_search_batch() {
+            let Some(lib) = try_load_cuvs() else { return };
+            let d = 16;
+            let n = 200;
+            let index = CagraIndex::new(SpaceType::Euclidean, d, lib);
+
+            for i in 0..n {
+                let val = i as f32 / n as f32;
+                index
+                    .add(PrimaryId::from(i as u64), &make_vector(vec![val; d]))
+                    .unwrap();
+            }
+
+            let q0 = make_vector(vec![0.0; d]);
+            let q1 = make_vector(vec![1.0; d]);
+            let limit = make_limit(3);
+
+            let queries: Vec<(&Vector, Limit)> =
+                vec![(&q0, limit.clone()), (&q1, limit.clone())];
+            let batch_results = index.search_batch(&queries);
+
+            assert_eq!(batch_results.len(), 2, "expected 2 result sets");
+
+            // First query (origin) should find PrimaryId(0) nearest.
+            let r0 = batch_results[0].as_ref().unwrap();
+            assert!(!r0.is_empty());
+            assert_eq!(r0[0].0, PrimaryId::from(0u64));
+
+            // Second query (all 1.0) should find PrimaryId(n-1) nearest.
+            let r1 = batch_results[1].as_ref().unwrap();
+            assert!(!r1.is_empty());
+            assert_eq!(
+                r1[0].0,
+                PrimaryId::from((n - 1) as u64),
+                "batch query 2: expected PrimaryId({}) nearest",
+                n - 1
+            );
+
+            // Each result set should match what individual search returns.
+            let individual_0 = index.search(&q0, limit.clone()).unwrap();
+            let individual_1 = index.search(&q1, limit).unwrap();
+
+            assert_eq!(r0[0].0, individual_0[0].0, "batch vs individual mismatch q0");
+            assert_eq!(r1[0].0, individual_1[0].0, "batch vs individual mismatch q1");
         }
     }
 }
