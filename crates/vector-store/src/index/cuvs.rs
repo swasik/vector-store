@@ -545,100 +545,267 @@ fn new(
                             }
 
                             // When search_batch_timeout is non-zero, wait
-                            // briefly to accumulate more concurrent searches
-                            // into a single GPU batch.
+                            // up to `search_batch_timeout` to accumulate more
+                            // concurrent searches into a single GPU batch.
+                            // Uses select! so we process messages as they
+                            // arrive (no idle sleep when work is available).
                             if !search_batch_timeout.is_zero() {
                                 let deadline =
                                     tokio::time::Instant::now() + search_batch_timeout;
                                 loop {
-                                    tokio::time::sleep_until(deadline).await;
-                                    let mut got_more = false;
-                                    while let Ok(next_msg) = rx.try_recv() {
-                                        let Some((ns, np, nm)) = preprocess(
-                                            space_type,
-                                            &mut states,
-                                            &mut partitions,
-                                            table.as_ref(),
-                                            dimensions,
-                                            next_msg,
-                                        ) else {
-                                            continue;
-                                        };
-                                        got_more = true;
-                                        match nm {
-                                            m @ (Index::Ann { .. }
-                                            | Index::FilteredAnn { .. }) => {
-                                                search_items.push((
-                                                    ns.dimensions,
-                                                    np,
-                                                    m,
-                                                ));
-                                            }
-                                            Index::AddVector {
-                                                primary_id,
-                                                embedding,
-                                                in_progress,
-                                                ..
-                                            } => {
-                                                pending.push(PendingMutation {
-                                                    partition: np,
-                                                    size: Arc::clone(&ns.size),
-                                                    op: MutationOp::Add {
+                                    tokio::select! {
+                                        biased;
+                                        _ = tokio::time::sleep_until(deadline) => {
+                                            // Deadline reached — drain any
+                                            // remaining messages and stop.
+                                            while let Ok(next_msg) = rx.try_recv() {
+                                                let Some((ns, np, nm)) = preprocess(
+                                                    space_type,
+                                                    &mut states,
+                                                    &mut partitions,
+                                                    table.as_ref(),
+                                                    dimensions,
+                                                    next_msg,
+                                                ) else {
+                                                    continue;
+                                                };
+                                                match nm {
+                                                    m @ (Index::Ann { .. }
+                                                    | Index::FilteredAnn { .. }) => {
+                                                        search_items.push((
+                                                            ns.dimensions,
+                                                            np,
+                                                            m,
+                                                        ));
+                                                    }
+                                                    Index::AddVector {
                                                         primary_id,
                                                         embedding,
-                                                        _in_progress: in_progress,
-                                                    },
-                                                });
-                                                if flush_deadline.is_none() {
-                                                    flush_deadline = Some(
-                                                        tokio::time::Instant::now()
-                                                            + batch_timeout,
-                                                    );
-                                                }
-                                                if pending.len() >= batch_size {
-                                                    flush_batch(
-                                                        &mut pending,
-                                                        &tokio_semaphore,
-                                                    )
-                                                    .await;
-                                                    flush_deadline = None;
-                                                }
-                                            }
-                                            Index::RemoveVector {
-                                                primary_id,
-                                                in_progress,
-                                                ..
-                                            } => {
-                                                pending.push(PendingMutation {
-                                                    partition: np,
-                                                    size: Arc::clone(&ns.size),
-                                                    op: MutationOp::Remove {
+                                                        in_progress,
+                                                        ..
+                                                    } => {
+                                                        pending.push(PendingMutation {
+                                                            partition: np,
+                                                            size: Arc::clone(&ns.size),
+                                                            op: MutationOp::Add {
+                                                                primary_id,
+                                                                embedding,
+                                                                _in_progress: in_progress,
+                                                            },
+                                                        });
+                                                        if flush_deadline.is_none() {
+                                                            flush_deadline = Some(
+                                                                tokio::time::Instant::now()
+                                                                    + batch_timeout,
+                                                            );
+                                                        }
+                                                        if pending.len() >= batch_size {
+                                                            flush_batch(
+                                                                &mut pending,
+                                                                &tokio_semaphore,
+                                                            )
+                                                            .await;
+                                                            flush_deadline = None;
+                                                        }
+                                                    }
+                                                    Index::RemoveVector {
                                                         primary_id,
-                                                        _in_progress: in_progress,
-                                                    },
-                                                });
-                                                if flush_deadline.is_none() {
-                                                    flush_deadline = Some(
-                                                        tokio::time::Instant::now()
-                                                            + batch_timeout,
-                                                    );
-                                                }
-                                                if pending.len() >= batch_size {
-                                                    flush_batch(
-                                                        &mut pending,
-                                                        &tokio_semaphore,
-                                                    )
-                                                    .await;
-                                                    flush_deadline = None;
+                                                        in_progress,
+                                                        ..
+                                                    } => {
+                                                        pending.push(PendingMutation {
+                                                            partition: np,
+                                                            size: Arc::clone(&ns.size),
+                                                            op: MutationOp::Remove {
+                                                                primary_id,
+                                                                _in_progress: in_progress,
+                                                            },
+                                                        });
+                                                        if flush_deadline.is_none() {
+                                                            flush_deadline = Some(
+                                                                tokio::time::Instant::now()
+                                                                    + batch_timeout,
+                                                            );
+                                                        }
+                                                        if pending.len() >= batch_size {
+                                                            flush_batch(
+                                                                &mut pending,
+                                                                &tokio_semaphore,
+                                                            )
+                                                            .await;
+                                                            flush_deadline = None;
+                                                        }
+                                                    }
+                                                    _ => unreachable!("handled by preprocess"),
                                                 }
                                             }
-                                            _ => unreachable!("handled by preprocess"),
+                                            break;
                                         }
-                                    }
-                                    if !got_more
-                                        || tokio::time::Instant::now() >= deadline
-                                    {
-                                        break;
+                                        next_msg = rx.recv() => {
+                                            let Some(next_msg) = next_msg else { break };
+                                            let Some((ns, np, nm)) = preprocess(
+                                                space_type,
+                                                &mut states,
+                                                &mut partitions,
+                                                table.as_ref(),
+                                                dimensions,
+                                                next_msg,
+                                            ) else {
+                                                continue;
+                                            };
+                                            match nm {
+                                                m @ (Index::Ann { .. }
+                                                | Index::FilteredAnn { .. }) => {
+                                                    search_items.push((
+                                                        ns.dimensions,
+                                                        np,
+                                                        m,
+                                                    ));
+                                                }
+                                                Index::AddVector {
+                                                    primary_id,
+                                                    embedding,
+                                                    in_progress,
+                                                    ..
+                                                } => {
+                                                    pending.push(PendingMutation {
+                                                        partition: np,
+                                                        size: Arc::clone(&ns.size),
+                                                        op: MutationOp::Add {
+                                                            primary_id,
+                                                            embedding,
+                                                            _in_progress: in_progress,
+                                                        },
+                                                    });
+                                                    if flush_deadline.is_none() {
+                                                        flush_deadline = Some(
+                                                            tokio::time::Instant::now()
+                                                                + batch_timeout,
+                                                        );
+                                                    }
+                                                    if pending.len() >= batch_size {
+                                                        flush_batch(
+                                                            &mut pending,
+                                                            &tokio_semaphore,
+                                                        )
+                                                        .await;
+                                                        flush_deadline = None;
+                                                    }
+                                                }
+                                                Index::RemoveVector {
+                                                    primary_id,
+                                                    in_progress,
+                                                    ..
+                                                } => {
+                                                    pending.push(PendingMutation {
+                                                        partition: np,
+                                                        size: Arc::clone(&ns.size),
+                                                        op: MutationOp::Remove {
+                                                            primary_id,
+                                                            _in_progress: in_progress,
+                                                        },
+                                                    });
+                                                    if flush_deadline.is_none() {
+                                                        flush_deadline = Some(
+                                                            tokio::time::Instant::now()
+                                                                + batch_timeout,
+                                                        );
+                                                    }
+                                                    if pending.len() >= batch_size {
+                                                        flush_batch(
+                                                            &mut pending,
+                                                            &tokio_semaphore,
+                                                        )
+                                                        .await;
+                                                        flush_deadline = None;
+                                                    }
+                                                }
+                                                _ => unreachable!("handled by preprocess"),
+                                            }
+                                            // After processing, also drain any
+                                            // immediately-available messages.
+                                            while let Ok(next_msg) = rx.try_recv() {
+                                                let Some((ns, np, nm)) = preprocess(
+                                                    space_type,
+                                                    &mut states,
+                                                    &mut partitions,
+                                                    table.as_ref(),
+                                                    dimensions,
+                                                    next_msg,
+                                                ) else {
+                                                    continue;
+                                                };
+                                                match nm {
+                                                    m @ (Index::Ann { .. }
+                                                    | Index::FilteredAnn { .. }) => {
+                                                        search_items.push((
+                                                            ns.dimensions,
+                                                            np,
+                                                            m,
+                                                        ));
+                                                    }
+                                                    Index::AddVector {
+                                                        primary_id,
+                                                        embedding,
+                                                        in_progress,
+                                                        ..
+                                                    } => {
+                                                        pending.push(PendingMutation {
+                                                            partition: np,
+                                                            size: Arc::clone(&ns.size),
+                                                            op: MutationOp::Add {
+                                                                primary_id,
+                                                                embedding,
+                                                                _in_progress: in_progress,
+                                                            },
+                                                        });
+                                                        if flush_deadline.is_none() {
+                                                            flush_deadline = Some(
+                                                                tokio::time::Instant::now()
+                                                                    + batch_timeout,
+                                                            );
+                                                        }
+                                                        if pending.len() >= batch_size {
+                                                            flush_batch(
+                                                                &mut pending,
+                                                                &tokio_semaphore,
+                                                            )
+                                                            .await;
+                                                            flush_deadline = None;
+                                                        }
+                                                    }
+                                                    Index::RemoveVector {
+                                                        primary_id,
+                                                        in_progress,
+                                                        ..
+                                                    } => {
+                                                        pending.push(PendingMutation {
+                                                            partition: np,
+                                                            size: Arc::clone(&ns.size),
+                                                            op: MutationOp::Remove {
+                                                                primary_id,
+                                                                _in_progress: in_progress,
+                                                            },
+                                                        });
+                                                        if flush_deadline.is_none() {
+                                                            flush_deadline = Some(
+                                                                tokio::time::Instant::now()
+                                                                    + batch_timeout,
+                                                            );
+                                                        }
+                                                        if pending.len() >= batch_size {
+                                                            flush_batch(
+                                                                &mut pending,
+                                                                &tokio_semaphore,
+                                                            )
+                                                            .await;
+                                                            flush_deadline = None;
+                                                        }
+                                                    }
+                                                    _ => unreachable!("handled by preprocess"),
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
