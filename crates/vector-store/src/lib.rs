@@ -87,6 +87,7 @@ pub struct Config {
     pub cuvs_batch_size: Option<usize>,
     pub cuvs_batch_timeout: Option<Duration>,
     pub cuvs_channel_size: Option<usize>,
+    pub cuvs_search_batch_timeout: Option<Duration>,
     pub usearch_simulator: Option<Vec<Duration>>,
     pub cql_keepalive_interval: Option<Duration>,
     pub cql_keepalive_timeout: Option<Duration>,
@@ -115,6 +116,7 @@ impl Default for Config {
             cuvs_batch_size: None,
             cuvs_batch_timeout: None,
             cuvs_channel_size: None,
+            cuvs_search_batch_timeout: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,
@@ -705,6 +707,7 @@ pub fn new_index_factory_cuvs(
         batch_size: config.cuvs_batch_size.unwrap_or(1024),
         batch_timeout: config.cuvs_batch_timeout.unwrap_or(Duration::from_millis(5)),
         channel_size: config.cuvs_channel_size.unwrap_or(128),
+        search_batch_timeout: config.cuvs_search_batch_timeout.unwrap_or(Duration::ZERO),
     };
     Ok(Box::new(index::cuvs::new_cuvs(tokio_semaphore, batch_config)))
 }

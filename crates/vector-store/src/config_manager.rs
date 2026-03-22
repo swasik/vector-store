@@ -304,6 +304,12 @@ where
             anyhow!("Unable to parse VECTOR_STORE_CUVS_CHANNEL_SIZE: {err}")
         })?);
     }
+    if let Ok(val) = env("VECTOR_STORE_CUVS_SEARCH_BATCH_TIMEOUT_US") {
+        let us: u64 = val.parse().map_err(|err| {
+            anyhow!("Unable to parse VECTOR_STORE_CUVS_SEARCH_BATCH_TIMEOUT_US: {err}")
+        })?;
+        config.cuvs_search_batch_timeout = Some(Duration::from_micros(us));
+    }
 
     config.usearch_simulator = env("VECTOR_STORE_USEARCH_SIMULATOR")
         .ok()
@@ -554,6 +560,7 @@ mod tests {
             cuvs_batch_size: None,
             cuvs_batch_timeout: None,
             cuvs_channel_size: None,
+            cuvs_search_batch_timeout: None,
             usearch_simulator: None,
             disable_colors: false,
             tls_cert_path: None,

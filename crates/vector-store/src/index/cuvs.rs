@@ -201,16 +201,22 @@ fn compute_distance(a: &[f32], b: &[f32], space_type: SpaceType) -> anyhow::Resu
     }
 }
 
-/// Configuration for batching mutations before dispatching to the index.
+/// Configuration for batching mutations and searches before dispatching to the index.
 ///
 /// GPU-accelerated backends achieve peak throughput when operations are batched
 /// into a single kernel launch. Mutations are accumulated until either
 /// `batch_size` is reached or `batch_timeout` elapses, then flushed together
 /// in one blocking task.
+///
+/// `search_batch_timeout` controls how long the actor waits after receiving
+/// the first search request to accumulate additional concurrent searches
+/// before dispatching them as a single GPU batch. `Duration::ZERO` disables
+/// accumulation (searches dispatch immediately after draining the channel).
 pub(crate) struct BatchConfig {
     pub batch_size: usize,
     pub batch_timeout: Duration,
     pub channel_size: usize,
+    pub search_batch_timeout: Duration,
 }
 
 impl Default for BatchConfig {
@@ -219,6 +225,7 @@ impl Default for BatchConfig {
             batch_size: 1024,
             batch_timeout: Duration::from_millis(5),
             channel_size: 128,
+            search_batch_timeout: Duration::ZERO,
         }
     }
 }
@@ -327,12 +334,13 @@ fn new(
     let (tx, mut rx) = mpsc::channel(batch_config.channel_size);
     let batch_size = batch_config.batch_size;
     let batch_timeout = batch_config.batch_timeout;
+    let search_batch_timeout = batch_config.search_batch_timeout;
 
     tokio::spawn(
         {
             let index_key = index_key.clone();
             async move {
-                debug!("starting (batch_size={batch_size}, batch_timeout={batch_timeout:?})");
+                debug!("starting (batch_size={batch_size}, batch_timeout={batch_timeout:?}, search_batch_timeout={search_batch_timeout:?})");
                 let mut states: BTreeMap<IndexId, IndexState> = BTreeMap::new();
                 let mut partitions: BTreeMap<PartitionId, Arc<PartitionState>> = BTreeMap::new();
                 let mut allocate_prev = Allocate::Can;
@@ -533,6 +541,105 @@ fn new(
                                         }
                                     }
                                     _ => unreachable!("handled by preprocess"),
+                                }
+                            }
+
+                            // When search_batch_timeout is non-zero, wait
+                            // briefly to accumulate more concurrent searches
+                            // into a single GPU batch.
+                            if !search_batch_timeout.is_zero() {
+                                let deadline =
+                                    tokio::time::Instant::now() + search_batch_timeout;
+                                loop {
+                                    tokio::time::sleep_until(deadline).await;
+                                    let mut got_more = false;
+                                    while let Ok(next_msg) = rx.try_recv() {
+                                        let Some((ns, np, nm)) = preprocess(
+                                            space_type,
+                                            &mut states,
+                                            &mut partitions,
+                                            table.as_ref(),
+                                            dimensions,
+                                            next_msg,
+                                        ) else {
+                                            continue;
+                                        };
+                                        got_more = true;
+                                        match nm {
+                                            m @ (Index::Ann { .. }
+                                            | Index::FilteredAnn { .. }) => {
+                                                search_items.push((
+                                                    ns.dimensions,
+                                                    np,
+                                                    m,
+                                                ));
+                                            }
+                                            Index::AddVector {
+                                                primary_id,
+                                                embedding,
+                                                in_progress,
+                                                ..
+                                            } => {
+                                                pending.push(PendingMutation {
+                                                    partition: np,
+                                                    size: Arc::clone(&ns.size),
+                                                    op: MutationOp::Add {
+                                                        primary_id,
+                                                        embedding,
+                                                        _in_progress: in_progress,
+                                                    },
+                                                });
+                                                if flush_deadline.is_none() {
+                                                    flush_deadline = Some(
+                                                        tokio::time::Instant::now()
+                                                            + batch_timeout,
+                                                    );
+                                                }
+                                                if pending.len() >= batch_size {
+                                                    flush_batch(
+                                                        &mut pending,
+                                                        &tokio_semaphore,
+                                                    )
+                                                    .await;
+                                                    flush_deadline = None;
+                                                }
+                                            }
+                                            Index::RemoveVector {
+                                                primary_id,
+                                                in_progress,
+                                                ..
+                                            } => {
+                                                pending.push(PendingMutation {
+                                                    partition: np,
+                                                    size: Arc::clone(&ns.size),
+                                                    op: MutationOp::Remove {
+                                                        primary_id,
+                                                        _in_progress: in_progress,
+                                                    },
+                                                });
+                                                if flush_deadline.is_none() {
+                                                    flush_deadline = Some(
+                                                        tokio::time::Instant::now()
+                                                            + batch_timeout,
+                                                    );
+                                                }
+                                                if pending.len() >= batch_size {
+                                                    flush_batch(
+                                                        &mut pending,
+                                                        &tokio_semaphore,
+                                                    )
+                                                    .await;
+                                                    flush_deadline = None;
+                                                }
+                                            }
+                                            _ => unreachable!("handled by preprocess"),
+                                        }
+                                    }
+                                    if !got_more
+                                        || tokio::time::Instant::now() >= deadline
+                                    {
+                                        break;
+                                    }
                                 }
                             }
 
@@ -3122,6 +3229,7 @@ mod tests {
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.batch_timeout, Duration::from_millis(5));
         assert_eq!(config.channel_size, 128);
+        assert_eq!(config.search_batch_timeout, Duration::ZERO);
     }
 
     /// Verify that mutations are flushed when batch_timeout elapses,
