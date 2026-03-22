@@ -35,23 +35,10 @@ up from the old hardcoded 10). Exposed as env var
 
 ---
 
-## Fix #6 — Pre-compute vector norms for brute-force (LOW)
+## ~~Fix #6 — Pre-compute vector norms for brute-force (LOW)~~ ✅ DONE
 
-**Problem:** The CPU brute-force fallback (used when dataset < 128 vectors)
-recomputes `||d_i||²` for every stored vector on every search. The GPU
-brute-force index (`GpuBruteForceIndex`) also computes norms on the CPU
-after the SGEMM.
-
-**Suggested approach:**
-
-1. Maintain a parallel `Vec<f32>` (or `BTreeMap<PrimaryId, f32>`) of
-   pre-computed norms, updated on `add()` / `remove()`.
-2. In `search()`, use the cached norms instead of recomputing them.
-3. For `GpuBruteForceIndex`, upload norms to GPU alongside the dataset so
-   the distance derivation can also run on the GPU (or at least avoid the
-   per-search CPU norm loop).
-
-**Files to modify:**
-
-- `crates/vector-store/src/index/cuvs.rs` — `BruteForceIndex`,
-  `CagraIndex::search_brute_force`, `GpuBruteForceIndex`
+Implemented: all index types (`BruteForceIndex`, `GpuBruteForceIndex`,
+`CagraIndex`/`DeltaIndex`) now store precomputed squared norms (`||v||²`)
+alongside vectors, updated on `add()`/`remove()`. Search paths use cached
+norms instead of recomputing O(d) per stored vector per query. The GPU
+brute-force post-SGEMM distance derivation also uses cached norms.

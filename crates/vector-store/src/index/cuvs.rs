@@ -79,6 +79,8 @@ trait CuvsVectorIndex: Send + Sync {
 #[cfg_attr(feature = "gpu", allow(dead_code))]
 struct BruteForceIndex {
     vectors: RwLock<BTreeMap<PrimaryId, Vec<f32>>>,
+    /// Precomputed squared norms (`||v||²`) for each stored vector.
+    norm_sqs: RwLock<BTreeMap<PrimaryId, f32>>,
     space_type: SpaceType,
 }
 
@@ -87,6 +89,7 @@ impl BruteForceIndex {
     fn new(space_type: SpaceType) -> Self {
         Self {
             vectors: RwLock::new(BTreeMap::new()),
+            norm_sqs: RwLock::new(BTreeMap::new()),
             space_type,
         }
     }
@@ -94,15 +97,21 @@ impl BruteForceIndex {
 
 impl CuvsVectorIndex for BruteForceIndex {
     fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
+        let v = vector.as_ref();
+        self.norm_sqs
+            .write()
+            .unwrap()
+            .insert(primary_id, norm_sq(v));
         self.vectors
             .write()
             .unwrap()
-            .insert(primary_id, vector.as_ref().to_vec());
+            .insert(primary_id, v.to_vec());
         Ok(())
     }
 
     fn remove(&self, primary_id: PrimaryId) -> anyhow::Result<()> {
         self.vectors.write().unwrap().remove(&primary_id);
+        self.norm_sqs.write().unwrap().remove(&primary_id);
         Ok(())
     }
 
@@ -112,12 +121,19 @@ impl CuvsVectorIndex for BruteForceIndex {
         limit: Limit,
     ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
         let vectors = self.vectors.read().unwrap();
+        let norm_sqs_map = self.norm_sqs.read().unwrap();
         let query = vector.as_ref();
+        let query_norm = norm_sq(query).sqrt();
 
         let mut results: Vec<(PrimaryId, Distance)> = vectors
             .iter()
             .map(|(&id, stored)| {
-                compute_distance(query, stored, self.space_type).map(|dist| (id, dist))
+                let stored_nsq = norm_sqs_map
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(|| norm_sq(stored));
+                compute_distance_cached(query, query_norm, stored, stored_nsq, self.space_type)
+                    .map(|dist| (id, dist))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -193,6 +209,47 @@ fn compute_distance(a: &[f32], b: &[f32], space_type: SpaceType) -> anyhow::Resu
         SpaceType::DotProduct => {
             let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
             // Inner product distance, matching usearch convention: distance = 1 - dot
+            Distance::new_dot_product(1.0 - dot)
+        }
+        SpaceType::Hamming => {
+            anyhow::bail!("cuVS backend does not support Hamming distance")
+        }
+    }
+}
+
+/// Squared L2 norm of a vector: `sum(x_i²)`.
+#[cfg_attr(feature = "gpu", allow(dead_code))]
+fn norm_sq(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum()
+}
+
+/// Compute distance using a precomputed query norm and stored-vector squared
+/// norm. For cosine this avoids the O(d) norm recomputation per stored vector.
+#[cfg_attr(feature = "gpu", allow(dead_code))]
+fn compute_distance_cached(
+    query: &[f32],
+    query_norm: f32,
+    stored: &[f32],
+    stored_norm_sq: f32,
+    space_type: SpaceType,
+) -> anyhow::Result<Distance> {
+    match space_type {
+        SpaceType::Euclidean => {
+            let sum: f32 = query.iter().zip(stored).map(|(x, y)| (x - y) * (x - y)).sum();
+            Distance::new_euclidean(sum)
+        }
+        SpaceType::Cosine => {
+            let dot: f32 = query.iter().zip(stored).map(|(x, y)| x * y).sum();
+            let norm_b = stored_norm_sq.sqrt();
+            let cos_sim = if query_norm == 0.0 || norm_b == 0.0 {
+                0.0
+            } else {
+                dot / (query_norm * norm_b)
+            };
+            Distance::new_cosine(1.0 - cos_sim)
+        }
+        SpaceType::DotProduct => {
+            let dot: f32 = query.iter().zip(stored).map(|(x, y)| x * y).sum();
             Distance::new_dot_product(1.0 - dot)
         }
         SpaceType::Hamming => {
@@ -1312,6 +1369,8 @@ mod gpu {
     /// back, and derives final distances on the CPU.
     pub(super) struct GpuBruteForceIndex {
         vectors: RwLock<BTreeMap<PrimaryId, Vec<f32>>>,
+        /// Precomputed squared norms (`||v||²`) for each stored vector.
+        norm_sqs: RwLock<BTreeMap<PrimaryId, f32>>,
         space_type: SpaceType,
         dimensions: usize,
         /// Cached CUDA context, created once on first search and reused.
@@ -1322,6 +1381,7 @@ mod gpu {
         pub fn new(space_type: SpaceType, dimensions: usize) -> Self {
             Self {
                 vectors: RwLock::new(BTreeMap::new()),
+                norm_sqs: RwLock::new(BTreeMap::new()),
                 space_type,
                 dimensions,
                 cuda_ctx: OnceLock::new(),
@@ -1347,15 +1407,21 @@ mod gpu {
 
     impl CuvsVectorIndex for GpuBruteForceIndex {
         fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
+            let v = vector.as_ref();
+            self.norm_sqs
+                .write()
+                .unwrap()
+                .insert(primary_id, norm_sq(v));
             self.vectors
                 .write()
                 .unwrap()
-                .insert(primary_id, vector.as_ref().to_vec());
+                .insert(primary_id, v.to_vec());
             Ok(())
         }
 
         fn remove(&self, primary_id: PrimaryId) -> anyhow::Result<()> {
             self.vectors.write().unwrap().remove(&primary_id);
+            self.norm_sqs.write().unwrap().remove(&primary_id);
             Ok(())
         }
 
@@ -1374,12 +1440,21 @@ mod gpu {
             let k = limit.0.get().min(n);
 
             // Build contiguous dataset row-major [n, d] and PrimaryId map.
+            let norm_sqs_map = self.norm_sqs.read().unwrap();
             let mut flat = Vec::with_capacity(n * d);
             let mut ids: Vec<PrimaryId> = Vec::with_capacity(n);
+            let mut cached_norm_sqs: Vec<f32> = Vec::with_capacity(n);
             for (&pid, v) in vectors.iter() {
                 flat.extend_from_slice(v);
                 ids.push(pid);
+                cached_norm_sqs.push(
+                    norm_sqs_map
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or_else(|| norm_sq(v)),
+                );
             }
+            drop(norm_sqs_map);
             drop(vectors);
 
             let query = vector.as_ref();
@@ -1442,9 +1517,7 @@ mod gpu {
                     let q_norm_sq: f32 = query.iter().map(|x| x * x).sum();
                     (0..n)
                         .map(|i| {
-                            let d_norm_sq: f32 =
-                                flat[i * d..(i + 1) * d].iter().map(|x| x * x).sum();
-                            (i, q_norm_sq + d_norm_sq - 2.0 * inner_products[i])
+                            (i, q_norm_sq + cached_norm_sqs[i] - 2.0 * inner_products[i])
                         })
                         .collect()
                 }
@@ -1453,11 +1526,7 @@ mod gpu {
                     let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
                     (0..n)
                         .map(|i| {
-                            let d_norm: f32 = flat[i * d..(i + 1) * d]
-                                .iter()
-                                .map(|x| x * x)
-                                .sum::<f32>()
-                                .sqrt();
+                            let d_norm = cached_norm_sqs[i].sqrt();
                             let dist = if q_norm == 0.0 || d_norm == 0.0 {
                                 1.0
                             } else {
@@ -1840,6 +1909,8 @@ mod gpu {
     struct DeltaIndex {
         /// Vectors added (or updated) since the last CAGRA build.
         added: BTreeMap<PrimaryId, Vec<f32>>,
+        /// Precomputed squared norms for delta-added vectors.
+        added_norm_sqs: BTreeMap<PrimaryId, f32>,
         /// PrimaryIds whose CAGRA-graph entry is stale (removed or
         /// replaced). These must be filtered out of CAGRA results.
         removed: HashSet<PrimaryId>,
@@ -1849,6 +1920,7 @@ mod gpu {
         fn new() -> Self {
             Self {
                 added: BTreeMap::new(),
+                added_norm_sqs: BTreeMap::new(),
                 removed: HashSet::new(),
             }
         }
@@ -1878,6 +1950,8 @@ mod gpu {
     pub(super) struct CagraIndex {
         /// Canonical store of all vectors, keyed by PrimaryId.
         vectors: RwLock<BTreeMap<PrimaryId, Vec<f32>>>,
+        /// Precomputed squared norms (`||v||²`) for the canonical store.
+        norm_sqs: RwLock<BTreeMap<PrimaryId, f32>>,
         space_type: SpaceType,
         dimensions: usize,
         /// Loaded cuVS library handle (shared across all CagraIndex instances).
@@ -1903,6 +1977,8 @@ mod gpu {
         flat: Vec<f32>,
         /// Ordered PrimaryId for each row.
         ids: Vec<PrimaryId>,
+        /// Precomputed squared norms, parallel to `ids`.
+        norm_sqs: Vec<f32>,
         /// cuVS resources handle (CUDA stream) used for build.
         /// Kept alive because the CAGRA graph may reference memory allocated
         /// on this stream's memory pool.
@@ -1949,6 +2025,7 @@ mod gpu {
         ) -> Self {
             Self {
                 vectors: RwLock::new(BTreeMap::new()),
+                norm_sqs: RwLock::new(BTreeMap::new()),
                 space_type,
                 dimensions,
                 lib,
@@ -2261,17 +2338,25 @@ mod gpu {
             query: &[f32],
             flat: &[f32],
             ids: &[PrimaryId],
+            cached_norm_sqs: &[f32],
             k: usize,
         ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
             let d = self.dimensions;
             let n = ids.len();
+            let query_norm = norm_sq(query).sqrt();
 
             let mut scored: Vec<(usize, f32)> = (0..n)
                 .map(|i| {
                     let row = &flat[i * d..(i + 1) * d];
-                    let dist = compute_distance(query, row, self.space_type)
-                        .map(|d| -> f32 { d.into() })
-                        .unwrap_or(f32::MAX);
+                    let dist = compute_distance_cached(
+                        query,
+                        query_norm,
+                        row,
+                        cached_norm_sqs[i],
+                        self.space_type,
+                    )
+                    .map(|d| -> f32 { d.into() })
+                    .unwrap_or(f32::MAX);
                     (i, dist)
                 })
                 .collect();
@@ -2306,15 +2391,24 @@ mod gpu {
             let _build_guard = self.build_lock.lock().unwrap();
 
             let vectors = self.vectors.read().unwrap();
+            let norm_sqs_map = self.norm_sqs.read().unwrap();
             let n = vectors.len();
             let d = self.dimensions;
 
             let mut flat = Vec::with_capacity(n * d);
             let mut ids = Vec::with_capacity(n);
+            let mut build_norm_sqs = Vec::with_capacity(n);
             for (&pid, v) in vectors.iter() {
                 flat.extend_from_slice(v);
                 ids.push(pid);
+                build_norm_sqs.push(
+                    norm_sqs_map
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or_else(|| norm_sq(v)),
+                );
             }
+            drop(norm_sqs_map);
             drop(vectors);
 
             let (res, index_ptr) = if n >= MIN_CAGRA_BUILD_SIZE {
@@ -2340,6 +2434,7 @@ mod gpu {
             *self.cached_build.write().unwrap() = Some(CagraCachedBuild {
                 flat,
                 ids,
+                norm_sqs: build_norm_sqs,
                 res,
                 index_ptr,
                 lib: Arc::clone(&self.lib),
@@ -2357,13 +2452,25 @@ mod gpu {
             if delta.added.is_empty() {
                 return Ok(vec![]);
             }
+            let query_norm = norm_sq(query).sqrt();
             let mut scored: Vec<(PrimaryId, f32)> = delta
                 .added
                 .iter()
                 .map(|(&pid, v)| {
-                    let dist = compute_distance(query, v, self.space_type)
-                        .map(|d| -> f32 { d.into() })
-                        .unwrap_or(f32::MAX);
+                    let nsq = delta
+                        .added_norm_sqs
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or_else(|| norm_sq(v));
+                    let dist = compute_distance_cached(
+                        query,
+                        query_norm,
+                        v,
+                        nsq,
+                        self.space_type,
+                    )
+                    .map(|d| -> f32 { d.into() })
+                    .unwrap_or(f32::MAX);
                     (pid, dist)
                 })
                 .collect();
@@ -2396,6 +2503,7 @@ mod gpu {
             k: usize,
         ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
             let vectors = self.vectors.read().unwrap();
+            let norm_sqs_map = self.norm_sqs.read().unwrap();
             let n = vectors.len();
             if n == 0 || k == 0 {
                 return Ok(vec![]);
@@ -2403,12 +2511,20 @@ mod gpu {
             let d = self.dimensions;
             let mut flat = Vec::with_capacity(n * d);
             let mut ids = Vec::with_capacity(n);
+            let mut bf_norm_sqs = Vec::with_capacity(n);
             for (&pid, v) in vectors.iter() {
                 flat.extend_from_slice(v);
                 ids.push(pid);
+                bf_norm_sqs.push(
+                    norm_sqs_map
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or_else(|| norm_sq(v)),
+                );
             }
+            drop(norm_sqs_map);
             drop(vectors);
-            self.search_brute_force(query, &flat, &ids, k.min(n))
+            self.search_brute_force(query, &flat, &ids, &bf_norm_sqs, k.min(n))
         }
 
         /// Multi-query CAGRA search: runs all queries in a single GPU kernel.
@@ -2590,10 +2706,13 @@ mod gpu {
     impl CuvsVectorIndex for CagraIndex {
         fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
             let v = vector.as_ref().to_vec();
+            let nsq = norm_sq(&v);
+            self.norm_sqs.write().unwrap().insert(primary_id, nsq);
             self.vectors.write().unwrap().insert(primary_id, v.clone());
             // Track the mutation in the delta so searches can merge it
             // with the (potentially stale) CAGRA graph.
             let mut delta = self.delta.write().unwrap();
+            delta.added_norm_sqs.insert(primary_id, nsq);
             delta.added.insert(primary_id, v);
             // Mark the old CAGRA entry (if any) as stale.
             delta.removed.insert(primary_id);
@@ -2602,8 +2721,10 @@ mod gpu {
 
         fn remove(&self, primary_id: PrimaryId) -> anyhow::Result<()> {
             self.vectors.write().unwrap().remove(&primary_id);
+            self.norm_sqs.write().unwrap().remove(&primary_id);
             let mut delta = self.delta.write().unwrap();
             delta.added.remove(&primary_id);
+            delta.added_norm_sqs.remove(&primary_id);
             delta.removed.insert(primary_id);
             Ok(())
         }
@@ -2647,6 +2768,7 @@ mod gpu {
                         query,
                         &cached.flat,
                         &cached.ids,
+                        &cached.norm_sqs,
                         k,
                     );
                 }
@@ -2669,6 +2791,7 @@ mod gpu {
                         query,
                         &cached.flat,
                         &cached.ids,
+                        &cached.norm_sqs,
                         cagra_k,
                     )?
                 } else {
@@ -2738,6 +2861,7 @@ mod gpu {
                                 v.as_ref(),
                                 &cached.flat,
                                 &cached.ids,
+                                &cached.norm_sqs,
                                 k,
                             )
                         })
@@ -2836,6 +2960,7 @@ mod gpu {
                                         q,
                                         &cached.flat,
                                         &cached.ids,
+                                        &cached.norm_sqs,
                                         cagra_k,
                                     )?
                                 } else {
