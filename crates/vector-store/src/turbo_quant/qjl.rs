@@ -112,7 +112,12 @@ impl QjlProjection {
     }
 
     /// Compute QJL inner product correction term:
-    ///   (π/2) / d · γ · Σ_j sign_j · projected_query_j
+    ///   √(π/2) / d · γ · Σ_j sign_j · projected_query_j
+    ///
+    /// Fix C: The scaling factor is √(π/2)/d, not (π/2)/d.
+    /// For jointly Gaussian U = S·(r/γ), V = S·q':
+    ///   E[sign(U)·V] = √(2/π) · Cov(U,V)
+    /// so the unbiased estimator of ⟨r, q'⟩ requires √(π/2) correction.
     ///
     /// `signs`: packed sign bits from `quantize()` (ceil(d/8) bytes)
     /// `projected_query`: output of `project_query()` (d floats)
@@ -131,8 +136,8 @@ impl QjlProjection {
             dot_sum += sign_val * pq;
         }
 
-        // (π/2) / d · γ · dot_sum
-        (std::f32::consts::FRAC_PI_2 / d as f32) * gamma * dot_sum
+        // √(π/2) / d · γ · dot_sum
+        ((std::f32::consts::PI / 2.0_f32).sqrt() / d as f32) * gamma * dot_sum
     }
 }
 

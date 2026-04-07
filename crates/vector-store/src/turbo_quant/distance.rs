@@ -35,15 +35,16 @@ impl Tq4Quantizer {
     /// O(d log d) for rotation + O(d²) for QJL projection.
     /// Called once per search, amortized across all candidates.
     pub fn prepare_query(&self, query: &[f32]) -> Tq4QueryState {
-        let d = self.dimension();
+        let d_pad = self.padded_dim();
 
         // Query norm
         let query_norm: f32 = query.iter().map(|v| v * v).sum::<f32>().sqrt();
 
         // Rotate query (NOT normalized — raw query is rotated so that
         // the MSE dot product preserves the ‖q‖ factor)
-        let mut rotated_query = vec![0.0f32; d];
-        self.rotation().forward(query, &mut rotated_query);
+        // Fix B: full padded output for norm-preserving distance computation.
+        let mut rotated_query = vec![0.0f32; d_pad];
+        self.rotation().forward_padded(query, &mut rotated_query);
 
         // Project rotated query through QJL matrix: S · q'
         let projected_query = self.qjl().project_query(&rotated_query);
@@ -65,12 +66,12 @@ impl Tq4Quantizer {
         query_state: &Tq4QueryState,
         compressed: &Tq4CompressedVector,
     ) -> f32 {
-        let d = self.dimension();
+        let d_pad = self.padded_dim();
         let inv_sqrt_d = self.inv_sqrt_d();
 
         // MSE term: Σ_j centroid[idx_j] · rotated_query[j]
         let mut mse_ip = 0.0f32;
-        for j in 0..d {
+        for j in 0..d_pad {
             let idx = codebook::extract_3bit_index(&compressed.mse_indices, j);
             let centroid_val = CENTROIDS_3BIT[idx as usize] * inv_sqrt_d;
             mse_ip += centroid_val * query_state.rotated_query[j];
@@ -197,6 +198,7 @@ mod tests {
     fn symmetric_distance_self() {
         let d = 768;
         let quantizer = Tq4Quantizer::new(d, 42, 137);
+        let d_pad = quantizer.padded_dim();
         let inv_sqrt_d = quantizer.inv_sqrt_d();
         let cross_table = cross_product_table_3bit(inv_sqrt_d);
 
@@ -209,7 +211,7 @@ mod tests {
         let packed = compressed.pack();
 
         // Self-distance should approximate ‖x‖²
-        let ip = tq4_symmetric_distance(&packed, &packed, d, &cross_table);
+        let ip = tq4_symmetric_distance(&packed, &packed, d_pad, &cross_table);
         let expected = norm * norm;
         let rel_err = (ip - expected).abs() / expected;
         assert!(

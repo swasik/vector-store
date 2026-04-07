@@ -49,9 +49,13 @@ impl Tq4CompressedVector {
     }
 
     /// Unpack from a contiguous byte array retrieved via USearch::get().
+    ///
+    /// `dimension` here is the original vector dimension; internally pads to
+    /// next power of 2 for TQ4 encoding.
     pub fn unpack(bytes: &[u8], dimension: usize) -> Self {
-        let mse_len = (dimension * 3).div_ceil(8);
-        let qjl_len = dimension.div_ceil(8);
+        let d_pad = dimension.next_power_of_two();
+        let mse_len = (d_pad * 3).div_ceil(8);
+        let qjl_len = d_pad.div_ceil(8);
 
         let mse_indices = bytes[..mse_len].to_vec();
         let qjl_signs = bytes[mse_len..mse_len + qjl_len].to_vec();
@@ -71,9 +75,12 @@ impl Tq4CompressedVector {
     }
 
     /// Expected packed size in bytes for a given dimension.
+    ///
+    /// Internally pads to next power of 2 for TQ4 encoding.
     pub fn packed_size(dimension: usize) -> usize {
-        let mse_len = (dimension * 3).div_ceil(8);
-        let qjl_len = dimension.div_ceil(8);
+        let d_pad = dimension.next_power_of_two();
+        let mse_len = (d_pad * 3).div_ceil(8);
+        let qjl_len = d_pad.div_ceil(8);
         mse_len + qjl_len + 8
     }
 }
@@ -85,8 +92,11 @@ impl Tq4CompressedVector {
 pub struct Tq4Quantizer {
     rotation: RotationMatrix,
     qjl: QjlProjection,
+    /// Original vector dimension d.
     dimension: usize,
-    /// 1/√d_pad for codebook scaling (see plan §2.4 normalization note).
+    /// Padded dimension d_pad = d.next_power_of_two().
+    padded_dim: usize,
+    /// 1/√d for codebook scaling.
     inv_sqrt_d: f32,
 }
 
@@ -97,25 +107,35 @@ impl Tq4Quantizer {
     /// same seeds always produce the same quantizer state.
     pub fn new(dimension: usize, rotation_seed: u64, qjl_seed: u64) -> Self {
         let rotation = RotationMatrix::from_seed(dimension, rotation_seed);
-        let qjl = QjlProjection::from_seed(dimension, qjl_seed);
-        // Use 1/√d_pad for codebook scaling (matches Hadamard output variance).
         let d_pad = rotation.padded_dim();
-        let inv_sqrt_d = 1.0 / (d_pad as f32).sqrt();
+        // QJL operates in padded space (d_pad dimensions) for norm preservation.
+        let qjl = QjlProjection::from_seed(d_pad, qjl_seed);
+        // Codebook scaling uses 1/√d (original dimension).
+        // Even though forward_padded outputs d_pad coordinates, the energy is
+        // concentrated in the first d components (zero-padded input), so the
+        // effective per-coordinate variance aligns closer to 1/d than 1/d_pad.
+        let inv_sqrt_d = 1.0 / (dimension as f32).sqrt();
 
         Self {
             rotation,
             qjl,
             dimension,
+            padded_dim: d_pad,
             inv_sqrt_d,
         }
     }
 
-    /// Vector dimension.
+    /// Original vector dimension d.
     pub fn dimension(&self) -> usize {
         self.dimension
     }
 
-    /// 1/√d_pad scaling factor.
+    /// Padded dimension d_pad = d.next_power_of_two().
+    pub fn padded_dim(&self) -> usize {
+        self.padded_dim
+    }
+
+    /// 1/√d scaling factor.
     pub fn inv_sqrt_d(&self) -> f32 {
         self.inv_sqrt_d
     }
@@ -131,6 +151,7 @@ impl Tq4Quantizer {
     /// 6. QJL: qjl_signs = sign(S · (r/γ))
     pub fn quantize(&self, vector: &[f32]) -> Tq4CompressedVector {
         let d = self.dimension;
+        let d_pad = self.padded_dim;
         debug_assert_eq!(vector.len(), d);
 
         // Step 1: Original norm
@@ -139,8 +160,8 @@ impl Tq4Quantizer {
         // Short-circuit for zero vector
         if norm == 0.0 {
             return Tq4CompressedVector {
-                mse_indices: vec![0u8; (d * 3).div_ceil(8)],
-                qjl_signs: vec![0u8; d.div_ceil(8)],
+                mse_indices: vec![0u8; (d_pad * 3).div_ceil(8)],
+                qjl_signs: vec![0u8; d_pad.div_ceil(8)],
                 gamma: 0.0,
                 norm: 0.0,
             };
@@ -150,15 +171,15 @@ impl Tq4Quantizer {
         let inv_norm = 1.0 / norm;
         let normalized: Vec<f32> = vector.iter().map(|v| v * inv_norm).collect();
 
-        // Step 3: Rotate via RHT
-        let mut rotated = vec![0.0f32; d];
-        self.rotation.forward(&normalized, &mut rotated);
+        // Step 3: Rotate via RHT (Fix B: full padded output, no truncation)
+        let mut rotated = vec![0.0f32; d_pad];
+        self.rotation.forward_padded(&normalized, &mut rotated);
 
         // Step 4: Scalar quantize (3-bit codebook)
         let mse_indices = codebook::encode_vector_3bit(&rotated, self.inv_sqrt_d);
 
         // Step 5: Dequantize MSE and compute residual
-        let dequantized = codebook::decode_vector_3bit(&mse_indices, d, self.inv_sqrt_d);
+        let dequantized = codebook::decode_vector_3bit(&mse_indices, d_pad, self.inv_sqrt_d);
         let residual: Vec<f32> = rotated
             .iter()
             .zip(dequantized.iter())
@@ -172,7 +193,7 @@ impl Tq4Quantizer {
             let normalized_residual: Vec<f32> = residual.iter().map(|r| r * inv_gamma).collect();
             self.qjl.quantize(&normalized_residual)
         } else {
-            vec![0u8; d.div_ceil(8)]
+            vec![0u8; d_pad.div_ceil(8)]
         };
 
         Tq4CompressedVector {
@@ -189,21 +210,22 @@ impl Tq4Quantizer {
     /// where ỹ is the codebook reconstruction and Q_qjl⁻¹ is the QJL dequantize.
     pub fn dequantize_f32(&self, compressed: &Tq4CompressedVector) -> Vec<f32> {
         let d = self.dimension;
+        let d_pad = self.padded_dim;
 
-        // Decode MSE codebook values in rotated space
+        // Decode MSE codebook values in padded rotated space
         let mut rotated_approx =
-            codebook::decode_vector_3bit(&compressed.mse_indices, d, self.inv_sqrt_d);
+            codebook::decode_vector_3bit(&compressed.mse_indices, d_pad, self.inv_sqrt_d);
 
-        // Add QJL residual correction: γ · (π/2)/d · S^T · signs
+        // Add QJL residual correction: γ · √(π/2)/d · S^T · signs
         // This is approximate—the full QJL dequantize involves S^T multiplication.
         // For test/debug purposes, we skip the QJL term and return MSE-only.
         // The QJL term is properly applied during inner product estimation.
         let _ = &compressed.qjl_signs;
         let _ = compressed.gamma;
 
-        // Inverse rotate back to original space
+        // Inverse rotate back to original space (d_pad → d)
         let mut result = vec![0.0f32; d];
-        self.rotation.inverse(&rotated_approx, &mut result);
+        self.rotation.inverse_padded(&rotated_approx, &mut result);
 
         // Rescale by original norm
         for v in &mut result {
@@ -256,12 +278,11 @@ mod tests {
     #[test]
     fn packed_size_formula() {
         for d in [768usize, 1024, 1536, 3072] {
-            let expected = (d * 3).div_ceil(8) + d.div_ceil(8) + 8;
+            let d_pad = d.next_power_of_two();
+            let expected = (d_pad * 3).div_ceil(8) + d_pad.div_ceil(8) + 8;
             assert_eq!(Tq4CompressedVector::packed_size(d), expected);
-            // For d divisible by 8, should be exactly d/2 + 8
-            if d % 8 == 0 {
-                assert_eq!(expected, d / 2 + 8);
-            }
+            // d_pad is always power of 2, so packed size = d_pad/2 + 8
+            assert_eq!(expected, d_pad / 2 + 8);
         }
     }
 
