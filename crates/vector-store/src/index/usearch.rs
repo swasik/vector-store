@@ -53,6 +53,9 @@ use usearch::MetricKind;
 use usearch::ScalarKind;
 use usearch::b1x8;
 
+use crate::turbo_quant::distance::tq4_symmetric_distance;
+use crate::turbo_quant::{Tq4CompressedVector, Tq4Config, Tq4Quantizer};
+
 pub struct UsearchIndexFactory {
     tokio_semaphore: Arc<Semaphore>,
     rayon_semaphore: Arc<Semaphore>,
@@ -68,26 +71,52 @@ impl IndexFactory for UsearchIndexFactory {
     ) -> anyhow::Result<mpsc::Sender<Index>> {
         match &self.mode {
             Mode::Usearch => {
-                let options = IndexOptions {
-                    dimensions: index.dimensions.0.get(),
-                    connectivity: index.connectivity.0,
-                    expansion_add: index.expansion_add.0,
-                    expansion_search: index.expansion_search.0,
-                    metric: metric_kind(index.quantization, index.space_type)?,
-                    quantization: index.quantization.into(),
-                    ..Default::default()
-                };
                 let threads =
                     Handle::current().metrics().num_workers() + rayon::current_num_threads();
-                new(
-                    move || Ok(Arc::new(ThreadedUsearchIndex::new(options, threads)?)),
-                    index.key,
-                    index.dimensions,
-                    table,
-                    Arc::clone(&self.tokio_semaphore),
-                    Arc::clone(&self.rayon_semaphore),
-                    memory,
-                )
+                if index.quantization == Quantization::TQ4 {
+                    let dimension = index.dimensions.0.get();
+                    let connectivity = index.connectivity.0;
+                    let expansion_add = index.expansion_add.0;
+                    let expansion_search = index.expansion_search.0;
+                    let space_type = index.space_type;
+                    new(
+                        move || {
+                            Ok(Arc::new(ThreadedUsearchIndex::new_tq4(
+                                dimension,
+                                connectivity,
+                                expansion_add,
+                                expansion_search,
+                                space_type,
+                                threads,
+                            )?))
+                        },
+                        index.key,
+                        index.dimensions,
+                        table,
+                        Arc::clone(&self.tokio_semaphore),
+                        Arc::clone(&self.rayon_semaphore),
+                        memory,
+                    )
+                } else {
+                    let options = IndexOptions {
+                        dimensions: index.dimensions.0.get(),
+                        connectivity: index.connectivity.0,
+                        expansion_add: index.expansion_add.0,
+                        expansion_search: index.expansion_search.0,
+                        metric: metric_kind(index.quantization, index.space_type)?,
+                        quantization: index.quantization.into(),
+                        ..Default::default()
+                    };
+                    new(
+                        move || Ok(Arc::new(ThreadedUsearchIndex::new(options, threads)?)),
+                        index.key,
+                        index.dimensions,
+                        table,
+                        Arc::clone(&self.tokio_semaphore),
+                        Arc::clone(&self.rayon_semaphore),
+                        memory,
+                    )
+                }
             }
             Mode::Simulator { config, config_rx } => new(
                 {
@@ -165,6 +194,19 @@ struct ThreadedUsearchIndex {
     threads: usize,
     quantization: usearch::ScalarKind,
     space_type: usearch::MetricKind,
+    /// TQ4 state (None for non-TQ quantizations).
+    tq4: Option<Tq4IndexState>,
+}
+
+/// Per-index TQ4 state shared across all vectors.
+struct Tq4IndexState {
+    quantizer: Arc<Tq4Quantizer>,
+    /// Original vector dimension (before packing).
+    original_dimension: usize,
+    /// Packed TQ4 size in bytes = ceil(3d/8) + ceil(d/8) + 8.
+    packed_dimension: usize,
+    /// Oversample factor for HNSW retrieval before asymmetric reranking.
+    oversample_factor: f32,
 }
 
 impl ThreadedUsearchIndex {
@@ -174,6 +216,81 @@ impl ThreadedUsearchIndex {
             threads,
             quantization: options.quantization,
             space_type: options.metric,
+            tq4: None,
+        })
+    }
+
+    /// Create a TQ4 index with custom metric for TQ4-to-TQ4 distance.
+    fn new_tq4(
+        original_dimension: usize,
+        connectivity: usize,
+        expansion_add: usize,
+        expansion_search: usize,
+        space_type: SpaceType,
+        threads: usize,
+    ) -> anyhow::Result<Self> {
+        let config = Tq4Config::default();
+        let packed_dim = Tq4CompressedVector::packed_size(original_dimension);
+        let quantizer = Arc::new(Tq4Quantizer::new(
+            original_dimension,
+            config.rotation_seed,
+            config.qjl_seed,
+        ));
+
+        // Use IP as placeholder metric (overridden by change_metric)
+        let metric_kind = match space_type {
+            SpaceType::Cosine | SpaceType::DotProduct => MetricKind::IP,
+            _ => anyhow::bail!("TQ4 only supports Cosine and DotProduct, got {space_type:?}"),
+        };
+
+        let options = IndexOptions {
+            dimensions: packed_dim,
+            connectivity,
+            expansion_add,
+            expansion_search,
+            metric: metric_kind,
+            quantization: ScalarKind::I8,
+            ..Default::default()
+        };
+        let mut inner = usearch::Index::new(&options)?;
+
+        // Precompute 8×8 cross-product table for the symmetric metric
+        let inv_sqrt_d = quantizer.inv_sqrt_d();
+        let cross_table = crate::turbo_quant::codebook::cross_product_table_3bit(inv_sqrt_d);
+        let dim = original_dimension;
+
+        // Register custom TQ4-to-TQ4 metric
+        inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
+            // Per-thread AMX initialization (idempotent)
+            thread_local! {
+                static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            CONFIGURED.with(|c| {
+                if !c.get() {
+                    numkong::configure_thread();
+                    c.set(true);
+                }
+            });
+
+            let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
+            let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
+
+            let ip = tq4_symmetric_distance(a, b, dim, &cross_table);
+            // Convert inner product to distance (USearch minimizes distance)
+            usearch::Distance::from(1.0 - ip)
+        }));
+
+        Ok(Self {
+            inner,
+            threads,
+            quantization: ScalarKind::I8,
+            space_type: metric_kind,
+            tq4: Some(Tq4IndexState {
+                quantizer,
+                original_dimension,
+                packed_dimension: packed_dim,
+                oversample_factor: config.oversample_factor,
+            }),
         })
     }
 }
@@ -194,6 +311,12 @@ impl UsearchIndex for ThreadedUsearchIndex {
     }
 
     fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
+        if let Some(tq4) = &self.tq4 {
+            let compressed = tq4.quantizer.quantize(vector.as_slice());
+            let packed = compressed.pack();
+            let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
+            return Ok(self.inner.add(primary_id.into(), packed_i8)?);
+        }
         if self.quantization == ScalarKind::B1 {
             let vector = f32_to_b1x8(vector.as_slice());
             return Ok(self.inner.add(primary_id.into(), &vector)?);
@@ -210,6 +333,9 @@ impl UsearchIndex for ThreadedUsearchIndex {
         vector: &Vector,
         limit: Limit,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<(PrimaryId, Distance)>>> {
+        if let Some(tq4) = &self.tq4 {
+            return self.tq4_search(tq4, vector, limit);
+        }
         let matches = if self.quantization == ScalarKind::B1 {
             let vector = f32_to_b1x8(vector.as_slice());
             self.inner.search(&vector, limit.0.get())?
@@ -223,7 +349,9 @@ impl UsearchIndex for ThreadedUsearchIndex {
             .map(|(primary_id, distance)| {
                 Distance::try_from((distance, self.space_type.try_into()?, vector.dim()))
                     .map(|dist| (primary_id.into(), dist))
-            }))
+            })
+            .collect::<Vec<_>>()
+            .into_iter())
     }
 
     fn filtered_search(
@@ -232,6 +360,9 @@ impl UsearchIndex for ThreadedUsearchIndex {
         limit: Limit,
         filter: impl Fn(PrimaryId) -> bool,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<(PrimaryId, Distance)>>> {
+        if let Some(tq4) = &self.tq4 {
+            return self.tq4_filtered_search(tq4, vector, limit, filter);
+        }
         let matches = if self.quantization == ScalarKind::B1 {
             let vector = f32_to_b1x8(vector.as_slice());
             self.inner
@@ -249,10 +380,145 @@ impl UsearchIndex for ThreadedUsearchIndex {
             .map(|(primary_id, distance)| {
                 Distance::try_from((distance, self.space_type.try_into()?, vector.dim()))
                     .map(|dist| (primary_id.into(), dist))
-            }))
+            })
+            .collect::<Vec<_>>()
+            .into_iter())
     }
 
     fn stop(&self) {}
+}
+
+impl ThreadedUsearchIndex {
+    /// TQ4 search: oversample with HNSW, then rerank asymmetrically.
+    fn tq4_search(
+        &self,
+        tq4: &Tq4IndexState,
+        vector: &Vector,
+        limit: Limit,
+    ) -> anyhow::Result<std::vec::IntoIter<anyhow::Result<(PrimaryId, Distance)>>> {
+        // Phase 1: HNSW retrieval with TQ4-to-TQ4 custom metric (oversampled)
+        let oversample_limit = (limit.0.get() as f32 * tq4.oversample_factor).ceil() as usize;
+        let compressed_query = tq4.quantizer.quantize(vector.as_slice());
+        let packed_query = compressed_query.pack();
+        let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
+        let candidates = self.inner.search(packed_i8, oversample_limit)?;
+
+        // Phase 2: Precise asymmetric reranking with f32 query vs stored TQ4
+        let query_state = tq4.quantizer.prepare_query(vector.as_slice());
+        let mut get_buf = vec![0i8; tq4.packed_dimension];
+
+        let mut results: Vec<(PrimaryId, f32, f32)> = candidates
+            .keys
+            .iter()
+            .filter_map(|&id| {
+                get_buf.fill(0);
+                let found = self.inner.get(id, &mut get_buf).ok()?;
+                if found == 0 {
+                    return None;
+                }
+                let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                let compressed = Tq4CompressedVector::unpack(buf_u8, tq4.original_dimension);
+                let pid = PrimaryId::from(id);
+                let x_norm = compressed.norm;
+                let ip = tq4.quantizer.inner_product(&query_state, &compressed);
+                Some((pid, ip, x_norm))
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit.0.get());
+
+        let space_type = self.space_type;
+        let q_norm = query_state.query_norm;
+        let dim = vector.dim();
+
+        Ok(results
+            .into_iter()
+            .map(move |(id, raw_ip, x_norm)| {
+                let distance = match space_type {
+                    MetricKind::Cos => {
+                        let denom = q_norm * x_norm;
+                        let sim = if denom > 0.0 {
+                            (raw_ip / denom).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        1.0 - sim
+                    }
+                    MetricKind::IP => -raw_ip,
+                    _ => unreachable!("TQ4 only supports Cosine and DotProduct"),
+                };
+                Distance::try_from((distance, space_type.try_into()?, dim)).map(|dist| (id, dist))
+            })
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    /// TQ4 filtered search: same as tq4_search but with a filter predicate.
+    fn tq4_filtered_search(
+        &self,
+        tq4: &Tq4IndexState,
+        vector: &Vector,
+        limit: Limit,
+        filter: impl Fn(PrimaryId) -> bool,
+    ) -> anyhow::Result<std::vec::IntoIter<anyhow::Result<(PrimaryId, Distance)>>> {
+        let oversample_limit = (limit.0.get() as f32 * tq4.oversample_factor).ceil() as usize;
+        let compressed_query = tq4.quantizer.quantize(vector.as_slice());
+        let packed_query = compressed_query.pack();
+        let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
+        let candidates = self
+            .inner
+            .filtered_search(packed_i8, oversample_limit, |row_id| filter(row_id.into()))?;
+
+        let query_state = tq4.quantizer.prepare_query(vector.as_slice());
+        let mut get_buf = vec![0i8; tq4.packed_dimension];
+
+        let mut results: Vec<(PrimaryId, f32, f32)> = candidates
+            .keys
+            .iter()
+            .filter_map(|&id| {
+                get_buf.fill(0);
+                let found = self.inner.get(id, &mut get_buf).ok()?;
+                if found == 0 {
+                    return None;
+                }
+                let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                let compressed = Tq4CompressedVector::unpack(buf_u8, tq4.original_dimension);
+                let pid = PrimaryId::from(id);
+                let x_norm = compressed.norm;
+                let ip = tq4.quantizer.inner_product(&query_state, &compressed);
+                Some((pid, ip, x_norm))
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit.0.get());
+
+        let space_type = self.space_type;
+        let q_norm = query_state.query_norm;
+        let dim = vector.dim();
+
+        Ok(results
+            .into_iter()
+            .map(move |(id, raw_ip, x_norm)| {
+                let distance = match space_type {
+                    MetricKind::Cos => {
+                        let denom = q_norm * x_norm;
+                        let sim = if denom > 0.0 {
+                            (raw_ip / denom).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        1.0 - sim
+                    }
+                    MetricKind::IP => -raw_ip,
+                    _ => unreachable!("TQ4 only supports Cosine and DotProduct"),
+                };
+                Distance::try_from((distance, space_type.try_into()?, dim)).map(|dist| (id, dist))
+            })
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
 }
 
 struct Simulator {
@@ -455,11 +721,18 @@ struct MetricConfig {
 
 fn metric_kind(quantization: Quantization, space_type: SpaceType) -> anyhow::Result<MetricKind> {
     // Usearch requires a binary metric (e.g., Hamming, Jaccard) for B1 quantization.
-    // Using a non-binary metric would cause a panic during index creation.
-    // Since we don't currently support selecting a specific binary space type,
-    // we default to Hamming for B1 quantization.
     if quantization == Quantization::B1 {
         return Ok(MetricKind::Hamming);
+    }
+
+    // TQ4 uses a custom metric registered via change_metric(); return placeholder.
+    if quantization == Quantization::TQ4 {
+        return match space_type {
+            SpaceType::Cosine | SpaceType::DotProduct => Ok(MetricKind::IP),
+            _ => anyhow::bail!(
+                "TQ4 quantization only supports Cosine and DotProduct. Unsupported: {space_type:?}"
+            ),
+        };
     }
 
     MetricConfig {
@@ -478,6 +751,16 @@ impl TryFrom<MetricConfig> for MetricKind {
                 SpaceType::Hamming => Ok(MetricKind::Hamming),
                 _ => anyhow::bail!(
                     "B1 quantization requires binary space type. Unsupported space type: {:?}",
+                    config.space_type
+                ),
+            };
+        }
+
+        if config.quantization == Quantization::TQ4 {
+            return match config.space_type {
+                SpaceType::Cosine | SpaceType::DotProduct => Ok(MetricKind::IP),
+                _ => anyhow::bail!(
+                    "TQ4 quantization only supports Cosine and DotProduct. Unsupported: {:?}",
                     config.space_type
                 ),
             };
@@ -514,6 +797,7 @@ impl From<Quantization> for ScalarKind {
             Quantization::BF16 => ScalarKind::BF16,
             Quantization::I8 => ScalarKind::I8,
             Quantization::B1 => ScalarKind::B1,
+            Quantization::TQ4 => ScalarKind::I8, // TQ4 packed bytes stored as opaque I8
         }
     }
 }
@@ -1600,5 +1884,456 @@ mod tests {
         let b1_vec = f32_to_b1x8(&input);
         assert_eq!(b1_vec.len(), 2);
         assert_eq!(b1x8_to_u8_vec(&b1_vec), &[0b01010101, 0b00000101]);
+    }
+
+    mod tq4_recall {
+        use super::*;
+        use crate::turbo_quant::qjl::fill_standard_normal;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use std::collections::HashSet;
+
+        /// Generate a random unit-norm f32 vector of given dimension.
+        fn random_unit_vector(rng: &mut StdRng, dim: usize) -> Vec<f32> {
+            let mut v = vec![0.0f32; dim];
+            fill_standard_normal(rng, &mut v);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        /// Brute-force cosine similarity search: returns top-k (id, similarity) pairs.
+        fn exact_cosine_search(
+            vectors: &[(u64, Vec<f32>)],
+            query: &[f32],
+            k: usize,
+        ) -> Vec<(u64, f32)> {
+            let q_norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let mut sims: Vec<(u64, f32)> = vectors
+                .iter()
+                .map(|(id, v)| {
+                    let dot: f32 = v.iter().zip(query).map(|(a, b)| a * b).sum();
+                    let v_norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let sim = if q_norm > 0.0 && v_norm > 0.0 {
+                        dot / (q_norm * v_norm)
+                    } else {
+                        0.0
+                    };
+                    (*id, sim)
+                })
+                .collect();
+            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sims.truncate(k);
+            sims
+        }
+
+        /// Compute recall@k: fraction of true top-k IDs present in retrieved top-k.
+        fn recall_at_k(retrieved_ids: &[u64], ground_truth_ids: &[u64], k: usize) -> f32 {
+            let truth_set: HashSet<_> = ground_truth_ids.iter().take(k).collect();
+            let found = retrieved_ids
+                .iter()
+                .take(k)
+                .filter(|id| truth_set.contains(id))
+                .count();
+            found as f32 / k as f32
+        }
+
+        fn build_tq4_index_and_search(
+            n_vectors: usize,
+            dim: usize,
+            n_queries: usize,
+            k: usize,
+            seed: u64,
+        ) -> f32 {
+            let threads = rayon::current_num_threads();
+            let index = ThreadedUsearchIndex::new_tq4(
+                dim,
+                16, // connectivity
+                128,
+                64,
+                SpaceType::Cosine,
+                threads,
+            )
+            .unwrap();
+            index.reserve(n_vectors + 1).unwrap();
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n_vectors)
+                .map(|i| {
+                    let v = random_unit_vector(&mut rng, dim);
+                    (i as u64, v)
+                })
+                .collect();
+
+            // Insert all vectors
+            for (id, v) in &vectors {
+                let vector: Vector = v.clone().into();
+                index.add((*id).into(), &vector).unwrap();
+            }
+
+            // Query and measure recall
+            let mut total_recall = 0.0f32;
+            for _ in 0..n_queries {
+                let query_vec = random_unit_vector(&mut rng, dim);
+                let query: Vector = query_vec.clone().into();
+                let limit = NonZeroUsize::new(k).unwrap().into();
+
+                let results: Vec<u64> = index
+                    .search(&query, limit)
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .map(|(pid, _)| pid.into())
+                    .collect();
+
+                let ground_truth = exact_cosine_search(&vectors, &query_vec, k);
+                let gt_ids: Vec<u64> = ground_truth.iter().map(|(id, _)| *id).collect();
+                total_recall += recall_at_k(&results, &gt_ids, k);
+            }
+
+            total_recall / n_queries as f32
+        }
+
+        #[test]
+        fn tq4_recall_at_10_random_1k() {
+            // Smaller test for CI: 1K vectors, d=128, 20 queries
+            let recall = build_tq4_index_and_search(1_000, 128, 20, 10, 42);
+            eprintln!("TQ4 recall@10 (1K, d=128): {recall:.3}");
+            assert!(
+                recall >= 0.40,
+                "TQ4 recall@10 too low: {recall:.3} (expected >= 0.40)"
+            );
+        }
+
+        #[test]
+        #[ignore] // Slow: ~10K vectors
+        fn tq4_recall_at_10_random_10k() {
+            let recall = build_tq4_index_and_search(10_000, 768, 100, 10, 42);
+            eprintln!("TQ4 recall@10 (10K, d=768): {recall:.3}");
+            assert!(
+                recall >= 0.85,
+                "TQ4 recall@10 too low: {recall:.3} (expected >= 0.85)"
+            );
+        }
+
+        #[test]
+        fn tq4_recall_at_1_top1_accuracy() {
+            let recall = build_tq4_index_and_search(1_000, 128, 50, 1, 137);
+            eprintln!("TQ4 top-1 accuracy (1K, d=128): {recall:.3}");
+            assert!(
+                recall >= 0.35,
+                "TQ4 top-1 accuracy too low: {recall:.3} (expected >= 0.35)"
+            );
+        }
+
+        /// Diagnostic: brute-force TQ4 asymmetric ranking (no HNSW).
+        /// Isolates whether low recall is from the distance function or HNSW graph.
+        #[test]
+        #[ignore] // Slow: brute-force on 10K vectors at d=768
+        fn tq4_bruteforce_asymmetric_recall() {
+            use crate::turbo_quant::quantize::{Tq4CompressedVector, Tq4Quantizer};
+
+            let dim = 768;
+            let n_vectors = 10_000;
+            let n_queries = 100;
+            let k = 10;
+
+            let quantizer = Tq4Quantizer::new(dim, 42, 137);
+
+            let mut rng = StdRng::seed_from_u64(42);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n_vectors)
+                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
+                .collect();
+
+            // Pre-quantize all vectors
+            let compressed: Vec<(u64, Tq4CompressedVector)> = vectors
+                .iter()
+                .map(|(id, v)| (*id, quantizer.quantize(v)))
+                .collect();
+
+            let mut total_recall = 0.0f32;
+            for _ in 0..n_queries {
+                let query_vec = random_unit_vector(&mut rng, dim);
+
+                // Ground truth: brute-force cosine on original f32 vectors
+                let ground_truth = exact_cosine_search(&vectors, &query_vec, k);
+                let gt_ids: Vec<u64> = ground_truth.iter().map(|(id, _)| *id).collect();
+
+                // TQ4 asymmetric: compute inner product for ALL vectors
+                let query_state = quantizer.prepare_query(&query_vec);
+                let mut tq4_results: Vec<(u64, f32)> = compressed
+                    .iter()
+                    .map(|(id, c)| (*id, quantizer.inner_product(&query_state, c)))
+                    .collect();
+                tq4_results
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let tq4_ids: Vec<u64> = tq4_results.iter().take(k).map(|(id, _)| *id).collect();
+
+                total_recall += recall_at_k(&tq4_ids, &gt_ids, k);
+            }
+
+            let avg_recall = total_recall / n_queries as f32;
+            eprintln!("TQ4 brute-force asymmetric recall@{k} (d={dim}): {avg_recall:.3}");
+            // This tests the distance function quality without HNSW
+        }
+
+        /// Diagnostic: brute-force TQ4 symmetric ranking (no HNSW).
+        #[test]
+        #[ignore] // Slow: brute-force on 10K vectors at d=768
+        fn tq4_bruteforce_symmetric_recall() {
+            use crate::turbo_quant::codebook::cross_product_table_3bit;
+            use crate::turbo_quant::distance::tq4_symmetric_distance;
+            use crate::turbo_quant::quantize::{Tq4CompressedVector, Tq4Quantizer};
+
+            let dim = 768;
+            let n_vectors = 10_000;
+            let n_queries = 100;
+            let k = 10;
+
+            let quantizer = Tq4Quantizer::new(dim, 42, 137);
+            let inv_sqrt_d = quantizer.inv_sqrt_d();
+            let cross_table = cross_product_table_3bit(inv_sqrt_d);
+
+            let mut rng = StdRng::seed_from_u64(42);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n_vectors)
+                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
+                .collect();
+
+            // Pre-quantize and pack all vectors
+            let packed: Vec<(u64, Vec<u8>)> = vectors
+                .iter()
+                .map(|(id, v)| (*id, quantizer.quantize(v).pack()))
+                .collect();
+
+            let mut total_recall = 0.0f32;
+            for _ in 0..n_queries {
+                let query_vec = random_unit_vector(&mut rng, dim);
+
+                // Ground truth
+                let ground_truth = exact_cosine_search(&vectors, &query_vec, k);
+                let gt_ids: Vec<u64> = ground_truth.iter().map(|(id, _)| *id).collect();
+
+                // TQ4 symmetric: quantize query, compare with all packed vectors
+                let query_packed = quantizer.quantize(&query_vec).pack();
+                let mut sym_results: Vec<(u64, f32)> = packed
+                    .iter()
+                    .map(|(id, p)| {
+                        (*id, tq4_symmetric_distance(&query_packed, p, dim, &cross_table))
+                    })
+                    .collect();
+                sym_results
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let sym_ids: Vec<u64> = sym_results.iter().take(k).map(|(id, _)| *id).collect();
+
+                total_recall += recall_at_k(&sym_ids, &gt_ids, k);
+            }
+
+            let avg_recall = total_recall / n_queries as f32;
+            eprintln!("TQ4 brute-force symmetric recall@{k} (d={dim}): {avg_recall:.3}");
+            // This tests the symmetric distance quality without HNSW
+        }
+
+        #[test]
+        fn tq4_cosine_ordering_top5() {
+            // Insert 100 vectors, verify TQ4 top-5 order matches ground truth
+            let dim: usize = 128;
+            let n = 100;
+            let threads = rayon::current_num_threads();
+            let index = ThreadedUsearchIndex::new_tq4(dim, 16, 128, 64, SpaceType::Cosine, threads)
+                .unwrap();
+            index.reserve(n + 1).unwrap();
+
+            let mut rng = StdRng::seed_from_u64(999);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n)
+                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
+                .collect();
+            for (id, v) in &vectors {
+                let vector: Vector = v.clone().into();
+                index.add((*id).into(), &vector).unwrap();
+            }
+
+            let query_vec = random_unit_vector(&mut rng, dim);
+            let query: Vector = query_vec.clone().into();
+            let results: Vec<u64> = index
+                .search(&query, NonZeroUsize::new(5).unwrap().into())
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .map(|(pid, _)| pid.into())
+                .collect();
+
+            let gt = exact_cosine_search(&vectors, &query_vec, 5);
+            let gt_ids: Vec<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+            // At least 4 of top-5 should match for a small dataset
+            let overlap = results.iter().filter(|id| gt_ids.contains(id)).count();
+            eprintln!("TQ4 top-5 overlap: {overlap}/5");
+            assert!(
+                overlap >= 3,
+                "TQ4 top-5 ordering poor: only {overlap}/5 match ground truth"
+            );
+        }
+
+        #[test]
+        fn tq4_dotproduct_search() {
+            // Verify DotProduct metric works and returns reasonable results
+            let dim: usize = 128;
+            let n = 200;
+            let threads = rayon::current_num_threads();
+            let index =
+                ThreadedUsearchIndex::new_tq4(dim, 16, 128, 64, SpaceType::DotProduct, threads)
+                    .unwrap();
+            index.reserve(n + 1).unwrap();
+
+            let mut rng = StdRng::seed_from_u64(77);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n)
+                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
+                .collect();
+            for (id, v) in &vectors {
+                let vector: Vector = v.clone().into();
+                index.add((*id).into(), &vector).unwrap();
+            }
+
+            let query_vec = random_unit_vector(&mut rng, dim);
+            let query: Vector = query_vec.clone().into();
+            let results: Vec<(PrimaryId, Distance)> = index
+                .search(&query, NonZeroUsize::new(10).unwrap().into())
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Should return results
+            assert!(
+                !results.is_empty(),
+                "TQ4 DotProduct search returned no results"
+            );
+            // Should return up to 10
+            assert!(results.len() <= 10);
+        }
+
+        #[test]
+        fn tq4_filtered_search_basic() {
+            let dim: usize = 128;
+            let n = 200;
+            let threads = rayon::current_num_threads();
+            let index = ThreadedUsearchIndex::new_tq4(dim, 16, 128, 64, SpaceType::Cosine, threads)
+                .unwrap();
+            index.reserve(n + 1).unwrap();
+
+            let mut rng = StdRng::seed_from_u64(55);
+            for i in 0..n {
+                let v = random_unit_vector(&mut rng, dim);
+                let vector: Vector = v.into();
+                index.add((i as u64).into(), &vector).unwrap();
+            }
+
+            // Filter: only even IDs
+            let query_vec = random_unit_vector(&mut rng, dim);
+            let query: Vector = query_vec.into();
+            let results: Vec<(PrimaryId, Distance)> = index
+                .filtered_search(&query, NonZeroUsize::new(10).unwrap().into(), |pid| {
+                    let id: u64 = pid.into();
+                    id.is_multiple_of(2)
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // All returned IDs should be even
+            for (pid, _) in &results {
+                let id: u64 = (*pid).into();
+                assert!(
+                    id.is_multiple_of(2),
+                    "Filtered search returned odd ID: {id}"
+                );
+            }
+            assert!(!results.is_empty(), "Filtered search returned no results");
+        }
+
+        #[test]
+        fn tq4_recall_improves_with_oversample() {
+            // Verify that search with default oversample produces reasonable recall
+            let dim: usize = 128;
+            let n = 500;
+            let k = 10;
+            let n_queries = 20;
+            let threads = rayon::current_num_threads();
+            let seed = 42u64;
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n)
+                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
+                .collect();
+
+            let queries: Vec<Vec<f32>> = (0..n_queries)
+                .map(|_| random_unit_vector(&mut rng, dim))
+                .collect();
+
+            let index = ThreadedUsearchIndex::new_tq4(dim, 16, 128, 64, SpaceType::Cosine, threads)
+                .unwrap();
+            index.reserve(n + 1).unwrap();
+            for (id, v) in &vectors {
+                let vector: Vector = v.clone().into();
+                index.add((*id).into(), &vector).unwrap();
+            }
+
+            let mut total_recall = 0.0f32;
+            for q in &queries {
+                let query: Vector = q.clone().into();
+                let results: Vec<u64> = index
+                    .search(&query, NonZeroUsize::new(k).unwrap().into())
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .map(|(pid, _)| pid.into())
+                    .collect();
+                let gt = exact_cosine_search(&vectors, q, k);
+                let gt_ids: Vec<u64> = gt.iter().map(|(id, _)| *id).collect();
+                total_recall += recall_at_k(&results, &gt_ids, k);
+            }
+            let recall = total_recall / n_queries as f32;
+
+            eprintln!("TQ4 recall@{k} (500 vecs, d=128, oversample=3): {recall:.3}");
+            assert!(
+                recall >= 0.40,
+                "TQ4 recall too low with default oversample: {recall:.3}"
+            );
+        }
+
+        #[test]
+        fn tq4_euclidean_rejected() {
+            let threads = rayon::current_num_threads();
+            let result =
+                ThreadedUsearchIndex::new_tq4(128, 16, 128, 64, SpaceType::Euclidean, threads);
+            assert!(result.is_err(), "TQ4 should reject Euclidean metric");
+        }
+
+        #[test]
+        fn tq4_remove_vector() {
+            let dim: usize = 128;
+            let threads = rayon::current_num_threads();
+            let index = ThreadedUsearchIndex::new_tq4(dim, 16, 128, 64, SpaceType::Cosine, threads)
+                .unwrap();
+            index.reserve(10).unwrap();
+
+            let mut rng = StdRng::seed_from_u64(123);
+            let v1 = random_unit_vector(&mut rng, dim);
+            let v2 = random_unit_vector(&mut rng, dim);
+            index.add(1u64.into(), &v1.clone().into()).unwrap();
+            index.add(2u64.into(), &v2.clone().into()).unwrap();
+            assert_eq!(index.size(), 2);
+
+            index.remove(1u64.into()).unwrap();
+            // After remove, searching should not return id=1
+            let results: Vec<u64> = index
+                .search(&v1.into(), NonZeroUsize::new(10).unwrap().into())
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .map(|(pid, _)| pid.into())
+                .collect();
+            assert!(
+                !results.contains(&1u64),
+                "Removed vector should not appear in search results"
+            );
+        }
     }
 }

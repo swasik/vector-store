@@ -5,6 +5,7 @@
 
 use crate::db_basic;
 use crate::usearch::setup_store_with_quantization;
+use crate::usearch::setup_store_with_quantization_and_metric;
 use crate::usearch::test_config;
 use crate::wait_for;
 use crate::wait_for_value;
@@ -15,6 +16,7 @@ use vector_store::DataType;
 use vector_store::DbIndexType;
 use vector_store::Distance;
 use vector_store::Quantization;
+use vector_store::SpaceType;
 use vector_store::Timestamp;
 use vector_store::httproutes;
 use vector_store::httproutes::PostIndexAnnFilter;
@@ -311,4 +313,227 @@ async fn binary_quantization_with_non_divisible_by_8_dimensions() {
         "Waiting for ANN search to return 1 distance",
     )
     .await;
+}
+
+#[tokio::test]
+async fn tq4_index_reports_data_type() {
+    crate::enable_tracing();
+
+    let (run, index, _db, _node_state) = setup_store_with_quantization_and_metric(
+        test_config(),
+        DbIndexType::Global,
+        [],
+        [],
+        None,
+        None,
+        Quantization::TQ4,
+        NonZeroUsize::new(128).unwrap().into(),
+        SpaceType::Cosine,
+    )
+    .await;
+
+    let (client, _server, _config) = run.await;
+
+    let index_info = wait_for_value(
+        || async {
+            let indexes = client.indexes().await;
+            indexes
+                .into_iter()
+                .find(|idx| idx.keyspace == index.keyspace_name && idx.index == index.index_name)
+        },
+        "Waiting for TQ4 index to be added to the store",
+    )
+    .await;
+
+    assert_eq!(index_info.data_type, DataType::TQ4);
+}
+
+#[tokio::test]
+async fn tq4_add_and_search_cosine() {
+    crate::enable_tracing();
+
+    const DIMENSIONS: usize = 128;
+    let vector = vec![0.5; DIMENSIONS];
+    let pk_value = 1;
+    let pk_column: ColumnName = "pk".into();
+    let vectors = vec![(
+        [CqlValue::Int(pk_value)].into(),
+        Some(vector.clone().into()),
+        Timestamp::from_unix_timestamp(10),
+    )];
+
+    let (run, index, _db, _node_state) = setup_store_with_quantization_and_metric(
+        test_config(),
+        DbIndexType::Global,
+        [pk_column.clone()],
+        [(
+            pk_column.clone(),
+            scylla::cluster::metadata::NativeType::Int,
+        )],
+        Some(db_basic::scan_fn(vectors)),
+        None,
+        Quantization::TQ4,
+        NonZeroUsize::new(DIMENSIONS).unwrap().into(),
+        SpaceType::Cosine,
+    )
+    .await;
+
+    let (client, _server, _config_tx) = run.await;
+
+    wait_for(
+        || async {
+            client
+                .index_status(&index.keyspace_name, &index.index_name)
+                .await
+                .is_ok_and(|s| s.count == 1)
+        },
+        "Waiting for 1 vector to be indexed (TQ4)",
+    )
+    .await;
+
+    let (keys, distances, _) = client
+        .ann(
+            &index.keyspace_name,
+            &index.index_name,
+            vector.clone().into(),
+            None,
+            NonZeroUsize::new(1).unwrap().into(),
+        )
+        .await;
+
+    assert_eq!(distances.len(), 1, "Should return exactly 1 result");
+    // Cosine distance of a vector with itself should be very small
+    let dist: httproutes::Distance = distances[0];
+    assert!(
+        dist <= Distance::new_cosine(0.1).unwrap().into(),
+        "Cosine distance of vector with itself should be near 0, got: {dist:?}"
+    );
+    assert!(
+        !keys.is_empty(),
+        "Should return primary keys for TQ4 search"
+    );
+}
+
+#[tokio::test]
+async fn tq4_add_and_search_dotproduct() {
+    crate::enable_tracing();
+
+    const DIMENSIONS: usize = 128;
+    let vector = vec![0.5; DIMENSIONS];
+    let pk_value = 1;
+    let pk_column: ColumnName = "pk".into();
+    let vectors = vec![(
+        [CqlValue::Int(pk_value)].into(),
+        Some(vector.clone().into()),
+        Timestamp::from_unix_timestamp(10),
+    )];
+
+    let (run, index, _db, _node_state) = setup_store_with_quantization_and_metric(
+        test_config(),
+        DbIndexType::Global,
+        [pk_column.clone()],
+        [(
+            pk_column.clone(),
+            scylla::cluster::metadata::NativeType::Int,
+        )],
+        Some(db_basic::scan_fn(vectors)),
+        None,
+        Quantization::TQ4,
+        NonZeroUsize::new(DIMENSIONS).unwrap().into(),
+        SpaceType::DotProduct,
+    )
+    .await;
+
+    let (client, _server, _config_tx) = run.await;
+
+    wait_for(
+        || async {
+            client
+                .index_status(&index.keyspace_name, &index.index_name)
+                .await
+                .is_ok_and(|s| s.count == 1)
+        },
+        "Waiting for 1 vector to be indexed (TQ4 DotProduct)",
+    )
+    .await;
+
+    let (_, distances, _) = client
+        .ann(
+            &index.keyspace_name,
+            &index.index_name,
+            vector.clone().into(),
+            None,
+            NonZeroUsize::new(1).unwrap().into(),
+        )
+        .await;
+
+    assert_eq!(distances.len(), 1, "Should return exactly 1 result");
+}
+
+#[tokio::test]
+async fn tq4_filtered_search() {
+    crate::enable_tracing();
+
+    const DIMENSIONS: usize = 128;
+    let vector = vec![0.5; DIMENSIONS];
+    let pk_value = 1;
+    let pk_column: ColumnName = "pk".into();
+    let vectors = vec![(
+        [CqlValue::Int(pk_value)].into(),
+        Some(vector.clone().into()),
+        Timestamp::from_unix_timestamp(10),
+    )];
+
+    let (run, index, _db, _node_state) = setup_store_with_quantization_and_metric(
+        test_config(),
+        DbIndexType::Global,
+        [pk_column.clone()],
+        [(
+            pk_column.clone(),
+            scylla::cluster::metadata::NativeType::Int,
+        )],
+        Some(db_basic::scan_fn(vectors)),
+        None,
+        Quantization::TQ4,
+        NonZeroUsize::new(DIMENSIONS).unwrap().into(),
+        SpaceType::Cosine,
+    )
+    .await;
+
+    let (client, _server, _config_tx) = run.await;
+
+    wait_for(
+        || async {
+            client
+                .index_status(&index.keyspace_name, &index.index_name)
+                .await
+                .is_ok_and(|s| s.count == 1)
+        },
+        "Waiting for 1 vector to be indexed (TQ4 filtered)",
+    )
+    .await;
+
+    let filter = PostIndexAnnFilter {
+        restrictions: vec![PostIndexAnnRestriction::In {
+            lhs: pk_column.clone(),
+            rhs: vec![pk_value.into()],
+        }],
+        allow_filtering: false,
+    };
+
+    let (_, distances, _) = client
+        .ann(
+            &index.keyspace_name,
+            &index.index_name,
+            vector.clone().into(),
+            Some(filter),
+            NonZeroUsize::new(1).unwrap().into(),
+        )
+        .await;
+
+    assert_eq!(
+        distances.len(),
+        1,
+        "Filtered TQ4 search should return 1 result"
+    );
 }

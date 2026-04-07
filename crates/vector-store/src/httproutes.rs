@@ -171,6 +171,8 @@ pub enum DataType {
     I8,
     /// 1-bit binary value (packed 8 per byte).
     B1,
+    /// 4-bit TurboQuant with QJL residual correction.
+    TQ4,
 }
 
 impl From<Quantization> for DataType {
@@ -181,6 +183,7 @@ impl From<Quantization> for DataType {
             Quantization::BF16 => DataType::BF16,
             Quantization::I8 => DataType::I8,
             Quantization::B1 => DataType::B1,
+            Quantization::TQ4 => DataType::TQ4,
         }
     }
 }

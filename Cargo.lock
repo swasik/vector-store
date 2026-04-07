@@ -537,6 +537,20 @@ name = "bytemuck"
 version = "1.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbdf580320f38b612e485521afda1ee26d10cc9884efaaa750d383e13e3c5f4"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.110",
+]
 
 [[package]]
 name = "byteorder"
@@ -2357,6 +2371,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.110",
+]
+
+[[package]]
+name = "numkong"
+version = "7.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0058768c57951d49c52a6236f9b5edfcb0d1edcbe2baf13e4d6542ca51437bca"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -4251,6 +4274,7 @@ dependencies = [
  "axum",
  "axum-server",
  "axum-server-dual-protocol",
+ "bytemuck",
  "chrono",
  "clap",
  "criterion",
@@ -4265,6 +4289,7 @@ dependencies = [
  "mimalloc",
  "mockall",
  "ntest",
+ "numkong",
  "opensearch",
  "prometheus",
  "rand",

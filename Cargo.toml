@@ -64,6 +64,8 @@ tower-http = { version = "0.6.2", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing-test = "0.2.5"
+bytemuck = { version = "1.21", features = ["derive"] }
+numkong = "7.4"
 usearch = "2.22.0"
 utoipa = { version = "5.3.1", features = ["axum_extras"] }
 utoipa-axum = "0.2.0"

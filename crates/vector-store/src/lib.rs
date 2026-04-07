@@ -27,6 +27,7 @@ mod primary_key;
 mod similarity;
 mod table;
 mod timestamp;
+pub(crate) mod turbo_quant;
 mod vector;
 
 pub use crate::config_manager::ConfigManager;
@@ -474,6 +475,8 @@ pub enum Quantization {
     I8,
     /// 1-bit binary value (packed 8 per byte).
     B1,
+    /// 4-bit TurboQuant with QJL residual correction.
+    TQ4,
 }
 
 impl FromStr for Quantization {
@@ -486,6 +489,7 @@ impl FromStr for Quantization {
             "BF16" => Ok(Self::BF16),
             "I8" => Ok(Self::I8),
             "B1" => Ok(Self::B1),
+            "TQ4" => Ok(Self::TQ4),
             _ => Err(anyhow::anyhow!("Unknown quantization type: {s}")),
         }
     }

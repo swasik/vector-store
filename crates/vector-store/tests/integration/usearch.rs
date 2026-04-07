@@ -88,6 +88,37 @@ pub(crate) async fn setup_store_with_quantization(
     DbBasic,
     Sender<NodeState>,
 ) {
+    setup_store_with_quantization_and_metric(
+        config,
+        index_type,
+        primary_keys,
+        columns,
+        fullscan_fn,
+        cdc_fn,
+        quantization,
+        dimension,
+        SpaceType::Euclidean,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn setup_store_with_quantization_and_metric(
+    config: Config,
+    index_type: DbIndexType,
+    primary_keys: impl IntoIterator<Item = ColumnName>,
+    columns: impl IntoIterator<Item = (ColumnName, NativeType)>,
+    fullscan_fn: Option<ScanFn>,
+    cdc_fn: Option<ScanFn>,
+    quantization: Quantization,
+    dimension: Dimensions,
+    space_type: SpaceType,
+) -> (
+    impl std::future::Future<Output = (HttpClient, impl Sized, impl Sized)>,
+    IndexMetadata,
+    DbBasic,
+    Sender<NodeState>,
+) {
     let node_state = vector_store::new_node_state().await;
     let internals = vector_store::new_internals();
 
@@ -105,7 +136,7 @@ pub(crate) async fn setup_store_with_quantization(
         connectivity: Connectivity::default(),
         expansion_add: ExpansionAdd::default(),
         expansion_search: ExpansionSearch::default(),
-        space_type: SpaceType::Euclidean,
+        space_type,
         version: Uuid::new_v4().into(),
         quantization,
     };
