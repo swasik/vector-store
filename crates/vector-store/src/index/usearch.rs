@@ -2603,4 +2603,446 @@ mod tests {
             Ok(total_recall / query_indices.len() as f32)
         }
     }
+
+    mod polar_quant_recall {
+        use super::*;
+        use crate::turbo_quant::polar_quantize::{
+            PolarCodebooks, PolarCompressedVector, PolarCrossTables, PolarQuantizer,
+            polar_symmetric_distance,
+        };
+        use crate::turbo_quant::qjl::fill_standard_normal;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use std::collections::HashSet;
+
+        /// Generate a random unit-norm f32 vector.
+        fn random_unit_vector(rng: &mut StdRng, dim: usize) -> Vec<f32> {
+            let mut v = vec![0.0f32; dim];
+            fill_standard_normal(rng, &mut v);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        /// Brute-force cosine similarity search.
+        fn exact_cosine_search(
+            vectors: &[(u64, Vec<f32>)],
+            query: &[f32],
+            k: usize,
+        ) -> Vec<(u64, f32)> {
+            let q_norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let mut sims: Vec<(u64, f32)> = vectors
+                .iter()
+                .map(|(id, v)| {
+                    let dot: f32 = v.iter().zip(query).map(|(a, b)| a * b).sum();
+                    let v_norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let sim = if q_norm > 0.0 && v_norm > 0.0 {
+                        dot / (q_norm * v_norm)
+                    } else {
+                        0.0
+                    };
+                    (*id, sim)
+                })
+                .collect();
+            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sims.truncate(k);
+            sims
+        }
+
+        fn recall_at_k(retrieved_ids: &[u64], ground_truth_ids: &[u64], k: usize) -> f32 {
+            let truth_set: HashSet<_> = ground_truth_ids.iter().take(k).collect();
+            let found = retrieved_ids
+                .iter()
+                .take(k)
+                .filter(|id| truth_set.contains(id))
+                .count();
+            found as f32 / k as f32
+        }
+
+        /// Brute-force PolarQuant recall: no HNSW, pure distance function quality.
+        fn polar_quant_bruteforce_recall(
+            n_vectors: usize,
+            dim: usize,
+            n_queries: usize,
+            k: usize,
+            seed: u64,
+        ) -> f32 {
+            let quantizer = PolarQuantizer::new(dim, 42, 137);
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n_vectors)
+                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
+                .collect();
+
+            let compressed: Vec<(u64, PolarCompressedVector)> = vectors
+                .iter()
+                .map(|(id, v)| (*id, quantizer.quantize(v)))
+                .collect();
+
+            let mut total_recall = 0.0f32;
+            for _ in 0..n_queries {
+                let query_vec = random_unit_vector(&mut rng, dim);
+                let ground_truth = exact_cosine_search(&vectors, &query_vec, k);
+                let gt_ids: Vec<u64> = ground_truth.iter().map(|(id, _)| *id).collect();
+
+                let query_state = quantizer.prepare_query(&query_vec);
+                let mut pq_results: Vec<(u64, f32)> = compressed
+                    .iter()
+                    .map(|(id, c)| {
+                        let ip = quantizer.inner_product(&query_state, c);
+                        let cos = ip / (query_state.query_norm * c.norm).max(1e-10);
+                        (*id, cos)
+                    })
+                    .collect();
+                pq_results
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let pq_ids: Vec<u64> =
+                    pq_results.iter().take(k).map(|(id, _)| *id).collect();
+
+                total_recall += recall_at_k(&pq_ids, &gt_ids, k);
+            }
+
+            total_recall / n_queries as f32
+        }
+
+        /// PolarQuant recall with HNSW index (end-to-end via USearch).
+        fn build_polar_quant_index_and_search(
+            n_vectors: usize,
+            dim: usize,
+            n_queries: usize,
+            k: usize,
+            seed: u64,
+        ) -> f32 {
+            let oversample_factor = 3.0f32;
+            let config = Tq4Config::default();
+            let packed_dim = PolarCompressedVector::packed_size(dim);
+            let quantizer = Arc::new(PolarQuantizer::new(
+                dim,
+                config.rotation_seed,
+                config.qjl_seed,
+            ));
+
+            // Build cross-product tables for symmetric metric (must live outside closure)
+            let codebooks = PolarCodebooks::new(
+                dim.next_power_of_two().trailing_zeros() as usize,
+            );
+            let tables = Arc::new(PolarCrossTables::new(&codebooks));
+            let padded_dim = quantizer.padded_dim();
+
+            let options = IndexOptions {
+                dimensions: packed_dim,
+                connectivity: 16,
+                expansion_add: 128,
+                expansion_search: 64,
+                metric: MetricKind::IP,
+                quantization: ScalarKind::I8,
+                ..Default::default()
+            };
+            let mut inner = usearch::Index::new(&options).unwrap();
+
+            // Register PolarQuant symmetric metric
+            let tb = tables.clone();
+            inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
+                thread_local! {
+                    static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                }
+                CONFIGURED.with(|c| {
+                    if !c.get() {
+                        numkong::configure_thread();
+                        c.set(true);
+                    }
+                });
+
+                let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
+                let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
+                let ip = polar_symmetric_distance(a, b, padded_dim, &tb);
+                usearch::Distance::from(1.0 - ip)
+            }));
+
+            let threads = rayon::current_num_threads();
+            inner
+                .reserve_capacity_and_threads(n_vectors + 1, threads)
+                .unwrap();
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let vectors: Vec<(u64, Vec<f32>)> = (0..n_vectors)
+                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
+                .collect();
+
+            // Insert all vectors
+            for (id, v) in &vectors {
+                let compressed = quantizer.quantize(v);
+                let packed = compressed.pack();
+                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
+                inner.add(*id, packed_i8).unwrap();
+            }
+
+            // Query with oversample + asymmetric reranking
+            let mut total_recall = 0.0f32;
+            for _ in 0..n_queries {
+                let query_vec = random_unit_vector(&mut rng, dim);
+
+                // Phase 1: HNSW search with PolarQuant symmetric metric
+                let compressed_query = quantizer.quantize(&query_vec);
+                let packed_query = compressed_query.pack();
+                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
+                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
+                let candidates = inner.search(packed_i8, oversample_k).unwrap();
+
+                // Phase 2: Asymmetric reranking
+                let query_state = quantizer.prepare_query(&query_vec);
+                let mut get_buf = vec![0i8; packed_dim];
+                let mut reranked: Vec<(u64, f32)> = Vec::with_capacity(candidates.keys.len());
+
+                for &id in &candidates.keys {
+                    get_buf.fill(0);
+                    if let Ok(found) = inner.get(id, &mut get_buf) {
+                        if found > 0 {
+                            let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                            let c = PolarCompressedVector::unpack(buf_u8, dim);
+                            let ip = quantizer.inner_product(&query_state, &c);
+                            reranked.push((id, ip));
+                        }
+                    }
+                }
+
+                reranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                reranked.truncate(k);
+                let result_ids: Vec<u64> =
+                    reranked.iter().map(|(id, _)| *id).collect();
+
+                let ground_truth = exact_cosine_search(&vectors, &query_vec, k);
+                let gt_ids: Vec<u64> = ground_truth.iter().map(|(id, _)| *id).collect();
+                total_recall += recall_at_k(&result_ids, &gt_ids, k);
+            }
+
+            total_recall / n_queries as f32
+        }
+
+        // --- Brute-force recall tests (distance function quality) ---
+
+        #[test]
+        fn polar_quant_bruteforce_recall_1k() {
+            let recall = polar_quant_bruteforce_recall(1_000, 128, 20, 10, 42);
+            eprintln!("PolarQuant brute-force recall@10 (1K, d=128): {recall:.3}");
+            assert!(
+                recall >= 0.30,
+                "PolarQuant brute-force recall@10 too low: {recall:.3} (expected >= 0.30)"
+            );
+        }
+
+        #[test]
+        #[ignore] // Slow
+        fn polar_quant_bruteforce_recall_10k() {
+            let recall = polar_quant_bruteforce_recall(10_000, 768, 100, 10, 42);
+            eprintln!("PolarQuant brute-force recall@10 (10K, d=768): {recall:.3}");
+            assert!(
+                recall >= 0.20,
+                "PolarQuant brute-force recall@10 too low: {recall:.3} (expected >= 0.20)"
+            );
+        }
+
+        // --- HNSW recall tests (end-to-end) ---
+
+        #[test]
+        fn polar_quant_recall_at_10_random_1k() {
+            let recall = build_polar_quant_index_and_search(1_000, 128, 20, 10, 42);
+            eprintln!("PolarQuant HNSW recall@10 (1K, d=128): {recall:.3}");
+            assert!(
+                recall >= 0.25,
+                "PolarQuant HNSW recall@10 too low: {recall:.3} (expected >= 0.25)"
+            );
+        }
+
+        #[test]
+        #[ignore] // Slow
+        fn polar_quant_recall_at_10_random_10k() {
+            let recall = build_polar_quant_index_and_search(10_000, 768, 100, 10, 42);
+            eprintln!("PolarQuant HNSW recall@10 (10K, d=768): {recall:.3}");
+            assert!(
+                recall >= 0.15,
+                "PolarQuant HNSW recall@10 too low: {recall:.3} (expected >= 0.15)"
+            );
+        }
+
+        // --- DBpedia recall test ---
+
+        #[test]
+        #[ignore] // Requires internet access + slow
+        fn polar_quant_recall_at_10_dbpedia_openai() {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { dbpedia_openai_polar_recall_inner(10).await });
+            match result {
+                Ok(recall) => {
+                    eprintln!(
+                        "PolarQuant recall@10 (DBpedia OpenAI, d=1536, n=1000): {recall:.3}"
+                    );
+                    assert!(
+                        recall >= 0.30,
+                        "PolarQuant DBpedia recall@10 too low: {recall:.3} (expected >= 0.30)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Skipping DBpedia PolarQuant test: {e}");
+                }
+            }
+        }
+
+        async fn dbpedia_openai_polar_recall_inner(k: usize) -> Result<f32, String> {
+            let client = reqwest::Client::new();
+            let n_pages = 10;
+            let rows_per_page = 100;
+            let dim = 1536;
+            let n_queries = 50;
+            let emb_field = "text-embedding-3-large-1536-embedding";
+
+            let mut vectors: Vec<(u64, Vec<f32>)> =
+                Vec::with_capacity(n_pages * rows_per_page);
+            for page in 0..n_pages {
+                let offset = page * rows_per_page;
+                let url = format!(
+                    "https://datasets-server.huggingface.co/rows\
+                     ?dataset=Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-100K\
+                     &config=default&split=train&offset={offset}&length={rows_per_page}"
+                );
+                let resp = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("HTTP request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP {}", resp.status()));
+                }
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("JSON parse failed: {e}"))?;
+                let rows = body["rows"]
+                    .as_array()
+                    .ok_or("Missing 'rows' field in response")?;
+                for row_obj in rows {
+                    let emb = row_obj["row"][emb_field]
+                        .as_array()
+                        .ok_or_else(|| format!("Missing '{emb_field}' field in row"))?;
+                    if emb.len() != dim {
+                        return Err(format!("Expected dim={dim}, got {}", emb.len()));
+                    }
+                    let v: Vec<f32> = emb
+                        .iter()
+                        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                        .collect();
+                    let id = vectors.len() as u64;
+                    vectors.push((id, v));
+                }
+            }
+
+            eprintln!(
+                "Downloaded {} DBpedia OpenAI vectors (d={dim})",
+                vectors.len()
+            );
+
+            // Build PolarQuant HNSW index
+            let oversample_factor = 3.0f32;
+            let packed_dim = PolarCompressedVector::packed_size(dim);
+            let quantizer = Arc::new(PolarQuantizer::new(dim, 42, 137));
+            let codebooks = PolarCodebooks::new(
+                dim.next_power_of_two().trailing_zeros() as usize,
+            );
+            let tables = Arc::new(PolarCrossTables::new(&codebooks));
+            let padded_dim = quantizer.padded_dim();
+
+            let options = IndexOptions {
+                dimensions: packed_dim,
+                connectivity: 16,
+                expansion_add: 128,
+                expansion_search: 64,
+                metric: MetricKind::IP,
+                quantization: ScalarKind::I8,
+                ..Default::default()
+            };
+            let mut inner = usearch::Index::new(&options)
+                .map_err(|e| format!("Index creation failed: {e}"))?;
+
+            let tb = tables.clone();
+            inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
+                thread_local! {
+                    static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+                }
+                CONFIGURED.with(|c| {
+                    if !c.get() {
+                        numkong::configure_thread();
+                        c.set(true);
+                    }
+                });
+                let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
+                let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
+                let ip = polar_symmetric_distance(a, b, padded_dim, &tb);
+                usearch::Distance::from(1.0 - ip)
+            }));
+
+            let threads = rayon::current_num_threads();
+            inner
+                .reserve_capacity_and_threads(vectors.len() + 1, threads)
+                .map_err(|e| format!("Reserve failed: {e}"))?;
+
+            for (id, v) in &vectors {
+                let compressed = quantizer.quantize(v);
+                let packed = compressed.pack();
+                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
+                inner
+                    .add(*id, packed_i8)
+                    .map_err(|e| format!("Insert failed: {e}"))?;
+            }
+
+            // Query with oversample + reranking
+            let query_indices: Vec<usize> =
+                (0..vectors.len()).step_by(20).take(n_queries).collect();
+            let mut total_recall = 0.0f32;
+            for &qi in &query_indices {
+                let query_vec = &vectors[qi].1;
+
+                let compressed_query = quantizer.quantize(query_vec);
+                let packed_query = compressed_query.pack();
+                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
+                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
+                let candidates = inner
+                    .search(packed_i8, oversample_k)
+                    .map_err(|e| format!("Search failed: {e}"))?;
+
+                let query_state = quantizer.prepare_query(query_vec);
+                let mut get_buf = vec![0i8; packed_dim];
+                let mut reranked: Vec<(u64, f32)> =
+                    Vec::with_capacity(candidates.keys.len());
+
+                for &id in &candidates.keys {
+                    get_buf.fill(0);
+                    if let Ok(found) = inner.get(id, &mut get_buf) {
+                        if found > 0 {
+                            let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                            let c = PolarCompressedVector::unpack(buf_u8, dim);
+                            let ip = quantizer.inner_product(&query_state, &c);
+                            reranked.push((id, ip));
+                        }
+                    }
+                }
+
+                reranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                reranked.truncate(k);
+                let result_ids: Vec<u64> =
+                    reranked.iter().map(|(id, _)| *id).collect();
+
+                let gt = exact_cosine_search(&vectors, query_vec, k);
+                let gt_ids: Vec<u64> = gt.iter().map(|(id, _)| *id).collect();
+                total_recall += recall_at_k(&result_ids, &gt_ids, k);
+            }
+
+            Ok(total_recall / query_indices.len() as f32)
+        }
+    }
 }

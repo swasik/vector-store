@@ -186,7 +186,7 @@ impl RotationMatrix {
 ///
 /// The result is the *unnormalized* Hadamard transform; multiply by
 /// `1/√n` after calling to obtain an orthonormal transform.
-fn hadamard_transform(data: &mut [f32]) {
+pub(crate) fn hadamard_transform(data: &mut [f32]) {
     let n = data.len();
     debug_assert!(n.is_power_of_two(), "Hadamard requires power-of-2 length");
 
