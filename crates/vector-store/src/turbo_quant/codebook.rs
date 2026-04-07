@@ -96,6 +96,30 @@ pub fn extract_3bit_index(packed: &[u8], j: usize) -> u8 {
     }
 }
 
+/// Extract 8 consecutive 3-bit indices from a packed big-endian bitstream.
+///
+/// Eight 3-bit values occupy exactly 24 bits = 3 bytes. This processes
+/// an entire group in one operation, avoiding per-element bit arithmetic
+/// in the hot loop of cross-product accumulation and MSE dot products.
+#[inline]
+pub fn extract_8_3bit_indices(packed: &[u8], group: usize) -> [u8; 8] {
+    let byte_offset = group * 3;
+    let b0 = packed[byte_offset] as u32;
+    let b1 = packed[byte_offset + 1] as u32;
+    let b2 = packed[byte_offset + 2] as u32;
+    let bits = (b0 << 16) | (b1 << 8) | b2;
+    [
+        ((bits >> 21) & 0x07) as u8,
+        ((bits >> 18) & 0x07) as u8,
+        ((bits >> 15) & 0x07) as u8,
+        ((bits >> 12) & 0x07) as u8,
+        ((bits >> 9) & 0x07) as u8,
+        ((bits >> 6) & 0x07) as u8,
+        ((bits >> 3) & 0x07) as u8,
+        (bits & 0x07) as u8,
+    ]
+}
+
 /// Batch-decode packed 3-bit indices to f32 centroid values.
 pub fn decode_vector_3bit(packed: &[u8], d: usize, inv_sqrt_d: f32) -> Vec<f32> {
     (0..d)

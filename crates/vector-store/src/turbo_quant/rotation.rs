@@ -107,19 +107,25 @@ impl RotationMatrix {
     ///
     /// Input `x` has length `dimension`. The full `padded_dim` output is
     /// written into `out` (no truncation). This preserves the L2 norm exactly.
+    /// Uses the output buffer directly as working space, avoiding allocation.
     pub fn forward_padded(&self, x: &[f32], out: &mut [f32]) {
         debug_assert_eq!(x.len(), self.dimension);
         debug_assert_eq!(out.len(), self.padded_dim);
 
-        let mut buf = vec![0.0f32; self.padded_dim];
+        // Apply diagonal D directly into output buffer (zero-padded)
         for i in 0..self.dimension {
-            buf[i] = self.signs[i] * x[i];
+            out[i] = self.signs[i] * x[i];
+        }
+        for i in self.dimension..self.padded_dim {
+            out[i] = 0.0;
         }
 
-        hadamard_transform(&mut buf);
+        // Unnormalized Walsh-Hadamard butterfly (in-place on output)
+        hadamard_transform(out);
 
-        for i in 0..self.padded_dim {
-            out[i] = buf[i] * self.inv_sqrt_d_pad;
+        // Normalize by 1/√d_pad
+        for v in out.iter_mut() {
+            *v *= self.inv_sqrt_d_pad;
         }
     }
 

@@ -1343,3 +1343,116 @@ for specific use cases. The same codebook and QJL infrastructure applies.
 When both query and database vectors are TQ4-quantized, the inner product can be estimated
 from the two compressed representations directly using quantized-quantized distance formulas.
 This avoids dequantization entirely and enables pure integer arithmetic paths.
+
+## 7. Recall Improvement Proposals
+
+Current measured recall on real OpenAI embeddings (DBpedia, d=1536, n=1000) is **93.4%
+recall@10**. A parameter sweep over HNSW connectivity/expansion and oversample factor showed
+no improvement — the 6.6% gap is entirely due to quantization error. The proposals below
+target the quantization quality itself.
+
+### 7.1 SRHT Random Sign Flips Before WHT
+
+**Priority**: High impact, easy implementation (~10 lines)
+
+The current rotation is plain Walsh-Hadamard: $y = H \cdot x$. The standard Subsampled
+Randomized Hadamard Transform (SRHT) adds a random diagonal sign matrix:
+$y = H \cdot D \cdot x$ where $D_{ii} \in \{-1, +1\}$ seeded from a PRNG.
+
+The sign flips provably achieve better sub-Gaussian tail concentration on the rotated
+coordinates, making the fixed Gaussian-assumption codebook boundaries a better fit. Without
+sign flips, structured inputs (e.g., sparse or axis-aligned vectors) can produce rotated
+coordinates that deviate from the Beta/Gaussian model, increasing codebook distortion.
+
+**Implementation**: In `rotation.rs`, multiply each input coordinate by a seeded random sign
+before the butterfly transform. The sign vector is generated once from `rotation_seed` and
+stored alongside the existing state.
+
+### 7.2 Asymmetric Distance During HNSW Construction
+
+**Priority**: High impact, moderate effort
+
+Currently `add()` inserts vectors using symmetric TQ4-vs-TQ4 distance for graph construction.
+However, the original float vector is available at insertion time. Using asymmetric
+(float-vs-TQ4) distance during construction builds a higher-quality HNSW graph because the
+query side has no quantization error — neighbors are more correctly chosen.
+
+This is how product quantization systems (FAISS, ScaNN) typically operate: build with
+higher-precision distance, search with quantized distance.
+
+**Implementation**: Requires modifying the USearch `change_metric` callback to detect
+"insertion mode" (one operand is a float vector) vs "search mode" (both operands are TQ4
+packed). Alternatively, store the float vector temporarily alongside the packed TQ4 during
+insertion phase and remove it afterwards.
+
+### 7.3 4-Bit Codebook (16 Centroids)
+
+**Priority**: High impact, moderate effort
+
+Upgrading the MSE stage from 3-bit (8 centroids) to 4-bit (16 centroids) roughly halves
+the MSE distortion per coordinate. This would make the overall scheme "TQ5" (4 bits MSE +
+1 bit QJL = 5 bits total).
+
+- Cross-product table grows from $8 \times 8 = 64$ to $16 \times 16 = 256$ entries (still
+  fits in L1 cache).
+- Storage increases ~33% for the MSE component (from $\lceil 3d/8 \rceil$ to $d/2$ bytes).
+  Total per-vector storage goes from $d/2 + 8$ to $5d/8 + 8$ bytes.
+- The symmetric distance inner loop would use **nibble packing** instead of the current
+  3-bit scheme, which is actually *simpler* to implement (nibble extraction is just
+  shift+mask, no cross-byte logic).
+
+**Trade-off**: ~25% more memory per vector in exchange for significantly lower quantization
+error. For d=1536, storage goes from 776 to 968 bytes (vs 6144 for F32 — still 6.3×
+compression).
+
+### 7.4 Data-Adaptive Codebook
+
+**Priority**: Moderate impact, harder implementation
+
+The current codebook uses fixed boundaries assuming $\mathcal{N}(0, 1/d)$ post-rotation.
+Real embeddings may not perfectly match this distribution, especially at lower dimensions
+or for non-uniform embedding models.
+
+A training pass over a sample of vectors to compute **k-means centroids** (Lloyd's algorithm
+on 1D marginals of the rotated vectors) would produce optimal boundaries for the actual data
+distribution.
+
+**Trade-off**: Adds a "training" phase to index creation (violates data-oblivious property).
+Could be optional — use fixed codebook by default, allow a `TRAIN` step for users who want
+maximum recall. The training cost is minimal: one pass over a sample of ~1000 vectors,
+running 1D k-means with 8 centroids.
+
+### 7.5 Residual Re-Encoding (Multi-Stage VQ)
+
+**Priority**: Moderate impact, moderate effort
+
+After MSE quantization, compute the residual $r = x_{\text{rotated}} - x_{\text{reconstructed}}$
+and encode it with a second, coarser codebook (e.g., 2-bit, 4 centroids). This is a form of
+multi-stage vector quantization.
+
+The second stage adds a table lookup to the distance computation but can recover a significant
+fraction of first-stage error. Total bit budget: 3 (MSE) + 2 (residual) + 1 (QJL) = 6 bits,
+with each stage covering a different error regime.
+
+### 7.6 Tuning QJL Bit Budget vs MSE Bits
+
+**Priority**: Low effort, diagnostic value
+
+Currently the QJL component uses $d_{\text{pad}}$ bits. The QJL term and the MSE term
+contribute differently to the total distance estimate error. Measuring their individual
+error contributions (e.g., ablation: compute recall with QJL term zeroed out, or with MSE
+term zeroed out) would reveal the optimal allocation.
+
+If the QJL term contributes little to recall (because the MSE codebook already captures
+most of the signal), the QJL bit could be reallocated to a 4-bit MSE codebook instead.
+
+### 7.7 Recommended Implementation Order
+
+Based on expected recall gain per implementation effort:
+
+1. **7.1** — SRHT sign flips (quick win, ~10 lines, directly improves codebook fit)
+2. **7.3** — 4-bit codebook (biggest structural improvement to quantization quality)
+3. **7.2** — Asymmetric construction (high value but requires USearch integration changes)
+4. **7.6** — QJL/MSE bit budget analysis (diagnostic, informs whether 7.3 or 7.5 is better)
+5. **7.4** — Data-adaptive codebook (optional, for users who want maximum recall)
+6. **7.5** — Residual re-encoding (diminishing returns if 7.3 is adopted)

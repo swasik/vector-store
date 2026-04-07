@@ -407,22 +407,31 @@ impl ThreadedUsearchIndex {
         let query_state = tq4.quantizer.prepare_query(vector.as_slice());
         let mut get_buf = vec![0i8; tq4.packed_dimension];
 
-        let mut results: Vec<(PrimaryId, f32, f32)> = candidates
-            .keys
-            .iter()
-            .filter_map(|&id| {
-                get_buf.fill(0);
-                let found = self.inner.get(id, &mut get_buf).ok()?;
-                if found == 0 {
-                    return None;
+        // Collect valid candidates for batch reranking
+        let mut rerank_ids: Vec<PrimaryId> = Vec::with_capacity(candidates.keys.len());
+        let mut rerank_vecs: Vec<Tq4CompressedVector> =
+            Vec::with_capacity(candidates.keys.len());
+        for &id in &candidates.keys {
+            get_buf.fill(0);
+            if let Ok(found) = self.inner.get(id, &mut get_buf) {
+                if found > 0 {
+                    let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                    let compressed =
+                        Tq4CompressedVector::unpack(buf_u8, tq4.original_dimension);
+                    rerank_ids.push(PrimaryId::from(id));
+                    rerank_vecs.push(compressed);
                 }
-                let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
-                let compressed = Tq4CompressedVector::unpack(buf_u8, tq4.original_dimension);
-                let pid = PrimaryId::from(id);
-                let x_norm = compressed.norm;
-                let ip = tq4.quantizer.inner_product(&query_state, &compressed);
-                Some((pid, ip, x_norm))
-            })
+            }
+        }
+
+        // Batch compute inner products (SIMD dot via NumKong, reused centroid buffer)
+        let ips = tq4.quantizer.batch_inner_products(&query_state, &rerank_vecs);
+
+        let mut results: Vec<(PrimaryId, f32, f32)> = rerank_ids
+            .iter()
+            .zip(rerank_vecs.iter())
+            .zip(ips.iter())
+            .map(|((pid, c), &ip)| (*pid, ip, c.norm))
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -473,22 +482,31 @@ impl ThreadedUsearchIndex {
         let query_state = tq4.quantizer.prepare_query(vector.as_slice());
         let mut get_buf = vec![0i8; tq4.packed_dimension];
 
-        let mut results: Vec<(PrimaryId, f32, f32)> = candidates
-            .keys
-            .iter()
-            .filter_map(|&id| {
-                get_buf.fill(0);
-                let found = self.inner.get(id, &mut get_buf).ok()?;
-                if found == 0 {
-                    return None;
+        // Collect valid candidates for batch reranking
+        let mut rerank_ids: Vec<PrimaryId> = Vec::with_capacity(candidates.keys.len());
+        let mut rerank_vecs: Vec<Tq4CompressedVector> =
+            Vec::with_capacity(candidates.keys.len());
+        for &id in &candidates.keys {
+            get_buf.fill(0);
+            if let Ok(found) = self.inner.get(id, &mut get_buf) {
+                if found > 0 {
+                    let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                    let compressed =
+                        Tq4CompressedVector::unpack(buf_u8, tq4.original_dimension);
+                    rerank_ids.push(PrimaryId::from(id));
+                    rerank_vecs.push(compressed);
                 }
-                let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
-                let compressed = Tq4CompressedVector::unpack(buf_u8, tq4.original_dimension);
-                let pid = PrimaryId::from(id);
-                let x_norm = compressed.norm;
-                let ip = tq4.quantizer.inner_product(&query_state, &compressed);
-                Some((pid, ip, x_norm))
-            })
+            }
+        }
+
+        // Batch compute inner products (SIMD dot via NumKong, reused centroid buffer)
+        let ips = tq4.quantizer.batch_inner_products(&query_state, &rerank_vecs);
+
+        let mut results: Vec<(PrimaryId, f32, f32)> = rerank_ids
+            .iter()
+            .zip(rerank_vecs.iter())
+            .zip(ips.iter())
+            .map(|((pid, c), &ip)| (*pid, ip, c.norm))
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2463,7 +2481,7 @@ mod tests {
         #[ignore] // Requires internet access
         fn tq4_recall_at_10_dbpedia_openai() {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { dbpedia_openai_recall_inner().await });
+            let result = rt.block_on(async { dbpedia_openai_recall_inner(10).await });
             match result {
                 Ok(recall) => {
                     eprintln!("TQ4 recall@10 (DBpedia OpenAI, d=1536, n=1000): {recall:.3}");
@@ -2478,12 +2496,30 @@ mod tests {
             }
         }
 
-        async fn dbpedia_openai_recall_inner() -> Result<f32, String> {
+        #[test]
+        #[ignore] // Requires internet access
+        fn tq4_recall_at_100_dbpedia_openai() {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { dbpedia_openai_recall_inner(100).await });
+            match result {
+                Ok(recall) => {
+                    eprintln!("TQ4 recall@100 (DBpedia OpenAI, d=1536, n=1000): {recall:.3}");
+                    assert!(
+                        recall >= 0.40,
+                        "TQ4 DBpedia OpenAI recall@100 too low: {recall:.3} (expected >= 0.40)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Skipping DBpedia OpenAI test: {e}");
+                }
+            }
+        }
+
+        async fn dbpedia_openai_recall_inner(k: usize) -> Result<f32, String> {
             let client = reqwest::Client::new();
             let n_pages = 10; // 10 pages × 100 rows = 1000 vectors
             let rows_per_page = 100;
             let dim = 1536;
-            let k = 10;
             let n_queries = 50;
             let emb_field = "text-embedding-3-large-1536-embedding";
 

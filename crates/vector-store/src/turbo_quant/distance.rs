@@ -14,7 +14,7 @@
 
 use crate::turbo_quant::codebook::{self, CENTROIDS_3BIT};
 use crate::turbo_quant::quantize::{Tq4CompressedVector, Tq4Quantizer};
-use numkong::{Hamming, u1x8};
+use numkong::{Dot, Hamming, u1x8};
 
 /// Precomputed query state for efficient asymmetric TQ4 distance computation.
 ///
@@ -68,13 +68,24 @@ impl Tq4Quantizer {
     ) -> f32 {
         let d_pad = self.padded_dim();
         let inv_sqrt_d = self.inv_sqrt_d();
+        let full_groups = d_pad / 8;
+        let remainder = d_pad % 8;
 
-        // MSE term: Σ_j centroid[idx_j] · rotated_query[j]
+        // MSE term: batch-extract 8 indices at a time to reduce bit-manipulation overhead
         let mut mse_ip = 0.0f32;
-        for j in 0..d_pad {
-            let idx = codebook::extract_3bit_index(&compressed.mse_indices, j);
-            let centroid_val = CENTROIDS_3BIT[idx as usize] * inv_sqrt_d;
-            mse_ip += centroid_val * query_state.rotated_query[j];
+        for g in 0..full_groups {
+            let indices = codebook::extract_8_3bit_indices(&compressed.mse_indices, g);
+            let base = g * 8;
+            for k in 0..8 {
+                mse_ip += CENTROIDS_3BIT[indices[k] as usize]
+                    * inv_sqrt_d
+                    * query_state.rotated_query[base + k];
+            }
+        }
+        let base = full_groups * 8;
+        for j in 0..remainder {
+            let idx = codebook::extract_3bit_index(&compressed.mse_indices, base + j);
+            mse_ip += CENTROIDS_3BIT[idx as usize] * inv_sqrt_d * query_state.rotated_query[base + j];
         }
 
         // QJL correction term: (π/2)/d · γ · Σ_j sign_j · projected_query_j
@@ -86,6 +97,57 @@ impl Tq4Quantizer {
 
         // Full inner product estimate: ‖x‖ · (MSE + QJL)
         compressed.norm * (mse_ip + qjl_ip)
+    }
+
+    /// Batch compute inner product estimates for multiple TQ4 candidates.
+    ///
+    /// Gathers centroid values into a reusable buffer and uses SIMD dot product
+    /// (via NumKong) for the MSE term. The centroid buffer is allocated once
+    /// and reused across all candidates.
+    pub fn batch_inner_products(
+        &self,
+        query_state: &Tq4QueryState,
+        candidates: &[Tq4CompressedVector],
+    ) -> Vec<f32> {
+        let d_pad = self.padded_dim();
+        let inv_sqrt_d = self.inv_sqrt_d();
+        let full_groups = d_pad / 8;
+        let remainder = d_pad % 8;
+
+        let mut centroids = vec![0.0f32; d_pad];
+        let mut results = Vec::with_capacity(candidates.len());
+
+        for candidate in candidates {
+            // Gather centroids using batch extraction
+            for g in 0..full_groups {
+                let indices =
+                    codebook::extract_8_3bit_indices(&candidate.mse_indices, g);
+                let base = g * 8;
+                for k in 0..8 {
+                    centroids[base + k] = CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d;
+                }
+            }
+            let base = full_groups * 8;
+            for j in 0..remainder {
+                let idx = codebook::extract_3bit_index(&candidate.mse_indices, base + j);
+                centroids[base + j] = CENTROIDS_3BIT[idx as usize] * inv_sqrt_d;
+            }
+
+            // SIMD dot product for MSE term (f64 accumulation for accuracy)
+            let mse_ip =
+                f32::dot(&centroids, &query_state.rotated_query).unwrap_or(0.0) as f32;
+
+            // QJL correction term
+            let qjl_ip = self.qjl().inner_product_term(
+                &candidate.qjl_signs,
+                &query_state.projected_query,
+                candidate.gamma,
+            );
+
+            results.push(candidate.norm * (mse_ip + qjl_ip));
+        }
+
+        results
     }
 
     /// Compute cosine similarity from TQ4 inner product.
@@ -169,20 +231,33 @@ pub fn tq4_symmetric_distance(a: &[u8], b: &[u8], dim: usize, cross_table: &[[f3
 
 /// Accumulate cross-product lookups over pairs of 3-bit indices.
 ///
-/// For each coordinate j ∈ [0, dim): extract 3-bit indices from a and b,
-/// look up cross_table[a_j][b_j], and accumulate. Zero heap allocation.
+/// Processes 8 index pairs at a time using batch 3-bit extraction,
+/// reducing per-element bit-manipulation overhead. Zero heap allocation.
 fn accumulate_cross_products(
     a_mse: &[u8],
     b_mse: &[u8],
     dim: usize,
     cross_table: &[[f32; 8]; 8],
 ) -> f32 {
+    let full_groups = dim / 8;
+    let remainder = dim % 8;
     let mut sum = 0.0f32;
-    for j in 0..dim {
-        let a_idx = codebook::extract_3bit_index(a_mse, j) as usize;
-        let b_idx = codebook::extract_3bit_index(b_mse, j) as usize;
+
+    for g in 0..full_groups {
+        let a_indices = codebook::extract_8_3bit_indices(a_mse, g);
+        let b_indices = codebook::extract_8_3bit_indices(b_mse, g);
+        for k in 0..8 {
+            sum += cross_table[a_indices[k] as usize][b_indices[k] as usize];
+        }
+    }
+
+    let base = full_groups * 8;
+    for j in 0..remainder {
+        let a_idx = codebook::extract_3bit_index(a_mse, base + j) as usize;
+        let b_idx = codebook::extract_3bit_index(b_mse, base + j) as usize;
         sum += cross_table[a_idx][b_idx];
     }
+
     sum
 }
 
