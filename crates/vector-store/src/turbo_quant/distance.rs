@@ -261,6 +261,76 @@ fn accumulate_cross_products(
     sum
 }
 
+/// Asymmetric float-vs-TQ4 inner product from packed bytes. Zero allocation.
+///
+/// Computes ⟨q, x⟩ where q is a full-precision float query (represented by its
+/// pre-rotated and pre-projected forms) and x is a packed TQ4 vector.
+///
+/// Used during HNSW construction (7.2 optimization) where the freshly inserted
+/// vector's float query state is available and the graph neighbor is packed TQ4.
+///
+/// # Arguments
+/// - `packed`: a packed TQ4 byte array (layout: [mse | qjl | gamma | norm])
+/// - `dim`: padded dimension d_pad
+/// - `inv_sqrt_d`: 1/√d for codebook scaling
+/// - `rotated_query`: Π · q (d_pad floats)
+/// - `projected_query`: S · (Π · q) (d_pad floats)
+#[allow(dead_code)]
+pub fn tq4_asymmetric_distance_packed(
+    packed: &[u8],
+    dim: usize,
+    inv_sqrt_d: f32,
+    rotated_query: &[f32],
+    projected_query: &[f32],
+) -> f32 {
+    let mse_len = (dim * 3).div_ceil(8);
+    let qjl_len = dim.div_ceil(8);
+
+    let mse_bytes = &packed[..mse_len];
+    let qjl_bytes = &packed[mse_len..mse_len + qjl_len];
+    let gamma = f32::from_le_bytes(
+        packed[mse_len + qjl_len..mse_len + qjl_len + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let norm = f32::from_le_bytes(
+        packed[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+            .try_into()
+            .unwrap(),
+    );
+
+    // MSE term: extract 3-bit indices and dot codebook centroids with rotated query
+    let full_groups = dim / 8;
+    let remainder = dim % 8;
+    let mut mse_ip = 0.0f32;
+    for g in 0..full_groups {
+        let indices = codebook::extract_8_3bit_indices(mse_bytes, g);
+        let base = g * 8;
+        for k in 0..8 {
+            mse_ip +=
+                CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d * rotated_query[base + k];
+        }
+    }
+    let base = full_groups * 8;
+    for j in 0..remainder {
+        let idx = codebook::extract_3bit_index(mse_bytes, base + j);
+        mse_ip += CENTROIDS_3BIT[idx as usize] * inv_sqrt_d * rotated_query[base + j];
+    }
+
+    // QJL correction term: √(π/2) / d · γ · Σ_j sign_j · projected_query_j
+    let mut dot_sum = 0.0f32;
+    for (j, &pq) in projected_query.iter().enumerate().take(dim) {
+        let byte_idx = j / 8;
+        let bit_idx = 7 - (j % 8);
+        let sign_bit = (qjl_bytes[byte_idx] >> bit_idx) & 1;
+        let sign_val = if sign_bit == 1 { 1.0f32 } else { -1.0 };
+        dot_sum += sign_val * pq;
+    }
+    let qjl_ip = ((std::f32::consts::PI / 2.0_f32).sqrt() / dim as f32) * gamma * dot_sum;
+
+    norm * (mse_ip + qjl_ip)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
