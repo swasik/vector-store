@@ -15,6 +15,7 @@
 use crate::turbo_quant::codebook;
 use crate::turbo_quant::qjl::QjlProjection;
 use crate::turbo_quant::rotation::RotationMatrix;
+use numkong::Dot;
 
 /// Packed TQ4 representation of a single vector.
 #[derive(Debug, Clone)]
@@ -154,8 +155,8 @@ impl Tq4Quantizer {
         let d_pad = self.padded_dim;
         debug_assert_eq!(vector.len(), d);
 
-        // Step 1: Original norm
-        let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // Step 1: Original norm (SIMD-accelerated via NumKong)
+        let norm: f32 = (f32::dot(vector, vector).unwrap_or(0.0) as f32).sqrt();
 
         // Short-circuit for zero vector
         if norm == 0.0 {
@@ -185,7 +186,7 @@ impl Tq4Quantizer {
             .zip(dequantized.iter())
             .map(|(y, y_hat)| y - y_hat)
             .collect();
-        let gamma: f32 = residual.iter().map(|r| r * r).sum::<f32>().sqrt();
+        let gamma: f32 = (f32::dot(&residual, &residual).unwrap_or(0.0) as f32).sqrt();
 
         // Step 6: QJL sign bits on normalized residual
         let qjl_signs = if gamma > 0.0 {
@@ -335,7 +336,7 @@ mod tests {
             let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
             let compressed = quantizer.quantize(&raw);
             assert!(
-                (compressed.norm - norm).abs() < 1e-5,
+                (compressed.norm - norm).abs() < 1e-4,
                 "Stored norm mismatch: {:.6} vs {:.6}",
                 compressed.norm,
                 norm

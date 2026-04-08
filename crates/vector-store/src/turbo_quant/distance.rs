@@ -37,8 +37,8 @@ impl Tq4Quantizer {
     pub fn prepare_query(&self, query: &[f32]) -> Tq4QueryState {
         let d_pad = self.padded_dim();
 
-        // Query norm
-        let query_norm: f32 = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // Query norm (SIMD-accelerated via NumKong)
+        let query_norm: f32 = (f32::dot(query, query).unwrap_or(0.0) as f32).sqrt();
 
         // Rotate query (NOT normalized — raw query is rotated so that
         // the MSE dot product preserves the ‖q‖ factor)

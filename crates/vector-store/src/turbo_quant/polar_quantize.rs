@@ -457,8 +457,8 @@ impl PolarQuantizer {
     pub fn quantize(&self, vector: &[f32]) -> PolarCompressedVector {
         let d_pad = self.padded_dim;
 
-        // Step 1: Original norm
-        let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // Step 1: Original norm (SIMD-accelerated via NumKong)
+        let norm: f32 = (f32::dot(vector, vector).unwrap_or(0.0) as f32).sqrt();
 
         if norm == 0.0 {
             let num_angles = d_pad - 1;
@@ -512,7 +512,7 @@ impl PolarQuantizer {
             .zip(approx_rotated.iter())
             .map(|(y, y_hat)| y - y_hat)
             .collect();
-        let gamma: f32 = residual.iter().map(|r| r * r).sum::<f32>().sqrt();
+        let gamma: f32 = (f32::dot(&residual, &residual).unwrap_or(0.0) as f32).sqrt();
 
         // Step 8: QJL sign bits on normalized residual
         let qjl_signs = if gamma > 0.0 {
@@ -616,7 +616,7 @@ impl PolarQuantizer {
     pub fn prepare_query(&self, query: &[f32]) -> PolarQueryState {
         let d_pad = self.padded_dim;
 
-        let query_norm: f32 = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let query_norm: f32 = (f32::dot(query, query).unwrap_or(0.0) as f32).sqrt();
 
         let mut rotated_query = vec![0.0f32; d_pad];
         self.rotation.forward_padded(query, &mut rotated_query);
@@ -923,7 +923,7 @@ mod tests {
             let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
             let compressed = quantizer.quantize(&raw);
             assert!(
-                (compressed.norm - norm).abs() < 1e-5,
+                (compressed.norm - norm).abs() < 1e-4,
                 "Stored norm mismatch: {:.6} vs {:.6}",
                 compressed.norm,
                 norm
