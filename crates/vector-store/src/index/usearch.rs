@@ -54,6 +54,10 @@ use usearch::ScalarKind;
 use usearch::b1x8;
 
 use crate::turbo_quant::distance::tq4_symmetric_distance;
+use crate::turbo_quant::polar_quantize::{
+    PolarCodebooks, PolarCompressedVector, PolarCrossTables, PolarQuantizer,
+    polar_symmetric_distance,
+};
 use crate::turbo_quant::{Tq4CompressedVector, Tq4Config, Tq4Quantizer};
 
 pub struct UsearchIndexFactory {
@@ -73,7 +77,9 @@ impl IndexFactory for UsearchIndexFactory {
             Mode::Usearch => {
                 let threads =
                     Handle::current().metrics().num_workers() + rayon::current_num_threads();
-                if index.quantization == Quantization::TQ4 {
+                if index.quantization == Quantization::TQ4
+                    || index.quantization == Quantization::I8
+                {
                     let dimension = index.dimensions.0.get();
                     let connectivity = index.connectivity.0;
                     let expansion_add = index.expansion_add.0;
@@ -82,6 +88,30 @@ impl IndexFactory for UsearchIndexFactory {
                     new(
                         move || {
                             Ok(Arc::new(ThreadedUsearchIndex::new_tq4(
+                                dimension,
+                                connectivity,
+                                expansion_add,
+                                expansion_search,
+                                space_type,
+                                threads,
+                            )?))
+                        },
+                        index.key,
+                        index.dimensions,
+                        table,
+                        Arc::clone(&self.tokio_semaphore),
+                        Arc::clone(&self.rayon_semaphore),
+                        memory,
+                    )
+                } else if index.quantization == Quantization::B1 {
+                    let dimension = index.dimensions.0.get();
+                    let connectivity = index.connectivity.0;
+                    let expansion_add = index.expansion_add.0;
+                    let expansion_search = index.expansion_search.0;
+                    let space_type = index.space_type;
+                    new(
+                        move || {
+                            Ok(Arc::new(ThreadedUsearchIndex::new_polar(
                                 dimension,
                                 connectivity,
                                 expansion_add,
@@ -196,6 +226,8 @@ struct ThreadedUsearchIndex {
     space_type: usearch::MetricKind,
     /// TQ4 state (None for non-TQ quantizations).
     tq4: Option<Tq4IndexState>,
+    /// PolarQuant state (None for non-Polar quantizations).
+    polar: Option<PolarIndexState>,
 }
 
 /// Per-index TQ4 state shared across all vectors.
@@ -209,6 +241,17 @@ struct Tq4IndexState {
     oversample_factor: f32,
 }
 
+/// Per-index PolarQuant state shared across all vectors.
+struct PolarIndexState {
+    quantizer: Arc<PolarQuantizer>,
+    /// Original vector dimension (before packing).
+    original_dimension: usize,
+    /// Packed PolarQuant size in bytes.
+    packed_dimension: usize,
+    /// Oversample factor for HNSW retrieval before asymmetric reranking.
+    oversample_factor: f32,
+}
+
 impl ThreadedUsearchIndex {
     fn new(options: IndexOptions, threads: usize) -> anyhow::Result<Self> {
         Ok(Self {
@@ -217,6 +260,7 @@ impl ThreadedUsearchIndex {
             quantization: options.quantization,
             space_type: options.metric,
             tq4: None,
+            polar: None,
         })
     }
 
@@ -291,6 +335,78 @@ impl ThreadedUsearchIndex {
                 packed_dimension: packed_dim,
                 oversample_factor: config.oversample_factor,
             }),
+            polar: None,
+        })
+    }
+
+    /// Create a PolarQuant index with custom metric for PolarQuant-to-PolarQuant distance.
+    fn new_polar(
+        original_dimension: usize,
+        connectivity: usize,
+        expansion_add: usize,
+        expansion_search: usize,
+        space_type: SpaceType,
+        threads: usize,
+    ) -> anyhow::Result<Self> {
+        let config = Tq4Config::default();
+        let packed_dim = PolarCompressedVector::packed_size(original_dimension);
+        let quantizer = Arc::new(PolarQuantizer::new(
+            original_dimension,
+            config.rotation_seed,
+            config.qjl_seed,
+        ));
+
+        let metric_kind = match space_type {
+            SpaceType::Cosine | SpaceType::DotProduct => MetricKind::IP,
+            _ => anyhow::bail!("PolarQuant only supports Cosine and DotProduct, got {space_type:?}"),
+        };
+
+        let options = IndexOptions {
+            dimensions: packed_dim,
+            connectivity,
+            expansion_add,
+            expansion_search,
+            metric: metric_kind,
+            quantization: ScalarKind::I8,
+            ..Default::default()
+        };
+        let mut inner = usearch::Index::new(&options)?;
+
+        let codebooks = PolarCodebooks::new(
+            original_dimension.next_power_of_two().trailing_zeros() as usize,
+        );
+        let tables = Arc::new(PolarCrossTables::new(&codebooks));
+        let padded_dim = quantizer.padded_dim();
+
+        inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
+            thread_local! {
+                static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            }
+            CONFIGURED.with(|c| {
+                if !c.get() {
+                    numkong::configure_thread();
+                    c.set(true);
+                }
+            });
+
+            let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
+            let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
+            let ip = polar_symmetric_distance(a, b, padded_dim, &tables);
+            usearch::Distance::from(1.0 - ip)
+        }));
+
+        Ok(Self {
+            inner,
+            threads,
+            quantization: ScalarKind::I8,
+            space_type: metric_kind,
+            tq4: None,
+            polar: Some(PolarIndexState {
+                quantizer,
+                original_dimension,
+                packed_dimension: packed_dim,
+                oversample_factor: config.oversample_factor,
+            }),
         })
     }
 }
@@ -317,6 +433,12 @@ impl UsearchIndex for ThreadedUsearchIndex {
             let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
             return Ok(self.inner.add(primary_id.into(), packed_i8)?);
         }
+        if let Some(polar) = &self.polar {
+            let compressed = polar.quantizer.quantize(vector.as_slice());
+            let packed = compressed.pack();
+            let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
+            return Ok(self.inner.add(primary_id.into(), packed_i8)?);
+        }
         if self.quantization == ScalarKind::B1 {
             let vector = f32_to_b1x8(vector.as_slice());
             return Ok(self.inner.add(primary_id.into(), &vector)?);
@@ -335,6 +457,9 @@ impl UsearchIndex for ThreadedUsearchIndex {
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<(PrimaryId, Distance)>>> {
         if let Some(tq4) = &self.tq4 {
             return self.tq4_search(tq4, vector, limit);
+        }
+        if let Some(polar) = &self.polar {
+            return self.polar_search(polar, vector, limit);
         }
         let matches = if self.quantization == ScalarKind::B1 {
             let vector = f32_to_b1x8(vector.as_slice());
@@ -362,6 +487,9 @@ impl UsearchIndex for ThreadedUsearchIndex {
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<(PrimaryId, Distance)>>> {
         if let Some(tq4) = &self.tq4 {
             return self.tq4_filtered_search(tq4, vector, limit, filter);
+        }
+        if let Some(polar) = &self.polar {
+            return self.polar_filtered_search(polar, vector, limit, filter);
         }
         let matches = if self.quantization == ScalarKind::B1 {
             let vector = f32_to_b1x8(vector.as_slice());
@@ -531,6 +659,149 @@ impl ThreadedUsearchIndex {
                     }
                     MetricKind::IP => -raw_ip,
                     _ => unreachable!("TQ4 only supports Cosine and DotProduct"),
+                };
+                Distance::try_from((distance, space_type.try_into()?, dim)).map(|dist| (id, dist))
+            })
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    /// PolarQuant search: oversample with HNSW, then rerank asymmetrically.
+    fn polar_search(
+        &self,
+        polar: &PolarIndexState,
+        vector: &Vector,
+        limit: Limit,
+    ) -> anyhow::Result<std::vec::IntoIter<anyhow::Result<(PrimaryId, Distance)>>> {
+        let oversample_limit = (limit.0.get() as f32 * polar.oversample_factor).ceil() as usize;
+        let compressed_query = polar.quantizer.quantize(vector.as_slice());
+        let packed_query = compressed_query.pack();
+        let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
+        let candidates = self.inner.search(packed_i8, oversample_limit)?;
+
+        let query_state = polar.quantizer.prepare_query(vector.as_slice());
+        let mut get_buf = vec![0i8; polar.packed_dimension];
+
+        let mut rerank_ids: Vec<PrimaryId> = Vec::with_capacity(candidates.keys.len());
+        let mut rerank_vecs: Vec<PolarCompressedVector> =
+            Vec::with_capacity(candidates.keys.len());
+        for &id in &candidates.keys {
+            get_buf.fill(0);
+            if let Ok(found) = self.inner.get(id, &mut get_buf) {
+                if found > 0 {
+                    let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                    let compressed =
+                        PolarCompressedVector::unpack(buf_u8, polar.original_dimension);
+                    rerank_ids.push(PrimaryId::from(id));
+                    rerank_vecs.push(compressed);
+                }
+            }
+        }
+
+        let ips = polar.quantizer.batch_inner_products(&query_state, &rerank_vecs);
+
+        let mut results: Vec<(PrimaryId, f32, f32)> = rerank_ids
+            .iter()
+            .zip(rerank_vecs.iter())
+            .zip(ips.iter())
+            .map(|((pid, c), &ip)| (*pid, ip, c.norm))
+            .collect();
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit.0.get());
+
+        let space_type = self.space_type;
+        let q_norm = query_state.query_norm;
+        let dim = vector.dim();
+
+        Ok(results
+            .into_iter()
+            .map(move |(id, raw_ip, x_norm)| {
+                let distance = match space_type {
+                    MetricKind::Cos => {
+                        let denom = q_norm * x_norm;
+                        let sim = if denom > 0.0 {
+                            (raw_ip / denom).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        1.0 - sim
+                    }
+                    MetricKind::IP => -raw_ip,
+                    _ => unreachable!("PolarQuant only supports Cosine and DotProduct"),
+                };
+                Distance::try_from((distance, space_type.try_into()?, dim)).map(|dist| (id, dist))
+            })
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    /// PolarQuant filtered search: same as polar_search but with a filter predicate.
+    fn polar_filtered_search(
+        &self,
+        polar: &PolarIndexState,
+        vector: &Vector,
+        limit: Limit,
+        filter: impl Fn(PrimaryId) -> bool,
+    ) -> anyhow::Result<std::vec::IntoIter<anyhow::Result<(PrimaryId, Distance)>>> {
+        let oversample_limit = (limit.0.get() as f32 * polar.oversample_factor).ceil() as usize;
+        let compressed_query = polar.quantizer.quantize(vector.as_slice());
+        let packed_query = compressed_query.pack();
+        let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
+        let candidates = self
+            .inner
+            .filtered_search(packed_i8, oversample_limit, |row_id| filter(row_id.into()))?;
+
+        let query_state = polar.quantizer.prepare_query(vector.as_slice());
+        let mut get_buf = vec![0i8; polar.packed_dimension];
+
+        let mut rerank_ids: Vec<PrimaryId> = Vec::with_capacity(candidates.keys.len());
+        let mut rerank_vecs: Vec<PolarCompressedVector> =
+            Vec::with_capacity(candidates.keys.len());
+        for &id in &candidates.keys {
+            get_buf.fill(0);
+            if let Ok(found) = self.inner.get(id, &mut get_buf) {
+                if found > 0 {
+                    let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
+                    let compressed =
+                        PolarCompressedVector::unpack(buf_u8, polar.original_dimension);
+                    rerank_ids.push(PrimaryId::from(id));
+                    rerank_vecs.push(compressed);
+                }
+            }
+        }
+
+        let ips = polar.quantizer.batch_inner_products(&query_state, &rerank_vecs);
+
+        let mut results: Vec<(PrimaryId, f32, f32)> = rerank_ids
+            .iter()
+            .zip(rerank_vecs.iter())
+            .zip(ips.iter())
+            .map(|((pid, c), &ip)| (*pid, ip, c.norm))
+            .collect();
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit.0.get());
+
+        let space_type = self.space_type;
+        let q_norm = query_state.query_norm;
+        let dim = vector.dim();
+
+        Ok(results
+            .into_iter()
+            .map(move |(id, raw_ip, x_norm)| {
+                let distance = match space_type {
+                    MetricKind::Cos => {
+                        let denom = q_norm * x_norm;
+                        let sim = if denom > 0.0 {
+                            (raw_ip / denom).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        1.0 - sim
+                    }
+                    MetricKind::IP => -raw_ip,
+                    _ => unreachable!("PolarQuant only supports Cosine and DotProduct"),
                 };
                 Distance::try_from((distance, space_type.try_into()?, dim)).map(|dist| (id, dist))
             })
