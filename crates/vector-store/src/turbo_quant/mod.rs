@@ -70,7 +70,7 @@ pub struct Tq4Config {
 impl Default for Tq4Config {
     fn default() -> Self {
         Self {
-            oversample_factor: 3.0,
+            oversample_factor: 1.5,
             rotation_seed: 42,
             qjl_seed: 137,
         }

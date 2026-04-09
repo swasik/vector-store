@@ -2389,7 +2389,7 @@ mod tests {
         #[ignore] // Requires internet access + slow
         fn polar_quant_recall_at_10_dbpedia_openai() {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { dbpedia_openai_polar_recall_inner(10).await });
+            let result = rt.block_on(async { dbpedia_openai_polar_recall_inner(10, 3.0).await });
             match result {
                 Ok(recall) => {
                     eprintln!("PolarQuant recall@10 (DBpedia OpenAI, d=1536, n=1000): {recall:.3}");
@@ -2404,7 +2404,32 @@ mod tests {
             }
         }
 
-        async fn dbpedia_openai_polar_recall_inner(k: usize) -> Result<f32, String> {
+        /// Sweep oversampling factors (1x, 3x, 5x) and report recall@10 on DBpedia.
+        #[test]
+        #[ignore] // Requires internet access + slow
+        fn polar_quant_recall_oversample_sweep_dbpedia() {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let factors = [1.0f32, 1.25, 1.5, 3.0, 5.0];
+            for &f in &factors {
+                let result = rt.block_on(async { dbpedia_openai_polar_recall_inner(10, f).await });
+                match result {
+                    Ok(recall) => {
+                        eprintln!(
+                            "oversample={f:.0}x  recall@10={recall:.4}  ({:.1}%)",
+                            recall * 100.0
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("oversample={f:.0}x  FAILED: {e}");
+                    }
+                }
+            }
+        }
+
+        async fn dbpedia_openai_polar_recall_inner(
+            k: usize,
+            oversample_factor: f32,
+        ) -> Result<f32, String> {
             let client = reqwest::Client::new();
             let n_pages = 10;
             let rows_per_page = 100;
@@ -2457,7 +2482,6 @@ mod tests {
             );
 
             // Build PolarQuant HNSW index
-            let oversample_factor = 3.0f32;
             let packed_dim = PolarCompressedVector::packed_size(dim);
             let quantizer = Arc::new(PolarQuantizer::new(dim, 42, 137));
             let codebooks = PolarCodebooks::new(dim.next_power_of_two().trailing_zeros() as usize);
