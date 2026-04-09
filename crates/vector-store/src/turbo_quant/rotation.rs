@@ -26,14 +26,14 @@ use rand::{Rng, SeedableRng};
 /// Shared across all vectors in an index; regenerated deterministically
 /// from `seed` on every restart.
 pub struct RotationMatrix {
-    /// Diagonal D: +1.0 or -1.0 per coordinate, length = padded_dim.
-    signs: Vec<f32>,
+    /// Diagonal D: random ±1 signs per coordinate.
+    pub(crate) signs: Vec<f32>,
     /// Original vector dimension d.
     dimension: usize,
     /// Next power of 2 ≥ dimension (e.g., 1024 for d=768).
     padded_dim: usize,
     /// 1/√padded_dim, applied after the unnormalized butterfly.
-    inv_sqrt_d_pad: f32,
+    pub(crate) inv_sqrt_d_pad: f32,
 }
 
 impl RotationMatrix {
@@ -44,7 +44,13 @@ impl RotationMatrix {
 
         let mut rng = StdRng::seed_from_u64(seed);
         let signs: Vec<f32> = (0..padded_dim)
-            .map(|_| if rng.random_bool(0.5) { 1.0 } else { -1.0 })
+            .map(|_| {
+                if rng.random_bool(0.5) {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
+            })
             .collect();
 
         Self {
@@ -76,7 +82,7 @@ impl RotationMatrix {
 
         // Zero-padded working buffer
         let mut buf = vec![0.0f32; self.padded_dim];
-        // Apply diagonal D: buf[i] = signs[i] * x[i] for i < d, rest stays 0
+        // Apply diagonal D
         for i in 0..self.dimension {
             buf[i] = self.signs[i] * x[i];
         }
@@ -112,12 +118,12 @@ impl RotationMatrix {
         debug_assert_eq!(x.len(), self.dimension);
         debug_assert_eq!(out.len(), self.padded_dim);
 
-        // Apply diagonal D directly into output buffer (zero-padded)
+        // Apply diagonal D directly into output buffer
         for i in 0..self.dimension {
             out[i] = self.signs[i] * x[i];
         }
-        for i in self.dimension..self.padded_dim {
-            out[i] = 0.0;
+        for v in out[self.dimension..self.padded_dim].iter_mut() {
+            *v = 0.0;
         }
 
         // Unnormalized Walsh-Hadamard butterfly (in-place on output)
@@ -140,8 +146,9 @@ impl RotationMatrix {
         let mut buf = y.to_vec();
         hadamard_transform(&mut buf);
 
+        // Apply D and scale by 1/√d_pad
         for i in 0..self.dimension {
-            out[i] = buf[i] * self.inv_sqrt_d_pad * self.signs[i];
+            out[i] = self.signs[i] * buf[i] * self.inv_sqrt_d_pad;
         }
     }
 
@@ -160,9 +167,9 @@ impl RotationMatrix {
         // Apply normalized Hadamard
         hadamard_transform(&mut buf);
 
-        // Scale by 1/√d_pad and multiply by D (self-inverse diagonal)
+        // Scale by 1/√d_pad and apply D
         for i in 0..self.dimension {
-            out[i] = buf[i] * self.inv_sqrt_d_pad * self.signs[i];
+            out[i] = self.signs[i] * buf[i] * self.inv_sqrt_d_pad;
         }
     }
 
@@ -173,7 +180,7 @@ impl RotationMatrix {
         buf[..self.dimension].copy_from_slice(data);
         hadamard_transform(&mut buf);
         for i in 0..self.dimension {
-            data[i] = buf[i] * self.inv_sqrt_d_pad * self.signs[i];
+            data[i] = self.signs[i] * buf[i] * self.inv_sqrt_d_pad;
         }
     }
 }
@@ -186,6 +193,7 @@ impl RotationMatrix {
 ///
 /// The result is the *unnormalized* Hadamard transform; multiply by
 /// `1/√n` after calling to obtain an orthonormal transform.
+///
 pub(crate) fn hadamard_transform(data: &mut [f32]) {
     let n = data.len();
     debug_assert!(n.is_power_of_two(), "Hadamard requires power-of-2 length");

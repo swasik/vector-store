@@ -69,7 +69,7 @@ pub struct QjlProjection {
 impl QjlProjection {
     /// Create from deterministic seed. Same seed + dimension = same projection.
     ///
-    /// Generates d random ±1 signs. Storage: O(d) instead of O(d²).
+    /// Generates d random ±1 sign bitmasks. Storage: O(d) instead of O(d²).
     /// For d=1536: ~6 KB vs ~9.4 MB with dense Gaussian matrix.
     pub fn from_seed(dimension: usize, seed: u64) -> Self {
         debug_assert!(
@@ -78,7 +78,13 @@ impl QjlProjection {
         );
         let mut rng = StdRng::seed_from_u64(seed);
         let signs: Vec<f32> = (0..dimension)
-            .map(|_| if rng.random_bool(0.5) { 1.0 } else { -1.0 })
+            .map(|_| {
+                if rng.random_bool(0.5) {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
+            })
             .collect();
         let inv_sqrt_d = 1.0 / (dimension as f32).sqrt();
 
@@ -103,19 +109,61 @@ impl QjlProjection {
         debug_assert_eq!(x.len(), self.dimension);
         let d = self.dimension;
 
-        // Apply diagonal D: buf[i] = signs[i] * x[i]
-        let mut buf: Vec<f32> = x.iter().zip(self.signs.iter()).map(|(&xi, &si)| xi * si).collect();
+        // Apply diagonal D
+        let mut buf: Vec<f32> = x
+            .iter()
+            .zip(self.signs.iter())
+            .map(|(&xi, &si)| xi * si)
+            .collect();
 
         // Walsh-Hadamard transform: O(d log d)
         hadamard_transform(&mut buf);
 
-        // Extract sign bits (1/√d doesn't affect signs)
+        // Extract sign bits 8 at a time (1/√d doesn't affect signs)
         let packed_len = d.div_ceil(8);
         let mut packed = vec![0u8; packed_len];
-        for i in 0..d {
-            if buf[i] >= 0.0 {
-                packed[i / 8] |= 1 << (7 - (i % 8));
+        let full_bytes = d / 8;
+        for (byte_idx, p) in packed.iter_mut().enumerate().take(full_bytes) {
+            let base = byte_idx * 8;
+            let b = &buf[base..base + 8];
+            let mut byte_val = 0u8;
+            if b[0] >= 0.0 {
+                byte_val |= 0x80;
             }
+            if b[1] >= 0.0 {
+                byte_val |= 0x40;
+            }
+            if b[2] >= 0.0 {
+                byte_val |= 0x20;
+            }
+            if b[3] >= 0.0 {
+                byte_val |= 0x10;
+            }
+            if b[4] >= 0.0 {
+                byte_val |= 0x08;
+            }
+            if b[5] >= 0.0 {
+                byte_val |= 0x04;
+            }
+            if b[6] >= 0.0 {
+                byte_val |= 0x02;
+            }
+            if b[7] >= 0.0 {
+                byte_val |= 0x01;
+            }
+            *p = byte_val;
+        }
+        // Handle remainder
+        let remainder = d % 8;
+        if remainder > 0 {
+            let base = full_bytes * 8;
+            let mut byte_val = 0u8;
+            for r in 0..remainder {
+                if buf[base + r] >= 0.0 {
+                    byte_val |= 0x80 >> r;
+                }
+            }
+            packed[full_bytes] = byte_val;
         }
         packed
     }
@@ -128,8 +176,12 @@ impl QjlProjection {
     pub fn project_query(&self, q: &[f32]) -> Vec<f32> {
         debug_assert_eq!(q.len(), self.dimension);
 
-        // Apply diagonal D: buf[i] = signs[i] * q[i]
-        let mut buf: Vec<f32> = q.iter().zip(self.signs.iter()).map(|(&qi, &si)| qi * si).collect();
+        // Apply diagonal D
+        let mut buf: Vec<f32> = q
+            .iter()
+            .zip(self.signs.iter())
+            .map(|(&qi, &si)| qi * si)
+            .collect();
 
         // Walsh-Hadamard transform: O(d log d)
         hadamard_transform(&mut buf);
@@ -155,14 +207,60 @@ impl QjlProjection {
         let d = self.dimension;
         debug_assert_eq!(projected_query.len(), d);
 
-        // Dot product of unpacked ±1 signs with projected query
+        // Process 8 elements per byte for the bulk of the data.
+        // For each byte, compute sum_positive (bit=1) and sum_all;
+        // contribution = 2*sum_positive - sum_all (since sign = 2*bit - 1).
+        let full_bytes = d / 8;
         let mut dot_sum = 0.0f32;
-        for (j, &pq) in projected_query.iter().enumerate().take(d) {
-            let byte_idx = j / 8;
-            let bit_idx = 7 - (j % 8);
-            let sign_bit = (signs[byte_idx] >> bit_idx) & 1;
-            let sign_val = if sign_bit == 1 { 1.0f32 } else { -1.0 };
-            dot_sum += sign_val * pq;
+
+        for (byte_idx, &byte) in signs.iter().enumerate().take(full_bytes) {
+            let base = byte_idx * 8;
+            let pq = &projected_query[base..base + 8];
+
+            // Sum of all 8 elements
+            let sum_all = pq[0] + pq[1] + pq[2] + pq[3] + pq[4] + pq[5] + pq[6] + pq[7];
+
+            // Sum of elements where bit=1 (MSB first: bit 7 is pq[0])
+            let mut sum_pos = 0.0f32;
+            if byte & 0x80 != 0 {
+                sum_pos += pq[0];
+            }
+            if byte & 0x40 != 0 {
+                sum_pos += pq[1];
+            }
+            if byte & 0x20 != 0 {
+                sum_pos += pq[2];
+            }
+            if byte & 0x10 != 0 {
+                sum_pos += pq[3];
+            }
+            if byte & 0x08 != 0 {
+                sum_pos += pq[4];
+            }
+            if byte & 0x04 != 0 {
+                sum_pos += pq[5];
+            }
+            if byte & 0x02 != 0 {
+                sum_pos += pq[6];
+            }
+            if byte & 0x01 != 0 {
+                sum_pos += pq[7];
+            }
+
+            // sign_j * pq_j = (2*bit-1)*pq_j; sum = 2*sum_pos - sum_all
+            dot_sum += 2.0 * sum_pos - sum_all;
+        }
+
+        // Handle remaining elements (d % 8 != 0)
+        let remainder = d % 8;
+        if remainder > 0 {
+            let byte = signs[full_bytes];
+            let base = full_bytes * 8;
+            for r in 0..remainder {
+                let bit = (byte >> (7 - r)) & 1;
+                let sign_val = if bit == 1 { 1.0f32 } else { -1.0 };
+                dot_sum += sign_val * projected_query[base + r];
+            }
         }
 
         // √(π/2) / d · γ · dot_sum

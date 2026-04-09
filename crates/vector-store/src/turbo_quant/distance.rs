@@ -85,7 +85,8 @@ impl Tq4Quantizer {
         let base = full_groups * 8;
         for j in 0..remainder {
             let idx = codebook::extract_3bit_index(&compressed.mse_indices, base + j);
-            mse_ip += CENTROIDS_3BIT[idx as usize] * inv_sqrt_d * query_state.rotated_query[base + j];
+            mse_ip +=
+                CENTROIDS_3BIT[idx as usize] * inv_sqrt_d * query_state.rotated_query[base + j];
         }
 
         // QJL correction term: (π/2)/d · γ · Σ_j sign_j · projected_query_j
@@ -120,8 +121,7 @@ impl Tq4Quantizer {
         for candidate in candidates {
             // Gather centroids using batch extraction
             for g in 0..full_groups {
-                let indices =
-                    codebook::extract_8_3bit_indices(&candidate.mse_indices, g);
+                let indices = codebook::extract_8_3bit_indices(&candidate.mse_indices, g);
                 let base = g * 8;
                 for k in 0..8 {
                     centroids[base + k] = CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d;
@@ -134,8 +134,7 @@ impl Tq4Quantizer {
             }
 
             // SIMD dot product for MSE term (f64 accumulation for accuracy)
-            let mse_ip =
-                f32::dot(&centroids, &query_state.rotated_query).unwrap_or(0.0) as f32;
+            let mse_ip = f32::dot(&centroids, &query_state.rotated_query).unwrap_or(0.0) as f32;
 
             // QJL correction term
             let qjl_ip = self.qjl().inner_product_term(
@@ -307,8 +306,7 @@ pub fn tq4_asymmetric_distance_packed(
         let indices = codebook::extract_8_3bit_indices(mse_bytes, g);
         let base = g * 8;
         for k in 0..8 {
-            mse_ip +=
-                CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d * rotated_query[base + k];
+            mse_ip += CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d * rotated_query[base + k];
         }
     }
     let base = full_groups * 8;

@@ -28,7 +28,10 @@ use std::f32::consts::PI;
 /// Requires d to be a power of 2.
 pub fn cartesian_to_polar(x: &[f32]) -> (Vec<f32>, f32) {
     let d = x.len();
-    debug_assert!(d.is_power_of_two(), "PolarQuant requires power-of-2 dimension");
+    debug_assert!(
+        d.is_power_of_two(),
+        "PolarQuant requires power-of-2 dimension"
+    );
     debug_assert!(d >= 2, "Dimension must be at least 2");
 
     let num_levels = d.trailing_zeros() as usize; // log2(d)
@@ -157,10 +160,7 @@ mod tests {
             .zip(reconstructed.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(
-            max_err < 1e-5,
-            "Roundtrip error too large: {max_err}"
-        );
+        assert!(max_err < 1e-5, "Roundtrip error too large: {max_err}");
     }
 
     #[test]
@@ -180,10 +180,7 @@ mod tests {
                 .zip(reconstructed.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(
-                max_err < 1e-4,
-                "Roundtrip error too large: {max_err}"
-            );
+            assert!(max_err < 1e-4, "Roundtrip error too large: {max_err}");
         }
     }
 
