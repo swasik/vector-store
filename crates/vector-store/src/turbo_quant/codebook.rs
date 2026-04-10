@@ -144,6 +144,94 @@ pub fn cross_product_table_3bit(inv_sqrt_d: f32) -> [[f32; 8]; 8] {
     table
 }
 
+// ---------------------------------------------------------------------------
+// Interleaved 4-bit nibble layout (3-bit MSE index + 1-bit QJL sign)
+// ---------------------------------------------------------------------------
+
+/// Encode a vector to raw 3-bit centroid indices (one byte per coordinate).
+///
+/// Returns values 0-7, one per coordinate. Used as input for the interleaved
+/// nibble packing where each 4-bit nibble stores MSE index (3 bits) + QJL
+/// sign (1 bit).
+pub fn encode_vector_3bit_raw(rotated: &[f32], inv_sqrt_d: f32) -> Vec<u8> {
+    rotated
+        .iter()
+        .map(|&val| encode_scalar_3bit(val, inv_sqrt_d))
+        .collect()
+}
+
+/// Decode raw 3-bit centroid indices to f32 centroid values.
+pub fn decode_vector_3bit_raw(indices: &[u8], inv_sqrt_d: f32) -> Vec<f32> {
+    indices
+        .iter()
+        .map(|&idx| decode_scalar_3bit(idx, inv_sqrt_d))
+        .collect()
+}
+
+/// Interleave MSE indices and QJL sign bits into packed 4-bit nibbles.
+///
+/// Each nibble stores: bit 3 = QJL sign, bits 2-0 = MSE centroid index (0-7).
+/// Two nibbles per byte: high nibble (bits 7-4) = even dimension,
+/// low nibble (bits 3-0) = odd dimension.
+///
+/// This interleaved format enables trivial extraction (shift + mask) and
+/// produces the same total packed size as the separate 3-bit + 1-bit layout.
+///
+/// # Arguments
+/// - `mse_raw`: raw MSE centroid indices (0-7), length d_pad
+/// - `qjl_signs`: packed QJL sign bits (MSB-first), length d_pad/8
+///
+/// # Returns
+/// Interleaved nibble bytes, length d_pad/2.
+pub fn interleave_nibbles(mse_raw: &[u8], qjl_signs: &[u8], d_pad: usize) -> Vec<u8> {
+    debug_assert_eq!(mse_raw.len(), d_pad);
+    debug_assert_eq!(qjl_signs.len(), d_pad.div_ceil(8));
+
+    let nibble_len = d_pad / 2;
+    let mut nibbles = vec![0u8; nibble_len];
+
+    for (byte_idx, nibble) in nibbles.iter_mut().enumerate() {
+        let dim_even = byte_idx * 2;
+        let dim_odd = byte_idx * 2 + 1;
+
+        let qjl_even = (qjl_signs[dim_even / 8] >> (7 - (dim_even % 8))) & 1;
+        let qjl_odd = (qjl_signs[dim_odd / 8] >> (7 - (dim_odd % 8))) & 1;
+
+        let hi = (qjl_even << 3) | (mse_raw[dim_even] & 0x07);
+        let lo = (qjl_odd << 3) | (mse_raw[dim_odd] & 0x07);
+        *nibble = (hi << 4) | lo;
+    }
+
+    nibbles
+}
+
+/// Extract contiguous QJL sign bits from interleaved nibble bytes.
+///
+/// Returns packed QJL signs in the same MSB-first format as `qjl.quantize()`,
+/// suitable for passing to `QjlProjection::inner_product_term()`.
+pub fn extract_qjl_from_nibbles(nibbles: &[u8], d_pad: usize) -> Vec<u8> {
+    let qjl_len = d_pad.div_ceil(8);
+    let mut qjl_signs = vec![0u8; qjl_len];
+
+    for (byte_idx, &nib) in nibbles.iter().enumerate() {
+        let dim_even = byte_idx * 2;
+        let dim_odd = byte_idx * 2 + 1;
+
+        // QJL sign is bit 3 of each nibble → bit 7 and bit 3 of the byte
+        let qjl_even = (nib >> 7) & 1;
+        let qjl_odd = (nib >> 3) & 1;
+
+        if qjl_even != 0 {
+            qjl_signs[dim_even / 8] |= 1 << (7 - (dim_even % 8));
+        }
+        if qjl_odd != 0 {
+            qjl_signs[dim_odd / 8] |= 1 << (7 - (dim_odd % 8));
+        }
+    }
+
+    qjl_signs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +341,51 @@ mod tests {
                     "Cross table mismatch at [{i}][{j}]"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn nibble_interleave_roundtrip() {
+        let d = 128;
+        let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+        let values: Vec<f32> = (0..d).map(|i| CENTROIDS_3BIT[i % 8] * inv_sqrt_d).collect();
+        let mse_raw = encode_vector_3bit_raw(&values, inv_sqrt_d);
+
+        // Synthetic QJL signs: alternating pattern
+        let qjl_signs: Vec<u8> = (0..d / 8)
+            .map(|i| if i % 2 == 0 { 0xAA } else { 0x55 })
+            .collect();
+
+        let nibbles = interleave_nibbles(&mse_raw, &qjl_signs, d);
+        assert_eq!(nibbles.len(), d / 2);
+
+        // Verify MSE indices survive the roundtrip
+        for byte_idx in 0..nibbles.len() {
+            let dim_even = byte_idx * 2;
+            let dim_odd = byte_idx * 2 + 1;
+            let hi = (nibbles[byte_idx] >> 4) & 0x07;
+            let lo = nibbles[byte_idx] & 0x07;
+            assert_eq!(hi, mse_raw[dim_even], "MSE mismatch at dim {dim_even}");
+            assert_eq!(lo, mse_raw[dim_odd], "MSE mismatch at dim {dim_odd}");
+        }
+
+        // Verify QJL roundtrip
+        let extracted_qjl = extract_qjl_from_nibbles(&nibbles, d);
+        assert_eq!(extracted_qjl, qjl_signs, "QJL roundtrip failed");
+    }
+
+    #[test]
+    fn raw_encode_decode_roundtrip() {
+        let d = 768;
+        let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+        let values: Vec<f32> = (0..d).map(|i| CENTROIDS_3BIT[i % 8] * inv_sqrt_d).collect();
+        let raw = encode_vector_3bit_raw(&values, inv_sqrt_d);
+        let decoded = decode_vector_3bit_raw(&raw, inv_sqrt_d);
+        for (j, (orig, dec)) in values.iter().zip(decoded.iter()).enumerate() {
+            assert!(
+                (orig - dec).abs() < 1e-6,
+                "Mismatch at dim {j}: orig={orig}, decoded={dec}"
+            );
         }
     }
 }

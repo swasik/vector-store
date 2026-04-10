@@ -5,6 +5,10 @@
 
 //! TQ4 distance computation for HNSW metric and asymmetric reranking.
 //!
+//! Uses the interleaved 4-bit nibble layout where each coordinate is stored
+//! as a single nibble: bit 3 = QJL sign, bits 2-0 = MSE centroid index.
+//! Two nibbles per byte (high nibble = even dimension, low nibble = odd).
+//!
 //! Two distance modes:
 //! 1. **Symmetric** (TQ4-to-TQ4): Used by USearch custom metric during HNSW
 //!    graph traversal. Computes approximate inner product from two packed TQ4
@@ -14,7 +18,7 @@
 
 use crate::turbo_quant::codebook::{self, CENTROIDS_3BIT};
 use crate::turbo_quant::quantize::{Tq4CompressedVector, Tq4Quantizer};
-use numkong::{Dot, Hamming, u1x8};
+use numkong::Dot;
 
 /// Precomputed query state for efficient asymmetric TQ4 distance computation.
 ///
@@ -68,30 +72,23 @@ impl Tq4Quantizer {
     ) -> f32 {
         let d_pad = self.padded_dim();
         let inv_sqrt_d = self.inv_sqrt_d();
-        let full_groups = d_pad / 8;
-        let remainder = d_pad % 8;
+        let nibble_len = d_pad / 2;
 
-        // MSE term: batch-extract 8 indices at a time to reduce bit-manipulation overhead
+        // MSE term: extract indices from interleaved nibbles
         let mut mse_ip = 0.0f32;
-        for g in 0..full_groups {
-            let indices = codebook::extract_8_3bit_indices(&compressed.mse_indices, g);
-            let base = g * 8;
-            for k in 0..8 {
-                mse_ip += CENTROIDS_3BIT[indices[k] as usize]
-                    * inv_sqrt_d
-                    * query_state.rotated_query[base + k];
-            }
-        }
-        let base = full_groups * 8;
-        for j in 0..remainder {
-            let idx = codebook::extract_3bit_index(&compressed.mse_indices, base + j);
-            mse_ip +=
-                CENTROIDS_3BIT[idx as usize] * inv_sqrt_d * query_state.rotated_query[base + j];
+        for byte_idx in 0..nibble_len {
+            let dim_even = byte_idx * 2;
+            let dim_odd = byte_idx * 2 + 1;
+            let hi = ((compressed.nibbles[byte_idx] >> 4) & 0x07) as usize;
+            let lo = (compressed.nibbles[byte_idx] & 0x07) as usize;
+            mse_ip += CENTROIDS_3BIT[hi] * inv_sqrt_d * query_state.rotated_query[dim_even];
+            mse_ip += CENTROIDS_3BIT[lo] * inv_sqrt_d * query_state.rotated_query[dim_odd];
         }
 
-        // QJL correction term: (π/2)/d · γ · Σ_j sign_j · projected_query_j
+        // QJL correction term: extract QJL signs from nibbles
+        let qjl_signs = codebook::extract_qjl_from_nibbles(&compressed.nibbles, d_pad);
         let qjl_ip = self.qjl().inner_product_term(
-            &compressed.qjl_signs,
+            &qjl_signs,
             &query_state.projected_query,
             compressed.gamma,
         );
@@ -113,24 +110,12 @@ impl Tq4Quantizer {
         let d_pad = dimension.next_power_of_two();
         debug_assert_eq!(d_pad, self.padded_dim());
 
-        let mse_len = (d_pad * 3).div_ceil(8);
-        let qjl_len = d_pad.div_ceil(8);
-        let mse_indices = &packed[..mse_len];
-        let qjl_signs = &packed[mse_len..mse_len + qjl_len];
-        let gamma = f32::from_le_bytes(
-            packed[mse_len + qjl_len..mse_len + qjl_len + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let norm = f32::from_le_bytes(
-            packed[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let nibble_len = d_pad / 2;
+        let nibbles = &packed[..nibble_len];
+        let gamma = f32::from_le_bytes(packed[nibble_len..nibble_len + 4].try_into().unwrap());
+        let norm = f32::from_le_bytes(packed[nibble_len + 4..nibble_len + 8].try_into().unwrap());
 
         let inv_sqrt_d = self.inv_sqrt_d();
-        let full_groups = d_pad / 8;
-        let remainder = d_pad % 8;
 
         thread_local! {
             static CENTROIDS: std::cell::RefCell<Vec<f32>> = const {
@@ -144,25 +129,24 @@ impl Tq4Quantizer {
                 centroids.resize(d_pad, 0.0);
             }
 
-            for g in 0..full_groups {
-                let indices = codebook::extract_8_3bit_indices(mse_indices, g);
-                let base = g * 8;
-                for k in 0..8 {
-                    centroids[base + k] = CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d;
-                }
-            }
-
-            let base = full_groups * 8;
-            for j in 0..remainder {
-                let idx = codebook::extract_3bit_index(mse_indices, base + j);
-                centroids[base + j] = CENTROIDS_3BIT[idx as usize] * inv_sqrt_d;
+            // Extract MSE centroids from interleaved nibbles
+            for (byte_idx, &nib) in nibbles.iter().enumerate() {
+                let dim_even = byte_idx * 2;
+                let dim_odd = byte_idx * 2 + 1;
+                let hi = ((nib >> 4) & 0x07) as usize;
+                let lo = (nib & 0x07) as usize;
+                centroids[dim_even] = CENTROIDS_3BIT[hi] * inv_sqrt_d;
+                centroids[dim_odd] = CENTROIDS_3BIT[lo] * inv_sqrt_d;
             }
 
             let mse_ip = f32::dot(&centroids[..d_pad], &query_state.rotated_query[..d_pad])
                 .unwrap_or(0.0) as f32;
+
+            // Extract QJL signs from nibbles for inner_product_term
+            let qjl_signs = codebook::extract_qjl_from_nibbles(nibbles, d_pad);
             let qjl_ip =
                 self.qjl()
-                    .inner_product_term(qjl_signs, &query_state.projected_query, gamma);
+                    .inner_product_term(&qjl_signs, &query_state.projected_query, gamma);
 
             norm * (mse_ip + qjl_ip)
         })
@@ -180,33 +164,29 @@ impl Tq4Quantizer {
     ) -> Vec<f32> {
         let d_pad = self.padded_dim();
         let inv_sqrt_d = self.inv_sqrt_d();
-        let full_groups = d_pad / 8;
-        let remainder = d_pad % 8;
+        let nibble_len = d_pad / 2;
 
         let mut centroids = vec![0.0f32; d_pad];
         let mut results = Vec::with_capacity(candidates.len());
 
         for candidate in candidates {
-            // Gather centroids using batch extraction
-            for g in 0..full_groups {
-                let indices = codebook::extract_8_3bit_indices(&candidate.mse_indices, g);
-                let base = g * 8;
-                for k in 0..8 {
-                    centroids[base + k] = CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d;
-                }
-            }
-            let base = full_groups * 8;
-            for j in 0..remainder {
-                let idx = codebook::extract_3bit_index(&candidate.mse_indices, base + j);
-                centroids[base + j] = CENTROIDS_3BIT[idx as usize] * inv_sqrt_d;
+            // Gather centroids from interleaved nibbles
+            for byte_idx in 0..nibble_len {
+                let dim_even = byte_idx * 2;
+                let dim_odd = byte_idx * 2 + 1;
+                let hi = ((candidate.nibbles[byte_idx] >> 4) & 0x07) as usize;
+                let lo = (candidate.nibbles[byte_idx] & 0x07) as usize;
+                centroids[dim_even] = CENTROIDS_3BIT[hi] * inv_sqrt_d;
+                centroids[dim_odd] = CENTROIDS_3BIT[lo] * inv_sqrt_d;
             }
 
             // SIMD dot product for MSE term (f64 accumulation for accuracy)
             let mse_ip = f32::dot(&centroids, &query_state.rotated_query).unwrap_or(0.0) as f32;
 
-            // QJL correction term
+            // QJL correction term: extract signs from nibbles
+            let qjl_signs = codebook::extract_qjl_from_nibbles(&candidate.nibbles, d_pad);
             let qjl_ip = self.qjl().inner_product_term(
-                &candidate.qjl_signs,
+                &qjl_signs,
                 &query_state.projected_query,
                 candidate.gamma,
             );
@@ -247,14 +227,15 @@ pub fn precompute_cos_table(dim: usize) -> Vec<f32> {
 
 /// TQ4-to-TQ4 symmetric distance for USearch custom metric.
 ///
-/// Computes approximate inner product from two packed TQ4 representations:
+/// Computes approximate inner product from two packed TQ4 representations
+/// using the interleaved nibble layout:
 ///   ⟨a, b⟩ ≈ norm_a · norm_b · (mse_term + qjl_term)
 ///
-/// - MSE term: cross-product table lookup over 3-bit index pairs
-/// - QJL term: Hamming distance on sign bits → cosine correction
+/// - MSE term: cross-product table lookup over 3-bit index pairs (nibble & 0x07)
+/// - QJL term: Hamming on interleaved sign bits (nibble bit 3) → cosine correction
 ///
 /// # Arguments
-/// - `a`, `b`: packed TQ4 byte arrays (layout: [mse | qjl | gamma | norm])
+/// - `a`, `b`: packed TQ4 byte arrays (layout: [nibbles | gamma | norm])
 /// - `dim`: padded dimension d_pad
 /// - `cross_table`: precomputed 8×8 cross-product table
 /// - `cos_table`: precomputed cos(π·k/d) for k ∈ [0, d] (from `precompute_cos_table`)
@@ -267,44 +248,25 @@ pub fn tq4_symmetric_distance(
     cross_table: &[[f32; 8]; 8],
     cos_table: &[f32],
 ) -> f32 {
-    let mse_len = (dim * 3).div_ceil(8);
-    let qjl_len = dim.div_ceil(8);
+    let nibble_len = dim / 2;
 
-    let a_mse = &a[..mse_len];
-    let b_mse = &b[..mse_len];
-    let a_qjl = &a[mse_len..mse_len + qjl_len];
-    let b_qjl = &b[mse_len..mse_len + qjl_len];
-    let a_gamma = f32::from_le_bytes(
-        a[mse_len + qjl_len..mse_len + qjl_len + 4]
-            .try_into()
-            .unwrap(),
-    );
-    let b_gamma = f32::from_le_bytes(
-        b[mse_len + qjl_len..mse_len + qjl_len + 4]
-            .try_into()
-            .unwrap(),
-    );
-    let a_norm = f32::from_le_bytes(
-        a[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-            .try_into()
-            .unwrap(),
-    );
-    let b_norm = f32::from_le_bytes(
-        b[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let a_nibbles = &a[..nibble_len];
+    let b_nibbles = &b[..nibble_len];
+    let a_gamma = f32::from_le_bytes(a[nibble_len..nibble_len + 4].try_into().unwrap());
+    let b_gamma = f32::from_le_bytes(b[nibble_len..nibble_len + 4].try_into().unwrap());
+    let a_norm = f32::from_le_bytes(a[nibble_len + 4..nibble_len + 8].try_into().unwrap());
+    let b_norm = f32::from_le_bytes(b[nibble_len + 4..nibble_len + 8].try_into().unwrap());
 
-    // MSE term: sum of cross_table[a_j][b_j] for all j
-    let mse_term = accumulate_cross_products(a_mse, b_mse, dim, cross_table);
+    // MSE term: cross-product table lookup from nibble indices
+    let mse_term = accumulate_cross_products_nibble(a_nibbles, b_nibbles, cross_table);
 
-    // QJL term: Hamming distance between sign bits → cosine of angle
-    // hamming_bits = number of differing bits between a_qjl and b_qjl
-    let a_bits: &[u1x8] =
-        unsafe { std::slice::from_raw_parts(a_qjl.as_ptr().cast::<u1x8>(), qjl_len) };
-    let b_bits: &[u1x8] =
-        unsafe { std::slice::from_raw_parts(b_qjl.as_ptr().cast::<u1x8>(), qjl_len) };
-    let hamming_bits = u1x8::hamming(a_bits, b_bits).unwrap_or(0);
+    // QJL term: Hamming on interleaved sign bits (bit 3 of each nibble)
+    // 0x88 mask selects bits 7 and 3 — the QJL sign bits of the two nibbles per byte.
+    let mut hamming_bits: u32 = 0;
+    for k in 0..nibble_len {
+        let xor = a_nibbles[k] ^ b_nibbles[k];
+        hamming_bits += (xor & 0x88).count_ones();
+    }
 
     // cos(π · hamming / d) via precomputed table lookup (zero trig at runtime)
     let qjl_term = a_gamma * b_gamma * cos_table[hamming_bits as usize];
@@ -312,35 +274,25 @@ pub fn tq4_symmetric_distance(
     a_norm * b_norm * (mse_term + qjl_term)
 }
 
-/// Accumulate cross-product lookups over pairs of 3-bit indices.
+/// Accumulate cross-product lookups over pairs of nibble-packed MSE indices.
 ///
-/// Processes 8 index pairs at a time using batch 3-bit extraction,
-/// reducing per-element bit-manipulation overhead. Zero heap allocation.
-fn accumulate_cross_products(
-    a_mse: &[u8],
-    b_mse: &[u8],
-    dim: usize,
+/// Each byte contains two 4-bit nibbles; bits 2-0 of each nibble are the
+/// 3-bit MSE index. Two table lookups per byte, zero heap allocation.
+fn accumulate_cross_products_nibble(
+    a_nibbles: &[u8],
+    b_nibbles: &[u8],
     cross_table: &[[f32; 8]; 8],
 ) -> f32 {
-    let full_groups = dim / 8;
-    let remainder = dim % 8;
     let mut sum = 0.0f32;
-
-    for g in 0..full_groups {
-        let a_indices = codebook::extract_8_3bit_indices(a_mse, g);
-        let b_indices = codebook::extract_8_3bit_indices(b_mse, g);
-        for k in 0..8 {
-            sum += cross_table[a_indices[k] as usize][b_indices[k] as usize];
-        }
+    for k in 0..a_nibbles.len() {
+        let a_byte = a_nibbles[k];
+        let b_byte = b_nibbles[k];
+        let a_hi = ((a_byte >> 4) & 0x07) as usize;
+        let a_lo = (a_byte & 0x07) as usize;
+        let b_hi = ((b_byte >> 4) & 0x07) as usize;
+        let b_lo = (b_byte & 0x07) as usize;
+        sum += cross_table[a_hi][b_hi] + cross_table[a_lo][b_lo];
     }
-
-    let base = full_groups * 8;
-    for j in 0..remainder {
-        let a_idx = codebook::extract_3bit_index(a_mse, base + j) as usize;
-        let b_idx = codebook::extract_3bit_index(b_mse, base + j) as usize;
-        sum += cross_table[a_idx][b_idx];
-    }
-
     sum
 }
 
@@ -349,11 +301,11 @@ fn accumulate_cross_products(
 /// Computes ⟨q, x⟩ where q is a full-precision float query (represented by its
 /// pre-rotated and pre-projected forms) and x is a packed TQ4 vector.
 ///
-/// Used during HNSW construction (7.2 optimization) where the freshly inserted
-/// vector's float query state is available and the graph neighbor is packed TQ4.
+/// Uses the interleaved nibble layout: each byte holds two 4-bit nibbles
+/// (bit 3 = QJL sign, bits 2-0 = MSE index).
 ///
 /// # Arguments
-/// - `packed`: a packed TQ4 byte array (layout: [mse | qjl | gamma | norm])
+/// - `packed`: a packed TQ4 byte array (layout: [nibbles | gamma | norm])
 /// - `dim`: padded dimension d_pad
 /// - `inv_sqrt_d`: 1/√d for codebook scaling
 /// - `rotated_query`: Π · q (d_pad floats)
@@ -366,47 +318,42 @@ pub fn tq4_asymmetric_distance_packed(
     rotated_query: &[f32],
     projected_query: &[f32],
 ) -> f32 {
-    let mse_len = (dim * 3).div_ceil(8);
-    let qjl_len = dim.div_ceil(8);
+    let nibble_len = dim / 2;
 
-    let mse_bytes = &packed[..mse_len];
-    let qjl_bytes = &packed[mse_len..mse_len + qjl_len];
-    let gamma = f32::from_le_bytes(
-        packed[mse_len + qjl_len..mse_len + qjl_len + 4]
-            .try_into()
-            .unwrap(),
-    );
-    let norm = f32::from_le_bytes(
-        packed[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let nibbles = &packed[..nibble_len];
+    let gamma = f32::from_le_bytes(packed[nibble_len..nibble_len + 4].try_into().unwrap());
+    let norm = f32::from_le_bytes(packed[nibble_len + 4..nibble_len + 8].try_into().unwrap());
 
-    // MSE term: extract 3-bit indices and dot codebook centroids with rotated query
-    let full_groups = dim / 8;
-    let remainder = dim % 8;
+    // MSE term: extract indices from nibbles and dot with rotated query
     let mut mse_ip = 0.0f32;
-    for g in 0..full_groups {
-        let indices = codebook::extract_8_3bit_indices(mse_bytes, g);
-        let base = g * 8;
-        for k in 0..8 {
-            mse_ip += CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d * rotated_query[base + k];
-        }
-    }
-    let base = full_groups * 8;
-    for j in 0..remainder {
-        let idx = codebook::extract_3bit_index(mse_bytes, base + j);
-        mse_ip += CENTROIDS_3BIT[idx as usize] * inv_sqrt_d * rotated_query[base + j];
+    for (byte_idx, &nib) in nibbles.iter().enumerate() {
+        let dim_even = byte_idx * 2;
+        let dim_odd = byte_idx * 2 + 1;
+        let hi = ((nib >> 4) & 0x07) as usize;
+        let lo = (nib & 0x07) as usize;
+        mse_ip += CENTROIDS_3BIT[hi] * inv_sqrt_d * rotated_query[dim_even];
+        mse_ip += CENTROIDS_3BIT[lo] * inv_sqrt_d * rotated_query[dim_odd];
     }
 
-    // QJL correction term: √(π/2) / d · γ · Σ_j sign_j · projected_query_j
+    // QJL correction term: extract sign bits from nibbles inline
     let mut dot_sum = 0.0f32;
-    for (j, &pq) in projected_query.iter().enumerate().take(dim) {
-        let byte_idx = j / 8;
-        let bit_idx = 7 - (j % 8);
-        let sign_bit = (qjl_bytes[byte_idx] >> bit_idx) & 1;
-        let sign_val = if sign_bit == 1 { 1.0f32 } else { -1.0 };
-        dot_sum += sign_val * pq;
+    for (byte_idx, &nib) in nibbles.iter().enumerate() {
+        let dim_even = byte_idx * 2;
+        let dim_odd = byte_idx * 2 + 1;
+        let hi_nibble = nib >> 4;
+        let lo_nibble = nib & 0x0F;
+        let sign_even = if (hi_nibble & 0x08) != 0 {
+            1.0f32
+        } else {
+            -1.0
+        };
+        let sign_odd = if (lo_nibble & 0x08) != 0 {
+            1.0f32
+        } else {
+            -1.0
+        };
+        dot_sum += sign_even * projected_query[dim_even];
+        dot_sum += sign_odd * projected_query[dim_odd];
     }
     let qjl_ip = ((std::f32::consts::PI / 2.0_f32).sqrt() / dim as f32) * gamma * dot_sum;
 
@@ -554,7 +501,13 @@ mod tests {
         for i in 0..n_iters {
             let a = &packed_vecs[i % n_vecs];
             let b = &packed_vecs[(i + 1) % n_vecs];
-            black_box(tq4_symmetric_distance(a, b, d_pad, &cross_table, &cos_table));
+            black_box(tq4_symmetric_distance(
+                a,
+                b,
+                d_pad,
+                &cross_table,
+                &cos_table,
+            ));
         }
         let elapsed = t0.elapsed();
         let ns_per_call = elapsed.as_nanos() as f64 / n_iters as f64;

@@ -18,12 +18,16 @@ use crate::turbo_quant::rotation::RotationMatrix;
 use numkong::Dot;
 
 /// Packed TQ4 representation of a single vector.
+///
+/// Uses an interleaved 4-bit nibble layout where each coordinate is stored as
+/// a single nibble: bit 3 = QJL sign, bits 2-0 = MSE 3-bit centroid index.
+/// Two nibbles per byte (high = even dim, low = odd dim).
 #[derive(Debug, Clone)]
 pub struct Tq4CompressedVector {
-    /// 3-bit codebook indices, packed as big-endian bitstream.
-    pub mse_indices: Vec<u8>,
-    /// QJL sign bits, packed: bit j of byte j/8 = sign of coord j.
-    pub qjl_signs: Vec<u8>,
+    /// Interleaved 4-bit nibbles: bit 3 = QJL sign, bits 2-0 = MSE index.
+    /// High nibble (bits 7-4) = even dimension, low nibble (bits 3-0) = odd.
+    /// Length: d_pad / 2.
+    pub nibbles: Vec<u8>,
     /// Residual L2 norm (γ = ‖r‖).
     pub gamma: f32,
     /// Original vector L2 norm (‖x‖).
@@ -33,17 +37,16 @@ pub struct Tq4CompressedVector {
 impl Tq4CompressedVector {
     /// Total storage in bytes.
     pub fn storage_bytes(&self) -> usize {
-        self.mse_indices.len() + self.qjl_signs.len() + 8 // 4 bytes gamma + 4 bytes norm
+        self.nibbles.len() + 8 // 4 bytes gamma + 4 bytes norm
     }
 
     /// Pack into a contiguous byte array for USearch storage.
     ///
-    /// Layout: `[mse_indices | qjl_signs | gamma(4 bytes LE) | norm(4 bytes LE)]`
+    /// Layout: `[nibbles | gamma(4 bytes LE) | norm(4 bytes LE)]`
     pub fn pack(&self) -> Vec<u8> {
         let total = self.storage_bytes();
         let mut buf = Vec::with_capacity(total);
-        buf.extend_from_slice(&self.mse_indices);
-        buf.extend_from_slice(&self.qjl_signs);
+        buf.extend_from_slice(&self.nibbles);
         buf.extend_from_slice(&self.gamma.to_le_bytes());
         buf.extend_from_slice(&self.norm.to_le_bytes());
         buf
@@ -55,21 +58,18 @@ impl Tq4CompressedVector {
     /// next power of 2 for TQ4 encoding.
     pub fn unpack(bytes: &[u8], dimension: usize) -> Self {
         let d_pad = dimension.next_power_of_two();
-        let mse_len = (d_pad * 3).div_ceil(8);
-        let qjl_len = d_pad.div_ceil(8);
+        let nibble_len = d_pad / 2;
 
-        let mse_indices = bytes[..mse_len].to_vec();
-        let qjl_signs = bytes[mse_len..mse_len + qjl_len].to_vec();
-        let gamma_bytes: [u8; 4] = bytes[mse_len + qjl_len..mse_len + qjl_len + 4]
+        let nibbles = bytes[..nibble_len].to_vec();
+        let gamma_bytes: [u8; 4] = bytes[nibble_len..nibble_len + 4]
             .try_into()
             .expect("gamma bytes");
-        let norm_bytes: [u8; 4] = bytes[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+        let norm_bytes: [u8; 4] = bytes[nibble_len + 4..nibble_len + 8]
             .try_into()
             .expect("norm bytes");
 
         Self {
-            mse_indices,
-            qjl_signs,
+            nibbles,
             gamma: f32::from_le_bytes(gamma_bytes),
             norm: f32::from_le_bytes(norm_bytes),
         }
@@ -80,9 +80,8 @@ impl Tq4CompressedVector {
     /// Internally pads to next power of 2 for TQ4 encoding.
     pub fn packed_size(dimension: usize) -> usize {
         let d_pad = dimension.next_power_of_two();
-        let mse_len = (d_pad * 3).div_ceil(8);
-        let qjl_len = d_pad.div_ceil(8);
-        mse_len + qjl_len + 8
+        // d_pad/2 nibble bytes + 4 gamma + 4 norm
+        d_pad / 2 + 8
     }
 }
 
@@ -150,6 +149,7 @@ impl Tq4Quantizer {
     /// 4. Scalar quantize each y_j with 3-bit codebook
     /// 5. Compute residual r = y − ỹ, γ = ‖r‖
     /// 6. QJL: qjl_signs = sign(S · (r/γ))
+    /// 7. Interleave MSE indices + QJL signs into 4-bit nibbles
     pub fn quantize(&self, vector: &[f32]) -> Tq4CompressedVector {
         let d = self.dimension;
         let d_pad = self.padded_dim;
@@ -161,8 +161,7 @@ impl Tq4Quantizer {
         // Short-circuit for zero vector
         if norm == 0.0 {
             return Tq4CompressedVector {
-                mse_indices: vec![0u8; (d_pad * 3).div_ceil(8)],
-                qjl_signs: vec![0u8; d_pad.div_ceil(8)],
+                nibbles: vec![0u8; d_pad / 2],
                 gamma: 0.0,
                 norm: 0.0,
             };
@@ -176,11 +175,11 @@ impl Tq4Quantizer {
         let mut rotated = vec![0.0f32; d_pad];
         self.rotation.forward_padded(&normalized, &mut rotated);
 
-        // Step 4: Scalar quantize (3-bit codebook)
-        let mse_indices = codebook::encode_vector_3bit(&rotated, self.inv_sqrt_d);
+        // Step 4: Scalar quantize to raw 3-bit indices (one byte per coordinate)
+        let mse_raw = codebook::encode_vector_3bit_raw(&rotated, self.inv_sqrt_d);
 
         // Step 5: Dequantize MSE and compute residual
-        let dequantized = codebook::decode_vector_3bit(&mse_indices, d_pad, self.inv_sqrt_d);
+        let dequantized = codebook::decode_vector_3bit_raw(&mse_raw, self.inv_sqrt_d);
         let residual: Vec<f32> = rotated
             .iter()
             .zip(dequantized.iter())
@@ -197,9 +196,11 @@ impl Tq4Quantizer {
             vec![0u8; d_pad.div_ceil(8)]
         };
 
+        // Step 7: Interleave into 4-bit nibbles (bit 3 = QJL sign, bits 2-0 = MSE)
+        let nibbles = codebook::interleave_nibbles(&mse_raw, &qjl_signs, d_pad);
+
         Tq4CompressedVector {
-            mse_indices,
-            qjl_signs,
+            nibbles,
             gamma,
             norm,
         }
@@ -207,22 +208,23 @@ impl Tq4Quantizer {
 
     /// Dequantize TQ4 back to approximate f32 vector (for testing/debugging).
     ///
-    /// Reconstructs: x̃ = ‖x‖ · Π⁻¹ · (ỹ + γ · Q_qjl⁻¹(signs))
-    /// where ỹ is the codebook reconstruction and Q_qjl⁻¹ is the QJL dequantize.
+    /// Reconstructs: x̃ = ‖x‖ · Π⁻¹ · ỹ
+    /// where ỹ is the codebook reconstruction extracted from nibbles.
+    /// The QJL residual correction is not applied (MSE-only reconstruction).
     pub fn dequantize_f32(&self, compressed: &Tq4CompressedVector) -> Vec<f32> {
         let d = self.dimension;
         let d_pad = self.padded_dim;
 
-        // Decode MSE codebook values in padded rotated space
-        let mut rotated_approx =
-            codebook::decode_vector_3bit(&compressed.mse_indices, d_pad, self.inv_sqrt_d);
-
-        // Add QJL residual correction: γ · √(π/2)/d · S^T · signs
-        // This is approximate—the full QJL dequantize involves S^T multiplication.
-        // For test/debug purposes, we skip the QJL term and return MSE-only.
-        // The QJL term is properly applied during inner product estimation.
-        let _ = &compressed.qjl_signs;
-        let _ = compressed.gamma;
+        // Extract MSE indices from interleaved nibbles and decode to centroids
+        let mut rotated_approx = vec![0.0f32; d_pad];
+        for byte_idx in 0..compressed.nibbles.len() {
+            let dim_even = byte_idx * 2;
+            let dim_odd = byte_idx * 2 + 1;
+            let hi = (compressed.nibbles[byte_idx] >> 4) & 0x07;
+            let lo = compressed.nibbles[byte_idx] & 0x07;
+            rotated_approx[dim_even] = codebook::decode_scalar_3bit(hi, self.inv_sqrt_d);
+            rotated_approx[dim_odd] = codebook::decode_scalar_3bit(lo, self.inv_sqrt_d);
+        }
 
         // Inverse rotate back to original space (d_pad → d)
         let mut result = vec![0.0f32; d];
@@ -232,8 +234,6 @@ impl Tq4Quantizer {
         for v in &mut result {
             *v *= compressed.norm;
         }
-        // Silence the mutable borrow warning — rotated_approx is consumed by the inverse call above.
-        let _ = &mut rotated_approx;
 
         result
     }
@@ -270,8 +270,7 @@ mod tests {
         assert_eq!(packed.len(), Tq4CompressedVector::packed_size(d));
 
         let unpacked = Tq4CompressedVector::unpack(&packed, d);
-        assert_eq!(compressed.mse_indices, unpacked.mse_indices);
-        assert_eq!(compressed.qjl_signs, unpacked.qjl_signs);
+        assert_eq!(compressed.nibbles, unpacked.nibbles);
         assert!((compressed.gamma - unpacked.gamma).abs() < 1e-7);
         assert!((compressed.norm - unpacked.norm).abs() < 1e-7);
     }
@@ -280,10 +279,8 @@ mod tests {
     fn packed_size_formula() {
         for d in [768usize, 1024, 1536, 3072] {
             let d_pad = d.next_power_of_two();
-            let expected = (d_pad * 3).div_ceil(8) + d_pad.div_ceil(8) + 8;
+            let expected = d_pad / 2 + 8;
             assert_eq!(Tq4CompressedVector::packed_size(d), expected);
-            // d_pad is always power of 2, so packed size = d_pad/2 + 8
-            assert_eq!(expected, d_pad / 2 + 8);
         }
     }
 

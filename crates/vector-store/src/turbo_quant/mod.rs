@@ -15,6 +15,19 @@
 //! 2. **QJL residual correction** (1 bit): 1-bit sign projection of the
 //!    quantization residual for inner product bias correction.
 //!
+//! ## Packed Format: Interleaved 4-bit Nibbles
+//!
+//! Each coordinate is stored as a 4-bit nibble:
+//! - Bit 3: QJL sign (1 = positive, 0 = negative)
+//! - Bits 2-0: MSE 3-bit centroid index (0-7)
+//!
+//! Two nibbles per byte: high nibble (bits 7-4) = even dimension,
+//! low nibble (bits 3-0) = odd dimension. Packed layout:
+//! `[nibbles (d_pad/2 bytes) | gamma (4B LE) | norm (4B LE)]`
+//!
+//! This interleaved layout enables trivial index extraction via shift+mask
+//! and inline Hamming computation on the interleaved QJL sign bits.
+//!
 //! # Usage
 //!
 //! ```ignore
