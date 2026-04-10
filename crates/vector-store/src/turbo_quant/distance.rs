@@ -16,7 +16,7 @@
 //! 2. **Asymmetric** (f32 query vs TQ4): Used for final reranking. Provides
 //!    the unbiased TurboQuant inner product estimator at full precision.
 
-use crate::turbo_quant::codebook::{self, CENTROIDS_3BIT};
+use crate::turbo_quant::codebook::CENTROIDS_3BIT;
 use crate::turbo_quant::quantize::{Tq4CompressedVector, Tq4Quantizer};
 use numkong::Dot;
 
@@ -65,6 +65,9 @@ impl Tq4Quantizer {
     /// Returns: ⟨q, x⟩ ≈ ‖x‖ · (mse_ip + qjl_ip)
     /// where mse_ip uses codebook centroids dotted with rotated query,
     /// and qjl_ip uses sign bits dotted with projected query.
+    ///
+    /// Fused single pass over nibbles: extracts MSE indices and QJL signs
+    /// together, zero heap allocation.
     pub fn inner_product(
         &self,
         query_state: &Tq4QueryState,
@@ -72,35 +75,39 @@ impl Tq4Quantizer {
     ) -> f32 {
         let d_pad = self.padded_dim();
         let inv_sqrt_d = self.inv_sqrt_d();
-        let nibble_len = d_pad / 2;
+        let rq = &query_state.rotated_query;
+        let pq = &query_state.projected_query;
 
-        // MSE term: extract indices from interleaved nibbles
-        let mut mse_ip = 0.0f32;
-        for byte_idx in 0..nibble_len {
-            let dim_even = byte_idx * 2;
-            let dim_odd = byte_idx * 2 + 1;
-            let hi = ((compressed.nibbles[byte_idx] >> 4) & 0x07) as usize;
-            let lo = (compressed.nibbles[byte_idx] & 0x07) as usize;
-            mse_ip += CENTROIDS_3BIT[hi] * inv_sqrt_d * query_state.rotated_query[dim_even];
-            mse_ip += CENTROIDS_3BIT[lo] * inv_sqrt_d * query_state.rotated_query[dim_odd];
+        // Precompute scaled centroids (8 entries, fits in registers)
+        let mut scaled = [0.0f32; 8];
+        for i in 0..8 {
+            scaled[i] = CENTROIDS_3BIT[i] * inv_sqrt_d;
         }
 
-        // QJL correction term: extract QJL signs from nibbles
-        let qjl_signs = codebook::extract_qjl_from_nibbles(&compressed.nibbles, d_pad);
-        let qjl_ip = self.qjl().inner_product_term(
-            &qjl_signs,
-            &query_state.projected_query,
-            compressed.gamma,
-        );
+        // Fused MSE + QJL in a single pass over nibbles
+        let mut mse_ip = 0.0f32;
+        let mut qjl_dot = 0.0f32;
+        for (byte_idx, &nib) in compressed.nibbles.iter().enumerate() {
+            let de = byte_idx * 2;
+            let do_ = de + 1;
+            let hi = ((nib >> 4) & 0x07) as usize;
+            let lo = (nib & 0x07) as usize;
+            mse_ip += scaled[hi] * rq[de] + scaled[lo] * rq[do_];
+            let se: f32 = if (nib & 0x80) != 0 { 1.0 } else { -1.0 };
+            let so: f32 = if (nib & 0x08) != 0 { 1.0 } else { -1.0 };
+            qjl_dot += se * pq[de] + so * pq[do_];
+        }
 
-        // Full inner product estimate: ‖x‖ · (MSE + QJL)
+        let qjl_ip =
+            ((std::f32::consts::PI / 2.0_f32).sqrt() / d_pad as f32) * compressed.gamma * qjl_dot;
+
         compressed.norm * (mse_ip + qjl_ip)
     }
 
     /// Compute inner product estimate directly from a packed TQ4 byte slice.
     ///
-    /// This avoids unpacking into an owned `Tq4CompressedVector` during
-    /// reranking and reuses a thread-local centroid buffer for the SIMD MSE dot.
+    /// Fused single pass: extracts MSE centroids and QJL signs from nibbles
+    /// in one loop with zero heap allocation and no thread-local buffers.
     pub fn inner_product_packed(
         &self,
         query_state: &Tq4QueryState,
@@ -116,47 +123,36 @@ impl Tq4Quantizer {
         let norm = f32::from_le_bytes(packed[nibble_len + 4..nibble_len + 8].try_into().unwrap());
 
         let inv_sqrt_d = self.inv_sqrt_d();
+        let rq = &query_state.rotated_query;
+        let pq = &query_state.projected_query;
 
-        thread_local! {
-            static CENTROIDS: std::cell::RefCell<Vec<f32>> = const {
-                std::cell::RefCell::new(Vec::new())
-            };
+        let mut scaled = [0.0f32; 8];
+        for i in 0..8 {
+            scaled[i] = CENTROIDS_3BIT[i] * inv_sqrt_d;
         }
 
-        CENTROIDS.with(|cell| {
-            let mut centroids = cell.borrow_mut();
-            if centroids.len() < d_pad {
-                centroids.resize(d_pad, 0.0);
-            }
+        let mut mse_ip = 0.0f32;
+        let mut qjl_dot = 0.0f32;
+        for (byte_idx, &nib) in nibbles.iter().enumerate() {
+            let de = byte_idx * 2;
+            let do_ = de + 1;
+            let hi = ((nib >> 4) & 0x07) as usize;
+            let lo = (nib & 0x07) as usize;
+            mse_ip += scaled[hi] * rq[de] + scaled[lo] * rq[do_];
+            let se: f32 = if (nib & 0x80) != 0 { 1.0 } else { -1.0 };
+            let so: f32 = if (nib & 0x08) != 0 { 1.0 } else { -1.0 };
+            qjl_dot += se * pq[de] + so * pq[do_];
+        }
 
-            // Extract MSE centroids from interleaved nibbles
-            for (byte_idx, &nib) in nibbles.iter().enumerate() {
-                let dim_even = byte_idx * 2;
-                let dim_odd = byte_idx * 2 + 1;
-                let hi = ((nib >> 4) & 0x07) as usize;
-                let lo = (nib & 0x07) as usize;
-                centroids[dim_even] = CENTROIDS_3BIT[hi] * inv_sqrt_d;
-                centroids[dim_odd] = CENTROIDS_3BIT[lo] * inv_sqrt_d;
-            }
+        let qjl_ip = ((std::f32::consts::PI / 2.0_f32).sqrt() / d_pad as f32) * gamma * qjl_dot;
 
-            let mse_ip = f32::dot(&centroids[..d_pad], &query_state.rotated_query[..d_pad])
-                .unwrap_or(0.0) as f32;
-
-            // Extract QJL signs from nibbles for inner_product_term
-            let qjl_signs = codebook::extract_qjl_from_nibbles(nibbles, d_pad);
-            let qjl_ip =
-                self.qjl()
-                    .inner_product_term(&qjl_signs, &query_state.projected_query, gamma);
-
-            norm * (mse_ip + qjl_ip)
-        })
+        norm * (mse_ip + qjl_ip)
     }
 
     /// Batch compute inner product estimates for multiple TQ4 candidates.
     ///
-    /// Gathers centroid values into a reusable buffer and uses SIMD dot product
-    /// (via NumKong) for the MSE term. The centroid buffer is allocated once
-    /// and reused across all candidates.
+    /// Fused single pass per candidate: extracts MSE and QJL from nibbles
+    /// in one loop with zero heap allocation per candidate.
     pub fn batch_inner_products(
         &self,
         query_state: &Tq4QueryState,
@@ -164,33 +160,32 @@ impl Tq4Quantizer {
     ) -> Vec<f32> {
         let d_pad = self.padded_dim();
         let inv_sqrt_d = self.inv_sqrt_d();
-        let nibble_len = d_pad / 2;
+        let rq = &query_state.rotated_query;
+        let pq = &query_state.projected_query;
+        let qjl_scale = (std::f32::consts::PI / 2.0_f32).sqrt() / d_pad as f32;
 
-        let mut centroids = vec![0.0f32; d_pad];
+        let mut scaled = [0.0f32; 8];
+        for i in 0..8 {
+            scaled[i] = CENTROIDS_3BIT[i] * inv_sqrt_d;
+        }
+
         let mut results = Vec::with_capacity(candidates.len());
 
         for candidate in candidates {
-            // Gather centroids from interleaved nibbles
-            for byte_idx in 0..nibble_len {
-                let dim_even = byte_idx * 2;
-                let dim_odd = byte_idx * 2 + 1;
-                let hi = ((candidate.nibbles[byte_idx] >> 4) & 0x07) as usize;
-                let lo = (candidate.nibbles[byte_idx] & 0x07) as usize;
-                centroids[dim_even] = CENTROIDS_3BIT[hi] * inv_sqrt_d;
-                centroids[dim_odd] = CENTROIDS_3BIT[lo] * inv_sqrt_d;
+            let mut mse_ip = 0.0f32;
+            let mut qjl_dot = 0.0f32;
+            for (byte_idx, &nib) in candidate.nibbles.iter().enumerate() {
+                let de = byte_idx * 2;
+                let do_ = de + 1;
+                let hi = ((nib >> 4) & 0x07) as usize;
+                let lo = (nib & 0x07) as usize;
+                mse_ip += scaled[hi] * rq[de] + scaled[lo] * rq[do_];
+                let se: f32 = if (nib & 0x80) != 0 { 1.0 } else { -1.0 };
+                let so: f32 = if (nib & 0x08) != 0 { 1.0 } else { -1.0 };
+                qjl_dot += se * pq[de] + so * pq[do_];
             }
 
-            // SIMD dot product for MSE term (f64 accumulation for accuracy)
-            let mse_ip = f32::dot(&centroids, &query_state.rotated_query).unwrap_or(0.0) as f32;
-
-            // QJL correction term: extract signs from nibbles
-            let qjl_signs = codebook::extract_qjl_from_nibbles(&candidate.nibbles, d_pad);
-            let qjl_ip = self.qjl().inner_product_term(
-                &qjl_signs,
-                &query_state.projected_query,
-                candidate.gamma,
-            );
-
+            let qjl_ip = qjl_scale * candidate.gamma * qjl_dot;
             results.push(candidate.norm * (mse_ip + qjl_ip));
         }
 

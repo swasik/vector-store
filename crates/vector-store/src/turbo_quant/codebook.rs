@@ -360,11 +360,11 @@ mod tests {
         assert_eq!(nibbles.len(), d / 2);
 
         // Verify MSE indices survive the roundtrip
-        for byte_idx in 0..nibbles.len() {
+        for (byte_idx, &nib) in nibbles.iter().enumerate() {
             let dim_even = byte_idx * 2;
             let dim_odd = byte_idx * 2 + 1;
-            let hi = (nibbles[byte_idx] >> 4) & 0x07;
-            let lo = nibbles[byte_idx] & 0x07;
+            let hi = (nib >> 4) & 0x07;
+            let lo = nib & 0x07;
             assert_eq!(hi, mse_raw[dim_even], "MSE mismatch at dim {dim_even}");
             assert_eq!(lo, mse_raw[dim_odd], "MSE mismatch at dim {dim_odd}");
         }
