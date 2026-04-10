@@ -51,13 +51,12 @@ use tracing::warn;
 use usearch::IndexOptions;
 use usearch::MetricKind;
 use usearch::ScalarKind;
-use usearch::b1x8;
 
+use crate::turbo_quant::Tq4CompressedVector;
 use crate::turbo_quant::Tq4Config;
-use crate::turbo_quant::polar_quantize::{
-    PolarCodebooks, PolarCompressedVector, PolarCrossTables, PolarQuantizer,
-    polar_symmetric_distance,
-};
+use crate::turbo_quant::Tq4Quantizer;
+use crate::turbo_quant::codebook::cross_product_table_3bit;
+use crate::turbo_quant::distance::tq4_symmetric_distance;
 
 pub struct UsearchIndexFactory {
     tokio_semaphore: Arc<Semaphore>,
@@ -76,8 +75,7 @@ impl IndexFactory for UsearchIndexFactory {
             Mode::Usearch => {
                 let threads =
                     Handle::current().metrics().num_workers() + rayon::current_num_threads();
-                if index.quantization == Quantization::TQ4 || index.quantization == Quantization::B1
-                {
+                if uses_tq4_path(index.quantization) {
                     let dimension = index.dimensions.0.get();
                     let connectivity = index.connectivity.0;
                     let expansion_add = index.expansion_add.0;
@@ -85,7 +83,7 @@ impl IndexFactory for UsearchIndexFactory {
                     let space_type = index.space_type;
                     new(
                         move || {
-                            Ok(Arc::new(ThreadedUsearchIndex::new_polar(
+                            Ok(Arc::new(ThreadedUsearchIndex::new_tq4(
                                 dimension,
                                 connectivity,
                                 expansion_add,
@@ -196,21 +194,55 @@ trait UsearchIndex {
 struct ThreadedUsearchIndex {
     inner: usearch::Index,
     threads: usize,
-    quantization: usearch::ScalarKind,
     space_type: usearch::MetricKind,
-    /// PolarQuant state (None for non-Polar quantizations).
-    polar: Option<PolarIndexState>,
+    tq4: Option<Tq4IndexState>,
 }
 
-/// Per-index PolarQuant state shared across all vectors.
-struct PolarIndexState {
-    quantizer: Arc<PolarQuantizer>,
-    /// Original vector dimension (before packing).
+struct Tq4IndexState {
+    quantizer: Arc<Tq4Quantizer>,
     original_dimension: usize,
-    /// Packed PolarQuant size in bytes.
     packed_dimension: usize,
-    /// Oversample factor for HNSW retrieval before asymmetric reranking.
+    norm_offset: usize,
     oversample_factor: f32,
+    space_type: SpaceType,
+}
+
+fn configure_numkong_thread() {
+    thread_local! {
+        static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    CONFIGURED.with(|configured| {
+        if !configured.get() {
+            numkong::configure_thread();
+            configured.set(true);
+        }
+    });
+}
+
+fn tq4_packed_norm(packed: &[u8], norm_offset: usize) -> f32 {
+    f32::from_le_bytes(packed[norm_offset..norm_offset + 4].try_into().unwrap())
+}
+
+fn tq4_distance_from_ip(
+    space_type: SpaceType,
+    raw_ip: f32,
+    left_norm: f32,
+    right_norm: f32,
+) -> f32 {
+    match space_type {
+        SpaceType::Cosine => {
+            let denom = left_norm * right_norm;
+            let similarity = if denom > 0.0 {
+                (raw_ip / denom).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            1.0 - similarity
+        }
+        SpaceType::DotProduct => -raw_ip,
+        _ => unreachable!("TQ4 only supports Cosine and DotProduct"),
+    }
 }
 
 impl ThreadedUsearchIndex {
@@ -218,14 +250,12 @@ impl ThreadedUsearchIndex {
         Ok(Self {
             inner: usearch::Index::new(&options)?,
             threads,
-            quantization: options.quantization,
             space_type: options.metric,
-            polar: None,
+            tq4: None,
         })
     }
 
-    /// Create a PolarQuant index with custom metric for PolarQuant-to-PolarQuant distance.
-    fn new_polar(
+    fn new_tq4(
         original_dimension: usize,
         connectivity: usize,
         expansion_add: usize,
@@ -234,19 +264,16 @@ impl ThreadedUsearchIndex {
         threads: usize,
     ) -> anyhow::Result<Self> {
         let config = Tq4Config::default();
-        let packed_dim = PolarCompressedVector::packed_size(original_dimension);
-        let quantizer = Arc::new(PolarQuantizer::new(
+        let packed_dim = Tq4CompressedVector::packed_size(original_dimension);
+        let quantizer = Arc::new(Tq4Quantizer::new(
             original_dimension,
             config.rotation_seed,
             config.qjl_seed,
         ));
-
-        let metric_kind = match space_type {
-            SpaceType::Cosine | SpaceType::DotProduct => MetricKind::IP,
-            _ => {
-                anyhow::bail!("PolarQuant only supports Cosine and DotProduct, got {space_type:?}")
-            }
-        };
+        let padded_dim = quantizer.padded_dim();
+        let norm_offset = packed_dim - 4;
+        let metric_kind = metric_kind(Quantization::TQ4, space_type)?;
+        let cross_table = cross_product_table_3bit(quantizer.inv_sqrt_d());
 
         let options = IndexOptions {
             dimensions: packed_dim,
@@ -259,38 +286,29 @@ impl ThreadedUsearchIndex {
         };
         let mut inner = usearch::Index::new(&options)?;
 
-        let codebooks =
-            PolarCodebooks::new(original_dimension.next_power_of_two().trailing_zeros() as usize);
-        let tables = Arc::new(PolarCrossTables::new(&codebooks));
-        let padded_dim = quantizer.padded_dim();
-
         inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
-            thread_local! {
-                static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-            }
-            CONFIGURED.with(|c| {
-                if !c.get() {
-                    numkong::configure_thread();
-                    c.set(true);
-                }
-            });
+            configure_numkong_thread();
 
             let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
             let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-            let ip = polar_symmetric_distance(a, b, padded_dim, &tables);
-            usearch::Distance::from(1.0 - ip)
+            let raw_ip = tq4_symmetric_distance(a, b, padded_dim, &cross_table);
+            let a_norm = tq4_packed_norm(a, norm_offset);
+            let b_norm = tq4_packed_norm(b, norm_offset);
+            let distance = tq4_distance_from_ip(space_type, raw_ip, a_norm, b_norm);
+            usearch::Distance::from(distance)
         }));
 
         Ok(Self {
             inner,
             threads,
-            quantization: ScalarKind::I8,
             space_type: metric_kind,
-            polar: Some(PolarIndexState {
+            tq4: Some(Tq4IndexState {
                 quantizer,
                 original_dimension,
                 packed_dimension: packed_dim,
+                norm_offset,
                 oversample_factor: config.oversample_factor,
+                space_type,
             }),
         })
     }
@@ -312,15 +330,11 @@ impl UsearchIndex for ThreadedUsearchIndex {
     }
 
     fn add(&self, primary_id: PrimaryId, vector: &Vector) -> anyhow::Result<()> {
-        if let Some(polar) = &self.polar {
-            let compressed = polar.quantizer.quantize(vector.as_slice());
+        if let Some(tq4) = &self.tq4 {
+            let compressed = tq4.quantizer.quantize(vector.as_slice());
             let packed = compressed.pack();
             let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
             return Ok(self.inner.add(primary_id.into(), packed_i8)?);
-        }
-        if self.quantization == ScalarKind::B1 {
-            let vector = f32_to_b1x8(vector.as_slice());
-            return Ok(self.inner.add(primary_id.into(), &vector)?);
         }
         Ok(self.inner.add(primary_id.into(), vector.as_slice())?)
     }
@@ -334,15 +348,10 @@ impl UsearchIndex for ThreadedUsearchIndex {
         vector: &Vector,
         limit: Limit,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<(PrimaryId, Distance)>>> {
-        if let Some(polar) = &self.polar {
-            return self.polar_search(polar, vector, limit);
+        if let Some(tq4) = &self.tq4 {
+            return self.tq4_search(tq4, vector, limit);
         }
-        let matches = if self.quantization == ScalarKind::B1 {
-            let vector = f32_to_b1x8(vector.as_slice());
-            self.inner.search(&vector, limit.0.get())?
-        } else {
-            self.inner.search(vector.as_slice(), limit.0.get())?
-        };
+        let matches = self.inner.search(vector.as_slice(), limit.0.get())?;
         Ok(matches
             .keys
             .into_iter()
@@ -361,19 +370,14 @@ impl UsearchIndex for ThreadedUsearchIndex {
         limit: Limit,
         filter: impl Fn(PrimaryId) -> bool,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<(PrimaryId, Distance)>>> {
-        if let Some(polar) = &self.polar {
-            return self.polar_filtered_search(polar, vector, limit, filter);
+        if let Some(tq4) = &self.tq4 {
+            return self.tq4_filtered_search(tq4, vector, limit, filter);
         }
-        let matches = if self.quantization == ScalarKind::B1 {
-            let vector = f32_to_b1x8(vector.as_slice());
-            self.inner
-                .filtered_search(&vector, limit.0.get(), |row_id| filter(row_id.into()))?
-        } else {
-            self.inner
-                .filtered_search(vector.as_slice(), limit.0.get(), |row_id| {
-                    filter(row_id.into())
-                })?
-        };
+        let matches = self
+            .inner
+            .filtered_search(vector.as_slice(), limit.0.get(), |row_id| {
+                filter(row_id.into())
+            })?;
         Ok(matches
             .keys
             .into_iter()
@@ -390,146 +394,100 @@ impl UsearchIndex for ThreadedUsearchIndex {
 }
 
 impl ThreadedUsearchIndex {
-    /// PolarQuant search: oversample with HNSW, then rerank asymmetrically.
-    fn polar_search(
+    fn tq4_search(
         &self,
-        polar: &PolarIndexState,
+        tq4: &Tq4IndexState,
         vector: &Vector,
         limit: Limit,
     ) -> anyhow::Result<std::vec::IntoIter<anyhow::Result<(PrimaryId, Distance)>>> {
-        let oversample_limit = (limit.0.get() as f32 * polar.oversample_factor).ceil() as usize;
-        let compressed_query = polar.quantizer.quantize(vector.as_slice());
+        let oversample_limit = (limit.0.get() as f32 * tq4.oversample_factor).ceil() as usize;
+        let compressed_query = tq4.quantizer.quantize(vector.as_slice());
         let packed_query = compressed_query.pack();
         let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
         let candidates = self.inner.search(packed_i8, oversample_limit)?;
 
-        let query_state = polar.quantizer.prepare_query(vector.as_slice());
-        let mut get_buf = vec![0i8; polar.packed_dimension];
+        let query_state = tq4.quantizer.prepare_query(vector.as_slice());
+        let q_norm = query_state.query_norm;
+        let mut get_buf = vec![0i8; tq4.packed_dimension];
+        let mut results: Vec<(PrimaryId, f32)> = Vec::with_capacity(candidates.keys.len());
 
-        // Zero-copy reranking: compute inner product directly from packed bytes
-        let orig_dim = polar.original_dimension;
-        let d_pad = orig_dim.next_power_of_two();
-        let norm_offset = {
-            let num_angles = d_pad - 1;
-            let angle_len = (num_angles * 3).div_ceil(8);
-            let qjl_len = d_pad.div_ceil(8);
-            angle_len + qjl_len + 4
-        };
-
-        let mut results: Vec<(PrimaryId, f32, f32)> = Vec::with_capacity(candidates.keys.len());
         for &id in &candidates.keys {
             get_buf.fill(0);
             if let Ok(found) = self.inner.get(id, &mut get_buf)
                 && found > 0
             {
                 let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
-                let ip = polar
-                    .quantizer
-                    .inner_product_packed(&query_state, buf_u8, orig_dim);
-                let x_norm =
-                    f32::from_le_bytes(buf_u8[norm_offset..norm_offset + 4].try_into().unwrap());
-                results.push((PrimaryId::from(id), ip, x_norm));
+                let raw_ip = tq4.quantizer.inner_product_packed(
+                    &query_state,
+                    buf_u8,
+                    tq4.original_dimension,
+                );
+                let x_norm = tq4_packed_norm(buf_u8, tq4.norm_offset);
+                let distance = tq4_distance_from_ip(tq4.space_type, raw_ip, q_norm, x_norm);
+                results.push((PrimaryId::from(id), distance));
             }
         }
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit.0.get());
 
-        let space_type = self.space_type;
-        let q_norm = query_state.query_norm;
         let dim = vector.dim();
-
+        let space_type = tq4.space_type;
         Ok(results
             .into_iter()
-            .map(move |(id, raw_ip, x_norm)| {
-                let distance = match space_type {
-                    MetricKind::Cos => {
-                        let denom = q_norm * x_norm;
-                        let sim = if denom > 0.0 {
-                            (raw_ip / denom).clamp(-1.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                        1.0 - sim
-                    }
-                    MetricKind::IP => -raw_ip,
-                    _ => unreachable!("PolarQuant only supports Cosine and DotProduct"),
-                };
-                Distance::try_from((distance, space_type.try_into()?, dim)).map(|dist| (id, dist))
+            .map(move |(id, distance)| {
+                Distance::try_from((distance, space_type, dim)).map(|dist| (id, dist))
             })
             .collect::<Vec<_>>()
             .into_iter())
     }
 
-    /// PolarQuant filtered search: same as polar_search but with a filter predicate.
-    fn polar_filtered_search(
+    fn tq4_filtered_search(
         &self,
-        polar: &PolarIndexState,
+        tq4: &Tq4IndexState,
         vector: &Vector,
         limit: Limit,
         filter: impl Fn(PrimaryId) -> bool,
     ) -> anyhow::Result<std::vec::IntoIter<anyhow::Result<(PrimaryId, Distance)>>> {
-        let oversample_limit = (limit.0.get() as f32 * polar.oversample_factor).ceil() as usize;
-        let compressed_query = polar.quantizer.quantize(vector.as_slice());
+        let oversample_limit = (limit.0.get() as f32 * tq4.oversample_factor).ceil() as usize;
+        let compressed_query = tq4.quantizer.quantize(vector.as_slice());
         let packed_query = compressed_query.pack();
         let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
         let candidates = self
             .inner
             .filtered_search(packed_i8, oversample_limit, |row_id| filter(row_id.into()))?;
 
-        let query_state = polar.quantizer.prepare_query(vector.as_slice());
-        let mut get_buf = vec![0i8; polar.packed_dimension];
+        let query_state = tq4.quantizer.prepare_query(vector.as_slice());
+        let q_norm = query_state.query_norm;
+        let mut get_buf = vec![0i8; tq4.packed_dimension];
+        let mut results: Vec<(PrimaryId, f32)> = Vec::with_capacity(candidates.keys.len());
 
-        // Zero-copy reranking: compute inner product directly from packed bytes
-        let orig_dim = polar.original_dimension;
-        let d_pad = orig_dim.next_power_of_two();
-        let norm_offset = {
-            let num_angles = d_pad - 1;
-            let angle_len = (num_angles * 3).div_ceil(8);
-            let qjl_len = d_pad.div_ceil(8);
-            angle_len + qjl_len + 4
-        };
-
-        let mut results: Vec<(PrimaryId, f32, f32)> = Vec::with_capacity(candidates.keys.len());
         for &id in &candidates.keys {
             get_buf.fill(0);
             if let Ok(found) = self.inner.get(id, &mut get_buf)
                 && found > 0
             {
                 let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
-                let ip = polar
-                    .quantizer
-                    .inner_product_packed(&query_state, buf_u8, orig_dim);
-                let x_norm =
-                    f32::from_le_bytes(buf_u8[norm_offset..norm_offset + 4].try_into().unwrap());
-                results.push((PrimaryId::from(id), ip, x_norm));
+                let raw_ip = tq4.quantizer.inner_product_packed(
+                    &query_state,
+                    buf_u8,
+                    tq4.original_dimension,
+                );
+                let x_norm = tq4_packed_norm(buf_u8, tq4.norm_offset);
+                let distance = tq4_distance_from_ip(tq4.space_type, raw_ip, q_norm, x_norm);
+                results.push((PrimaryId::from(id), distance));
             }
         }
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit.0.get());
 
-        let space_type = self.space_type;
-        let q_norm = query_state.query_norm;
         let dim = vector.dim();
-
+        let space_type = tq4.space_type;
         Ok(results
             .into_iter()
-            .map(move |(id, raw_ip, x_norm)| {
-                let distance = match space_type {
-                    MetricKind::Cos => {
-                        let denom = q_norm * x_norm;
-                        let sim = if denom > 0.0 {
-                            (raw_ip / denom).clamp(-1.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                        1.0 - sim
-                    }
-                    MetricKind::IP => -raw_ip,
-                    _ => unreachable!("PolarQuant only supports Cosine and DotProduct"),
-                };
-                Distance::try_from((distance, space_type.try_into()?, dim)).map(|dist| (id, dist))
+            .map(move |(id, distance)| {
+                Distance::try_from((distance, space_type, dim)).map(|dist| (id, dist))
             })
             .collect::<Vec<_>>()
             .into_iter())
@@ -637,7 +595,6 @@ impl UsearchIndex for RwLock<Simulator> {
     fn reserve(&self, size: usize) -> anyhow::Result<()> {
         let start = Instant::now();
 
-        // we need simulate write lock similar to real usearch index
         #[allow(clippy::readonly_write_lock)]
         let sim = self.write().unwrap();
         {
@@ -719,13 +676,9 @@ impl UsearchIndex for RwLock<Simulator> {
     }
 }
 
-// Initial and incremental number for the index vectors reservation.
-// The value was taken for initial benchmarks (size similar to benchmark size)
 const RESERVE_INCREMENT_GLOBAL: usize = 1000000;
 const RESERVE_INCREMENT_LOCAL: usize = 1000;
 
-// When free space for index vectors drops below this, will reserve more space
-// The ratio was taken for initial benchmarks
 const RESERVE_THRESHOLD_GLOBAL: usize = RESERVE_INCREMENT_GLOBAL / 3;
 const RESERVE_THRESHOLD_LOCAL: usize = RESERVE_INCREMENT_LOCAL / 3;
 
@@ -734,18 +687,16 @@ struct MetricConfig {
     space_type: SpaceType,
 }
 
-fn metric_kind(quantization: Quantization, space_type: SpaceType) -> anyhow::Result<MetricKind> {
-    // Usearch requires a binary metric (e.g., Hamming, Jaccard) for B1 quantization.
-    if quantization == Quantization::B1 {
-        return Ok(MetricKind::Hamming);
-    }
+fn uses_tq4_path(quantization: Quantization) -> bool {
+    matches!(quantization, Quantization::B1 | Quantization::TQ4)
+}
 
-    // TQ4 uses a custom metric registered via change_metric(); return placeholder.
-    if quantization == Quantization::TQ4 {
+fn metric_kind(quantization: Quantization, space_type: SpaceType) -> anyhow::Result<MetricKind> {
+    if uses_tq4_path(quantization) {
         return match space_type {
             SpaceType::Cosine | SpaceType::DotProduct => Ok(MetricKind::IP),
             _ => anyhow::bail!(
-                "TQ4 quantization only supports Cosine and DotProduct. Unsupported: {space_type:?}"
+                "TQ4-compatible quantization only supports Cosine and DotProduct. Unsupported: {space_type:?}"
             ),
         };
     }
@@ -761,21 +712,11 @@ impl TryFrom<MetricConfig> for MetricKind {
     type Error = anyhow::Error;
 
     fn try_from(config: MetricConfig) -> Result<Self, Self::Error> {
-        if config.quantization == Quantization::B1 {
-            return match config.space_type {
-                SpaceType::Hamming => Ok(MetricKind::Hamming),
-                _ => anyhow::bail!(
-                    "B1 quantization requires binary space type. Unsupported space type: {:?}",
-                    config.space_type
-                ),
-            };
-        }
-
-        if config.quantization == Quantization::TQ4 {
+        if uses_tq4_path(config.quantization) {
             return match config.space_type {
                 SpaceType::Cosine | SpaceType::DotProduct => Ok(MetricKind::IP),
                 _ => anyhow::bail!(
-                    "TQ4 quantization only supports Cosine and DotProduct. Unsupported: {:?}",
+                    "TQ4-compatible quantization only supports Cosine and DotProduct. Unsupported: {:?}",
                     config.space_type
                 ),
             };
@@ -811,8 +752,7 @@ impl From<Quantization> for ScalarKind {
             Quantization::F16 => ScalarKind::F16,
             Quantization::BF16 => ScalarKind::BF16,
             Quantization::I8 => ScalarKind::I8,
-            Quantization::B1 => ScalarKind::B1,
-            Quantization::TQ4 => ScalarKind::I8, // TQ4 packed bytes stored as opaque I8
+            Quantization::B1 | Quantization::TQ4 => ScalarKind::I8,
         }
     }
 }
@@ -848,9 +788,6 @@ mod operation {
         fn is_exclusive(&self) -> bool {
             match self {
                 Mode::Insert | Mode::Search => false,
-                // Remove and reserve are not safe to run concurrently with other operations.
-                // Therefore, we perform both exclusively.
-                // See: https://github.com/unum-cloud/USearch/issues/697.
                 Mode::Reserve | Mode::Remove => true,
             }
         }
@@ -885,15 +822,9 @@ mod operation {
             }
         }
 
-        /// Wait until it will be possible to spawn operation.
-        ///
-        /// The function must be called before spawning operation tasks as it blocks
-        /// until only requested family of operations is in progress.
         async fn permit(&mut self, mode: Mode) -> Permit {
             while self.mode != mode {
                 if self.counter.load(Ordering::Relaxed) == 0 {
-                    // it is safe to switch to the operation because there are no spawned tasks
-                    // and self.counter won't be changed
                     self.mode = mode;
                     break;
                 }
@@ -921,11 +852,9 @@ mod operation {
             self.permit(Mode::Reserve).await
         }
 
-        /// Capacity and size permit cannot be concurrent only with reserve mode.
         pub(super) async fn permit_for_capacity_and_size(&mut self) -> Permit {
             while self.mode == Mode::Reserve {
                 if self.counter.load(Ordering::Relaxed) == 0 {
-                    // checking for capacity is during add, so insert mode is fine
                     self.mode = Mode::Insert;
                     break;
                 }
@@ -984,7 +913,6 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
     rayon_semaphore: Arc<Semaphore>,
     memory: mpsc::Sender<Memory>,
 ) -> anyhow::Result<mpsc::Sender<Index>> {
-    // TODO: The value of channel size was taken from initial benchmarks. Needs more testing
     const CHANNEL_SIZE: usize = 10;
     let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
 
@@ -1458,34 +1386,6 @@ async fn check_memory_allocation(
     true
 }
 
-fn f32_to_b1x8(f32_vec: &[f32]) -> Vec<b1x8> {
-    fn chunk_to_byte(chunk: impl Iterator<Item = f32>) -> b1x8 {
-        chunk.enumerate().fold(b1x8(0u8), |byte, (i, val)| {
-            if val > 0.0 {
-                b1x8(byte.0 | (1 << i))
-            } else {
-                byte
-            }
-        })
-    }
-
-    // Pre-calculate total capacity to avoid reallocation when pushing the remainder chunk
-    let capacity = f32_vec.len().div_ceil(8);
-    let mut bytes = Vec::<b1x8>::with_capacity(capacity);
-
-    let mut iter = f32_vec.chunks_exact(8);
-    bytes.extend(
-        iter.by_ref()
-            .map(|chunk| chunk_to_byte(chunk.iter().copied())),
-    );
-
-    let remainder = iter.remainder();
-    if !remainder.is_empty() {
-        bytes.push(chunk_to_byte(remainder.iter().copied()));
-    }
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1503,7 +1403,6 @@ mod tests {
     use tokio::sync::watch;
     use tokio::task;
     use tokio::time;
-    use usearch::b1x8;
 
     fn add_concurrently(
         partition_id: PartitionId,
@@ -1844,75 +1743,38 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn quantization_to_kind_conversion() {
+    #[test]
+    fn quantization_to_kind_conversion() {
         assert_eq!(ScalarKind::from(Quantization::F32), ScalarKind::F32);
         assert_eq!(ScalarKind::from(Quantization::F16), ScalarKind::F16);
         assert_eq!(ScalarKind::from(Quantization::BF16), ScalarKind::BF16);
         assert_eq!(ScalarKind::from(Quantization::I8), ScalarKind::I8);
-        assert_eq!(ScalarKind::from(Quantization::B1), ScalarKind::B1);
-    }
-
-    fn b1x8_to_u8_vec(b1_vec: &[b1x8]) -> Vec<u8> {
-        b1_vec.iter().map(|&b| b.0).collect()
+        assert_eq!(ScalarKind::from(Quantization::B1), ScalarKind::I8);
+        assert_eq!(ScalarKind::from(Quantization::TQ4), ScalarKind::I8);
     }
 
     #[test]
-    fn f32_to_b1x8_empty() {
-        let b1_vec = f32_to_b1x8(&[]);
-        assert_eq!(b1_vec.len(), 0);
+    fn b1_uses_tq4_metric_path() {
+        assert!(uses_tq4_path(Quantization::B1));
+        assert!(uses_tq4_path(Quantization::TQ4));
+        assert_eq!(
+            metric_kind(Quantization::B1, SpaceType::Cosine).unwrap(),
+            MetricKind::IP
+        );
+        assert_eq!(
+            metric_kind(Quantization::B1, SpaceType::DotProduct).unwrap(),
+            MetricKind::IP
+        );
+        assert!(metric_kind(Quantization::B1, SpaceType::Hamming).is_err());
     }
 
-    #[test]
-    fn f32_to_b1x8_single_byte() {
-        // =< 0 clears bits and > 0 sets bits
-        let b1_vec = f32_to_b1x8(&[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(b1_vec.len(), 1);
-        assert_eq!(b1x8_to_u8_vec(&b1_vec), &[0b00001111]);
-    }
-
-    #[test]
-    fn f32_to_b1x8_multiple_bytes() {
-        let input = vec![
-            1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, // 0b01010101
-            -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, // 0b11110000
-        ];
-        let b1_vec = f32_to_b1x8(&input);
-        assert_eq!(b1_vec.len(), 2);
-        assert_eq!(b1x8_to_u8_vec(&b1_vec), &[0b01010101, 0b11110000]);
-    }
-
-    #[test]
-    fn f32_to_b1x8_large_input() {
-        let input = vec![1.0; 64]; // 64 elements = 8 bytes
-        let b1_vec = f32_to_b1x8(&input);
-        assert_eq!(b1_vec.len(), 8);
-        assert_eq!(b1x8_to_u8_vec(&b1_vec), &[0b11111111; 8]);
-    }
-
-    #[test]
-    fn f32_to_b1x8_remainder() {
-        let input = vec![
-            1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, // 0b01010101
-            1.0, -1.0, 1.0, // 0b00000101
-        ];
-        let b1_vec = f32_to_b1x8(&input);
-        assert_eq!(b1_vec.len(), 2);
-        assert_eq!(b1x8_to_u8_vec(&b1_vec), &[0b01010101, 0b00000101]);
-    }
-
-    mod polar_quant_recall {
+    mod tq4_recall {
         use super::*;
-        use crate::turbo_quant::polar_quantize::{
-            PolarCodebooks, PolarCompressedVector, PolarCrossTables, PolarQuantizer,
-            polar_symmetric_distance, polar_symmetric_distance_baseline,
-        };
         use crate::turbo_quant::qjl::fill_standard_normal;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
         use std::collections::HashSet;
 
-        /// Generate a random unit-norm f32 vector.
         fn random_unit_vector(rng: &mut StdRng, dim: usize) -> Vec<f32> {
             let mut v = vec![0.0f32; dim];
             fill_standard_normal(rng, &mut v);
@@ -1923,7 +1785,6 @@ mod tests {
             v
         }
 
-        /// Brute-force cosine similarity search.
         fn exact_cosine_search(
             vectors: &[(u64, Vec<f32>)],
             query: &[f32],
@@ -1958,152 +1819,39 @@ mod tests {
             found as f32 / k as f32
         }
 
-        /// Brute-force PolarQuant recall: no HNSW, pure distance function quality.
-        fn polar_quant_bruteforce_recall(
+        fn build_tq4_index_and_search(
             n_vectors: usize,
             dim: usize,
             n_queries: usize,
             k: usize,
             seed: u64,
         ) -> f32 {
-            let quantizer = PolarQuantizer::new(dim, 42, 137);
-
-            let mut rng = StdRng::seed_from_u64(seed);
-            let vectors: Vec<(u64, Vec<f32>)> = (0..n_vectors)
-                .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
-                .collect();
-
-            let compressed: Vec<(u64, PolarCompressedVector)> = vectors
-                .iter()
-                .map(|(id, v)| (*id, quantizer.quantize(v)))
-                .collect();
-
-            let mut total_recall = 0.0f32;
-            for _ in 0..n_queries {
-                let query_vec = random_unit_vector(&mut rng, dim);
-                let ground_truth = exact_cosine_search(&vectors, &query_vec, k);
-                let gt_ids: Vec<u64> = ground_truth.iter().map(|(id, _)| *id).collect();
-
-                let query_state = quantizer.prepare_query(&query_vec);
-                let mut pq_results: Vec<(u64, f32)> = compressed
-                    .iter()
-                    .map(|(id, c)| {
-                        let ip = quantizer.inner_product(&query_state, c);
-                        let cos = ip / (query_state.query_norm * c.norm).max(1e-10);
-                        (*id, cos)
-                    })
-                    .collect();
-                pq_results
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let pq_ids: Vec<u64> = pq_results.iter().take(k).map(|(id, _)| *id).collect();
-
-                total_recall += recall_at_k(&pq_ids, &gt_ids, k);
-            }
-
-            total_recall / n_queries as f32
-        }
-
-        /// PolarQuant recall with HNSW index (end-to-end via USearch).
-        fn build_polar_quant_index_and_search(
-            n_vectors: usize,
-            dim: usize,
-            n_queries: usize,
-            k: usize,
-            seed: u64,
-        ) -> f32 {
-            let oversample_factor = 3.0f32;
-            let config = Tq4Config::default();
-            let packed_dim = PolarCompressedVector::packed_size(dim);
-            let quantizer = Arc::new(PolarQuantizer::new(
-                dim,
-                config.rotation_seed,
-                config.qjl_seed,
-            ));
-
-            // Build cross-product tables for symmetric metric (must live outside closure)
-            let codebooks = PolarCodebooks::new(dim.next_power_of_two().trailing_zeros() as usize);
-            let tables = Arc::new(PolarCrossTables::new(&codebooks));
-            let padded_dim = quantizer.padded_dim();
-
-            let options = IndexOptions {
-                dimensions: packed_dim,
-                connectivity: 16,
-                expansion_add: 128,
-                expansion_search: 64,
-                metric: MetricKind::IP,
-                quantization: ScalarKind::I8,
-                ..Default::default()
-            };
-            let mut inner = usearch::Index::new(&options).unwrap();
-
-            // Register PolarQuant symmetric metric
-            let tb = tables.clone();
-            inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
-                thread_local! {
-                    static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-                }
-                CONFIGURED.with(|c| {
-                    if !c.get() {
-                        numkong::configure_thread();
-                        c.set(true);
-                    }
-                });
-
-                let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
-                let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-                let ip = polar_symmetric_distance(a, b, padded_dim, &tb);
-                usearch::Distance::from(1.0 - ip)
-            }));
-
             let threads = rayon::current_num_threads();
-            inner
-                .reserve_capacity_and_threads(n_vectors + 1, threads)
+            let index = ThreadedUsearchIndex::new_tq4(dim, 16, 128, 64, SpaceType::Cosine, threads)
                 .unwrap();
+            index.reserve(n_vectors + 1).unwrap();
 
             let mut rng = StdRng::seed_from_u64(seed);
             let vectors: Vec<(u64, Vec<f32>)> = (0..n_vectors)
                 .map(|i| (i as u64, random_unit_vector(&mut rng, dim)))
                 .collect();
 
-            // Insert all vectors
             for (id, v) in &vectors {
-                let compressed = quantizer.quantize(v);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                inner.add(*id, packed_i8).unwrap();
+                let vector: Vector = v.clone().into();
+                index.add((*id).into(), &vector).unwrap();
             }
 
-            // Query with oversample + asymmetric reranking
+            let limit: Limit = std::num::NonZeroUsize::new(k).unwrap().into();
             let mut total_recall = 0.0f32;
             for _ in 0..n_queries {
                 let query_vec = random_unit_vector(&mut rng, dim);
-
-                // Phase 1: HNSW search with PolarQuant symmetric metric
-                let compressed_query = quantizer.quantize(&query_vec);
-                let packed_query = compressed_query.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
-                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
-                let candidates = inner.search(packed_i8, oversample_k).unwrap();
-
-                // Phase 2: Asymmetric reranking (zero-copy)
-                let query_state = quantizer.prepare_query(&query_vec);
-                let mut get_buf = vec![0i8; packed_dim];
-                let mut reranked: Vec<(u64, f32)> = Vec::with_capacity(candidates.keys.len());
-
-                for &id in &candidates.keys {
-                    get_buf.fill(0);
-                    if let Ok(found) = inner.get(id, &mut get_buf)
-                        && found > 0
-                    {
-                        let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
-                        let ip = quantizer.inner_product_packed(&query_state, buf_u8, dim);
-                        reranked.push((id, ip));
-                    }
-                }
-
-                reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                reranked.truncate(k);
-                let result_ids: Vec<u64> = reranked.iter().map(|(id, _)| *id).collect();
+                let query: Vector = query_vec.clone().into();
+                let result_ids: Vec<u64> = index
+                    .search(&query, limit)
+                    .unwrap()
+                    .map(|result| result.map(|(id, _)| u64::from(id)))
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .unwrap();
 
                 let ground_truth = exact_cosine_search(&vectors, &query_vec, k);
                 let gt_ids: Vec<u64> = ground_truth.iter().map(|(id, _)| *id).collect();
@@ -2113,380 +1861,19 @@ mod tests {
             total_recall / n_queries as f32
         }
 
-        // --- Brute-force recall tests (distance function quality) ---
-
-        #[test]
-        fn polar_quant_bruteforce_recall_1k() {
-            let recall = polar_quant_bruteforce_recall(1_000, 128, 20, 10, 42);
-            eprintln!("PolarQuant brute-force recall@10 (1K, d=128): {recall:.3}");
-            assert!(
-                recall >= 0.30,
-                "PolarQuant brute-force recall@10 too low: {recall:.3} (expected >= 0.30)"
-            );
-        }
-
-        #[test]
-        #[ignore] // Slow
-        fn polar_quant_bruteforce_recall_10k() {
-            let recall = polar_quant_bruteforce_recall(10_000, 768, 100, 10, 42);
-            eprintln!("PolarQuant brute-force recall@10 (10K, d=768): {recall:.3}");
-            assert!(
-                recall >= 0.20,
-                "PolarQuant brute-force recall@10 too low: {recall:.3} (expected >= 0.20)"
-            );
-        }
-
-        // --- HNSW recall tests (end-to-end) ---
-
-        #[test]
-        fn polar_quant_recall_at_10_random_1k() {
-            let recall = build_polar_quant_index_and_search(1_000, 128, 20, 10, 42);
-            eprintln!("PolarQuant HNSW recall@10 (1K, d=128): {recall:.3}");
-            assert!(
-                recall >= 0.25,
-                "PolarQuant HNSW recall@10 too low: {recall:.3} (expected >= 0.25)"
-            );
-        }
-
-        #[test]
-        #[ignore] // Slow
-        fn polar_quant_recall_at_10_random_10k() {
-            let recall = build_polar_quant_index_and_search(10_000, 768, 100, 10, 42);
-            eprintln!("PolarQuant HNSW recall@10 (10K, d=768): {recall:.3}");
-            assert!(
-                recall >= 0.15,
-                "PolarQuant HNSW recall@10 too low: {recall:.3} (expected >= 0.15)"
-            );
-        }
-
-        /// Benchmark HNSW search query latency (symmetric metric dominated).
-        ///
-        /// Builds a 5K-vector index at d=1536, then measures per-query search
-        /// latency over 200 queries. Reports median and p99 query times.
-        #[test]
-        #[ignore] // Microbenchmark, run with --ignored
-        fn bench_hnsw_search_latency() {
-            use std::hint::black_box;
-            use std::time::Instant;
-
-            let n_vectors = 5_000;
-            let dim = 1536;
-            let k = 10;
-            let oversample_factor = 3.0f32;
-            let n_queries = 200;
-
+        fn build_tq4_benchmark_index(
+            dim: usize,
+        ) -> Result<(usearch::Index, Arc<Tq4Quantizer>, usize, usize), String> {
             let config = Tq4Config::default();
-            let packed_dim = PolarCompressedVector::packed_size(dim);
-            let quantizer = Arc::new(PolarQuantizer::new(
+            let packed_dim = Tq4CompressedVector::packed_size(dim);
+            let quantizer = Arc::new(Tq4Quantizer::new(
                 dim,
                 config.rotation_seed,
                 config.qjl_seed,
             ));
-
-            let codebooks = PolarCodebooks::new(dim.next_power_of_two().trailing_zeros() as usize);
-            let tables = Arc::new(PolarCrossTables::new(&codebooks));
             let padded_dim = quantizer.padded_dim();
-
-            let options = IndexOptions {
-                dimensions: packed_dim,
-                connectivity: 16,
-                expansion_add: 128,
-                expansion_search: 64,
-                metric: MetricKind::IP,
-                quantization: ScalarKind::I8,
-                ..Default::default()
-            };
-            let mut inner = usearch::Index::new(&options).unwrap();
-
-            let tb = tables.clone();
-            inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
-                thread_local! {
-                    static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-                }
-                CONFIGURED.with(|c| {
-                    if !c.get() {
-                        numkong::configure_thread();
-                        c.set(true);
-                    }
-                });
-                let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
-                let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-                let ip = polar_symmetric_distance(a, b, padded_dim, &tb);
-                usearch::Distance::from(1.0 - ip)
-            }));
-
-            let threads = rayon::current_num_threads();
-            inner
-                .reserve_capacity_and_threads(n_vectors + 1, threads)
-                .unwrap();
-
-            let mut rng = StdRng::seed_from_u64(42);
-            let vectors: Vec<Vec<f32>> = (0..n_vectors)
-                .map(|_| random_unit_vector(&mut rng, dim))
-                .collect();
-
-            // Build index
-            for (id, v) in vectors.iter().enumerate() {
-                let compressed = quantizer.quantize(v);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                inner.add(id as u64, packed_i8).unwrap();
-            }
-            eprintln!("Index built: {n_vectors} vectors, d={dim}");
-
-            // Warmup
-            for _ in 0..20 {
-                let query_vec = random_unit_vector(&mut rng, dim);
-                let compressed = quantizer.quantize(&query_vec);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
-                black_box(inner.search(packed_i8, oversample_k).unwrap());
-            }
-
-            // Measure query latency
-            let mut search_times_us: Vec<f64> = Vec::with_capacity(n_queries);
-            for _ in 0..n_queries {
-                let query_vec = random_unit_vector(&mut rng, dim);
-                let compressed = quantizer.quantize(&query_vec);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
-
-                let t0 = Instant::now();
-                let _candidates = black_box(inner.search(packed_i8, oversample_k).unwrap());
-                let elapsed = t0.elapsed();
-                search_times_us.push(elapsed.as_secs_f64() * 1_000_000.0);
-            }
-
-            search_times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = search_times_us[n_queries / 2];
-            let p99 = search_times_us[(n_queries as f64 * 0.99) as usize];
-            let mean = search_times_us.iter().sum::<f64>() / n_queries as f64;
-
-            eprintln!(
-                "\n=== HNSW Search Latency (d={dim}, n={n_vectors}, k={k}, oversample=3x) ===\n\
-                 Mean:   {mean:.1}µs\n\
-                 Median: {median:.1}µs\n\
-                 P99:    {p99:.1}µs\n\
-                 QPS:    {:.0}",
-                1e6 / mean,
-            );
-        }
-
-        /// Baseline HNSW search latency using pre-optimization distance function.
-        #[test]
-        #[ignore]
-        fn bench_hnsw_search_latency_baseline() {
-            use std::hint::black_box;
-            use std::time::Instant;
-
-            let n_vectors = 5_000;
-            let dim = 1536;
-            let k = 10;
-            let oversample_factor = 3.0f32;
-            let n_queries = 200;
-
-            let config = Tq4Config::default();
-            let packed_dim = PolarCompressedVector::packed_size(dim);
-            let quantizer = Arc::new(PolarQuantizer::new(
-                dim,
-                config.rotation_seed,
-                config.qjl_seed,
-            ));
-
-            let codebooks = PolarCodebooks::new(dim.next_power_of_two().trailing_zeros() as usize);
-            let tables = Arc::new(PolarCrossTables::new(&codebooks));
-            let padded_dim = quantizer.padded_dim();
-
-            let options = IndexOptions {
-                dimensions: packed_dim,
-                connectivity: 16,
-                expansion_add: 128,
-                expansion_search: 64,
-                metric: MetricKind::IP,
-                quantization: ScalarKind::I8,
-                ..Default::default()
-            };
-            let mut inner = usearch::Index::new(&options).unwrap();
-
-            let tb = tables.clone();
-            inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
-                thread_local! {
-                    static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-                }
-                CONFIGURED.with(|c| {
-                    if !c.get() {
-                        numkong::configure_thread();
-                        c.set(true);
-                    }
-                });
-                let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
-                let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-                let ip = polar_symmetric_distance_baseline(a, b, padded_dim, &tb);
-                usearch::Distance::from(1.0 - ip)
-            }));
-
-            let threads = rayon::current_num_threads();
-            inner
-                .reserve_capacity_and_threads(n_vectors + 1, threads)
-                .unwrap();
-
-            let mut rng = StdRng::seed_from_u64(42);
-            let vectors: Vec<Vec<f32>> = (0..n_vectors)
-                .map(|_| random_unit_vector(&mut rng, dim))
-                .collect();
-
-            for (id, v) in vectors.iter().enumerate() {
-                let compressed = quantizer.quantize(v);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                inner.add(id as u64, packed_i8).unwrap();
-            }
-            eprintln!("Baseline index built: {n_vectors} vectors, d={dim}");
-
-            for _ in 0..20 {
-                let query_vec = random_unit_vector(&mut rng, dim);
-                let compressed = quantizer.quantize(&query_vec);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
-                black_box(inner.search(packed_i8, oversample_k).unwrap());
-            }
-
-            let mut search_times_us: Vec<f64> = Vec::with_capacity(n_queries);
-            for _ in 0..n_queries {
-                let query_vec = random_unit_vector(&mut rng, dim);
-                let compressed = quantizer.quantize(&query_vec);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
-
-                let t0 = Instant::now();
-                let _candidates = black_box(inner.search(packed_i8, oversample_k).unwrap());
-                let elapsed = t0.elapsed();
-                search_times_us.push(elapsed.as_secs_f64() * 1_000_000.0);
-            }
-
-            search_times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = search_times_us[n_queries / 2];
-            let p99 = search_times_us[(n_queries as f64 * 0.99) as usize];
-            let mean = search_times_us.iter().sum::<f64>() / n_queries as f64;
-
-            eprintln!(
-                "\n=== BASELINE HNSW Search Latency (d={dim}, n={n_vectors}, k={k}, oversample=3x) ===\n\
-                 Mean:   {mean:.1}µs\n\
-                 Median: {median:.1}µs\n\
-                 P99:    {p99:.1}µs\n\
-                 QPS:    {:.0}",
-                1e6 / mean,
-            );
-        }
-
-        // --- DBpedia recall test ---
-
-        #[test]
-        #[ignore] // Requires internet access + slow
-        fn polar_quant_recall_at_10_dbpedia_openai() {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { dbpedia_openai_polar_recall_inner(10, 3.0).await });
-            match result {
-                Ok(recall) => {
-                    eprintln!("PolarQuant recall@10 (DBpedia OpenAI, d=1536, n=1000): {recall:.3}");
-                    assert!(
-                        recall >= 0.30,
-                        "PolarQuant DBpedia recall@10 too low: {recall:.3} (expected >= 0.30)"
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Skipping DBpedia PolarQuant test: {e}");
-                }
-            }
-        }
-
-        /// Sweep oversampling factors (1x, 3x, 5x) and report recall@10 on DBpedia.
-        #[test]
-        #[ignore] // Requires internet access + slow
-        fn polar_quant_recall_oversample_sweep_dbpedia() {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let factors = [1.0f32, 1.25, 1.5, 3.0, 5.0];
-            for &f in &factors {
-                let result = rt.block_on(async { dbpedia_openai_polar_recall_inner(10, f).await });
-                match result {
-                    Ok(recall) => {
-                        eprintln!(
-                            "oversample={f:.0}x  recall@10={recall:.4}  ({:.1}%)",
-                            recall * 100.0
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("oversample={f:.0}x  FAILED: {e}");
-                    }
-                }
-            }
-        }
-
-        async fn dbpedia_openai_polar_recall_inner(
-            k: usize,
-            oversample_factor: f32,
-        ) -> Result<f32, String> {
-            let client = reqwest::Client::new();
-            let n_pages = 10;
-            let rows_per_page = 100;
-            let dim = 1536;
-            let n_queries = 50;
-            let emb_field = "text-embedding-3-large-1536-embedding";
-
-            let mut vectors: Vec<(u64, Vec<f32>)> = Vec::with_capacity(n_pages * rows_per_page);
-            for page in 0..n_pages {
-                let offset = page * rows_per_page;
-                let url = format!(
-                    "https://datasets-server.huggingface.co/rows\
-                     ?dataset=Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-100K\
-                     &config=default&split=train&offset={offset}&length={rows_per_page}"
-                );
-                let resp = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("HTTP request failed: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("HTTP {}", resp.status()));
-                }
-                let body: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("JSON parse failed: {e}"))?;
-                let rows = body["rows"]
-                    .as_array()
-                    .ok_or("Missing 'rows' field in response")?;
-                for row_obj in rows {
-                    let emb = row_obj["row"][emb_field]
-                        .as_array()
-                        .ok_or_else(|| format!("Missing '{emb_field}' field in row"))?;
-                    if emb.len() != dim {
-                        return Err(format!("Expected dim={dim}, got {}", emb.len()));
-                    }
-                    let v: Vec<f32> = emb
-                        .iter()
-                        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                        .collect();
-                    let id = vectors.len() as u64;
-                    vectors.push((id, v));
-                }
-            }
-
-            eprintln!(
-                "Downloaded {} DBpedia OpenAI vectors (d={dim})",
-                vectors.len()
-            );
-
-            // Build PolarQuant HNSW index
-            let packed_dim = PolarCompressedVector::packed_size(dim);
-            let quantizer = Arc::new(PolarQuantizer::new(dim, 42, 137));
-            let codebooks = PolarCodebooks::new(dim.next_power_of_two().trailing_zeros() as usize);
-            let tables = Arc::new(PolarCrossTables::new(&codebooks));
-            let padded_dim = quantizer.padded_dim();
+            let norm_offset = packed_dim - 4;
+            let cross_table = cross_product_table_3bit(quantizer.inv_sqrt_d());
 
             let options = IndexOptions {
                 dimensions: packed_dim,
@@ -2500,107 +1887,30 @@ mod tests {
             let mut inner =
                 usearch::Index::new(&options).map_err(|e| format!("Index creation failed: {e}"))?;
 
-            let tb = tables.clone();
             inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
-                thread_local! {
-                    static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-                }
-                CONFIGURED.with(|c| {
-                    if !c.get() {
-                        numkong::configure_thread();
-                        c.set(true);
-                    }
-                });
+                configure_numkong_thread();
+
                 let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
                 let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-                let ip = polar_symmetric_distance(a, b, padded_dim, &tb);
-                usearch::Distance::from(1.0 - ip)
+                let raw_ip = tq4_symmetric_distance(a, b, padded_dim, &cross_table);
+                let a_norm = tq4_packed_norm(a, norm_offset);
+                let b_norm = tq4_packed_norm(b, norm_offset);
+                let distance = tq4_distance_from_ip(SpaceType::Cosine, raw_ip, a_norm, b_norm);
+                usearch::Distance::from(distance)
             }));
 
-            let threads = rayon::current_num_threads();
-            inner
-                .reserve_capacity_and_threads(vectors.len() + 1, threads)
-                .map_err(|e| format!("Reserve failed: {e}"))?;
-
-            for (id, v) in &vectors {
-                let compressed = quantizer.quantize(v);
-                let packed = compressed.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
-                inner
-                    .add(*id, packed_i8)
-                    .map_err(|e| format!("Insert failed: {e}"))?;
-            }
-
-            // Query with oversample + reranking
-            let query_indices: Vec<usize> =
-                (0..vectors.len()).step_by(20).take(n_queries).collect();
-            let mut total_recall = 0.0f32;
-            for &qi in &query_indices {
-                let query_vec = &vectors[qi].1;
-
-                let compressed_query = quantizer.quantize(query_vec);
-                let packed_query = compressed_query.pack();
-                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed_query);
-                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
-                let candidates = inner
-                    .search(packed_i8, oversample_k)
-                    .map_err(|e| format!("Search failed: {e}"))?;
-
-                let query_state = quantizer.prepare_query(query_vec);
-                let mut get_buf = vec![0i8; packed_dim];
-                let mut reranked: Vec<(u64, f32)> = Vec::with_capacity(candidates.keys.len());
-
-                for &id in &candidates.keys {
-                    get_buf.fill(0);
-                    if let Ok(found) = inner.get(id, &mut get_buf)
-                        && found > 0
-                    {
-                        let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
-                        let ip = quantizer.inner_product_packed(&query_state, buf_u8, dim);
-                        reranked.push((id, ip));
-                    }
-                }
-
-                reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                reranked.truncate(k);
-                let result_ids: Vec<u64> = reranked.iter().map(|(id, _)| *id).collect();
-
-                let gt = exact_cosine_search(&vectors, query_vec, k);
-                let gt_ids: Vec<u64> = gt.iter().map(|(id, _)| *id).collect();
-                total_recall += recall_at_k(&result_ids, &gt_ids, k);
-            }
-
-            Ok(total_recall / query_indices.len() as f32)
+            Ok((inner, quantizer, packed_dim, norm_offset))
         }
 
-        /// Performance benchmark: measure build time, query time, and recall separately.
-        ///
-        /// Downloads 1000 DBpedia OpenAI vectors (d=1536) and reports:
-        /// - Index build time (quantize + insert)
-        /// - Per-query time (HNSW search + asymmetric reranking)
-        /// - Recall@10
-        #[test]
-        #[ignore] // Requires internet access + slow
-        fn polar_quant_perf_benchmark_dbpedia() {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { polar_quant_perf_benchmark_dbpedia_inner().await });
-            match result {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("Skipping DBpedia perf benchmark: {e}");
-                }
-            }
-        }
+        async fn download_dbpedia_openai_vectors() -> Result<Vec<(u64, Vec<f32>)>, String> {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
-        async fn polar_quant_perf_benchmark_dbpedia_inner() -> Result<(), String> {
-            use std::time::Instant;
-
-            let client = reqwest::Client::new();
             let n_pages = 10;
             let rows_per_page = 100;
             let dim = 1536;
-            let n_queries = 50;
-            let k = 10;
             let emb_field = "text-embedding-3-large-1536-embedding";
 
             let mut vectors: Vec<(u64, Vec<f32>)> = Vec::with_capacity(n_pages * rows_per_page);
@@ -2642,20 +1952,189 @@ mod tests {
                 }
             }
 
+            Ok(vectors)
+        }
+
+        #[test]
+        fn tq4_recall_at_10_random_1k() {
+            let recall = build_tq4_index_and_search(1_000, 128, 20, 10, 42);
+            eprintln!("TQ4 HNSW recall@10 (1K, d=128): {recall:.3}");
+            assert!(
+                recall >= 0.50,
+                "TQ4 HNSW recall@10 too low: {recall:.3} (expected >= 0.50)"
+            );
+        }
+
+        /// Benchmark TQ4 HNSW search latency using the same settings as the
+        /// release benchmark harness.
+        #[test]
+        #[ignore] // Microbenchmark, run with --ignored
+        fn bench_hnsw_search_latency() {
+            use std::hint::black_box;
+            use std::time::Instant;
+
+            let n_vectors = 5_000;
+            let dim = 1536;
+            let k = 10;
+            let oversample_factor = 3.0f32;
+            let n_queries = 200;
+
+            let (inner, quantizer, _, _) = build_tq4_benchmark_index(dim).unwrap();
+
+            let threads = rayon::current_num_threads();
+            inner
+                .reserve_capacity_and_threads(n_vectors + 1, threads)
+                .unwrap();
+
+            let mut rng = StdRng::seed_from_u64(42);
+            let vectors: Vec<Vec<f32>> = (0..n_vectors)
+                .map(|_| random_unit_vector(&mut rng, dim))
+                .collect();
+
+            for (id, v) in vectors.iter().enumerate() {
+                let compressed = quantizer.quantize(v);
+                let packed = compressed.pack();
+                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
+                inner.add(id as u64, packed_i8).unwrap();
+            }
+            eprintln!("TQ4 index built: {n_vectors} vectors, d={dim}");
+
+            for _ in 0..20 {
+                let query_vec = random_unit_vector(&mut rng, dim);
+                let compressed = quantizer.quantize(&query_vec);
+                let packed = compressed.pack();
+                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
+                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
+                black_box(inner.search(packed_i8, oversample_k).unwrap());
+            }
+
+            let mut search_times_us: Vec<f64> = Vec::with_capacity(n_queries);
+            for _ in 0..n_queries {
+                let query_vec = random_unit_vector(&mut rng, dim);
+                let compressed = quantizer.quantize(&query_vec);
+                let packed = compressed.pack();
+                let packed_i8 = bytemuck::cast_slice::<u8, i8>(&packed);
+                let oversample_k = (k as f32 * oversample_factor).ceil() as usize;
+
+                let t0 = Instant::now();
+                let _candidates = black_box(inner.search(packed_i8, oversample_k).unwrap());
+                let elapsed = t0.elapsed();
+                search_times_us.push(elapsed.as_secs_f64() * 1_000_000.0);
+            }
+
+            search_times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = search_times_us[n_queries / 2];
+            let p99 = search_times_us[(n_queries as f64 * 0.99) as usize];
+            let mean = search_times_us.iter().sum::<f64>() / n_queries as f64;
+
             eprintln!(
-                "Downloaded {} DBpedia OpenAI vectors (d={dim})",
+                "\n=== TQ4 HNSW Search Latency (d={dim}, n={n_vectors}, k={k}, oversample=3x) ===\n\
+                 Mean:   {mean:.1}µs\n\
+                 Median: {median:.1}µs\n\
+                 P99:    {p99:.1}µs\n\
+                 QPS:    {:.0}",
+                1e6 / mean,
+            );
+        }
+
+        #[test]
+        #[ignore] // Slow and requires network access.
+        fn tq4_recall_at_10_dbpedia_openai() {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { dbpedia_openai_tq4_recall_inner(10).await });
+            match result {
+                Ok(recall) => {
+                    eprintln!("TQ4 recall@10 (DBpedia OpenAI, d=1536, n=1000): {recall:.3}");
+                    assert!(
+                        recall >= 0.80,
+                        "TQ4 DBpedia recall@10 too low: {recall:.3} (expected >= 0.80)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Skipping DBpedia TQ4 test: {e}");
+                }
+            }
+        }
+
+        /// DBpedia end-to-end TQ4 benchmark matching the release harness.
+        #[test]
+        #[ignore] // Requires internet access + slow
+        fn tq4_perf_benchmark_dbpedia() {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { tq4_perf_benchmark_dbpedia_inner(3.0).await });
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Skipping TQ4 DBpedia perf benchmark: {e}");
+                }
+            }
+        }
+
+        async fn dbpedia_openai_tq4_recall_inner(k: usize) -> Result<f32, String> {
+            let dim = 1536;
+            let n_queries = 50;
+            let vectors = download_dbpedia_openai_vectors().await?;
+
+            eprintln!(
+                "Downloaded {} DBpedia OpenAI vectors for TQ4 (d={dim})",
                 vectors.len()
             );
 
-            // --- Measure quantization time ---
-            let oversample_factor = 3.0f32;
-            let packed_dim = PolarCompressedVector::packed_size(dim);
-            let quantizer = Arc::new(PolarQuantizer::new(dim, 42, 137));
-            let codebooks = PolarCodebooks::new(dim.next_power_of_two().trailing_zeros() as usize);
-            let tables = Arc::new(PolarCrossTables::new(&codebooks));
-            let padded_dim = quantizer.padded_dim();
+            let threads = rayon::current_num_threads();
+            let index = ThreadedUsearchIndex::new_tq4(dim, 16, 128, 64, SpaceType::Cosine, threads)
+                .map_err(|e| format!("Index creation failed: {e}"))?;
+            index
+                .reserve(vectors.len() + 1)
+                .map_err(|e| format!("Reserve failed: {e}"))?;
+
+            for (id, v) in &vectors {
+                let vector: Vector = v.clone().into();
+                index
+                    .add((*id).into(), &vector)
+                    .map_err(|e| format!("Insert failed: {e}"))?;
+            }
+
+            let limit: Limit = std::num::NonZeroUsize::new(k).unwrap().into();
+            let query_indices: Vec<usize> =
+                (0..vectors.len()).step_by(20).take(n_queries).collect();
+            let mut total_recall = 0.0f32;
+
+            for &qi in &query_indices {
+                let query_vec = &vectors[qi].1;
+                let query: Vector = query_vec.clone().into();
+                let result_ids: Vec<u64> = index
+                    .search(&query, limit)
+                    .map_err(|e| format!("Search failed: {e}"))?
+                    .map(|result| {
+                        result
+                            .map(|(id, _)| u64::from(id))
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let gt = exact_cosine_search(&vectors, query_vec, k);
+                let gt_ids: Vec<u64> = gt.iter().map(|(id, _)| *id).collect();
+                total_recall += recall_at_k(&result_ids, &gt_ids, k);
+            }
+
+            Ok(total_recall / query_indices.len() as f32)
+        }
+
+        async fn tq4_perf_benchmark_dbpedia_inner(oversample_factor: f32) -> Result<(), String> {
+            use std::time::Instant;
+
+            let dim = 1536;
+            let n_queries = 50;
+            let k = 10;
+            let vectors = download_dbpedia_openai_vectors().await?;
+
+            eprintln!(
+                "Downloaded {} DBpedia OpenAI vectors for TQ4 perf benchmark (d={dim})",
+                vectors.len()
+            );
 
             let t0 = Instant::now();
+            let (_, quantizer, _, _) = build_tq4_benchmark_index(dim)?;
             let packed_vecs: Vec<(u64, Vec<u8>)> = vectors
                 .iter()
                 .map(|(id, v)| {
@@ -2671,35 +2150,7 @@ mod tests {
                 quantize_time.as_secs_f64() * 1_000_000.0 / vectors.len() as f64,
             );
 
-            // --- Build HNSW index (measures insert + graph construction) ---
-            let options = IndexOptions {
-                dimensions: packed_dim,
-                connectivity: 16,
-                expansion_add: 128,
-                expansion_search: 64,
-                metric: MetricKind::IP,
-                quantization: ScalarKind::I8,
-                ..Default::default()
-            };
-            let mut inner =
-                usearch::Index::new(&options).map_err(|e| format!("Index creation failed: {e}"))?;
-
-            let tb = tables.clone();
-            inner.change_metric::<i8>(Box::new(move |a_ptr: *const i8, b_ptr: *const i8| {
-                thread_local! {
-                    static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-                }
-                CONFIGURED.with(|c| {
-                    if !c.get() {
-                        numkong::configure_thread();
-                        c.set(true);
-                    }
-                });
-                let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
-                let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-                let ip = polar_symmetric_distance(a, b, padded_dim, &tb);
-                usearch::Distance::from(1.0 - ip)
-            }));
+            let (inner, quantizer, packed_dim, norm_offset) = build_tq4_benchmark_index(dim)?;
 
             let threads = rayon::current_num_threads();
             inner
@@ -2721,7 +2172,6 @@ mod tests {
                 build_time.as_secs_f64() * 1_000_000.0 / vectors.len() as f64,
             );
 
-            // --- Measure query time (HNSW search + reranking) ---
             let query_indices: Vec<usize> =
                 (0..vectors.len()).step_by(20).take(n_queries).collect();
             let mut total_recall = 0.0f32;
@@ -2731,7 +2181,6 @@ mod tests {
             for &qi in &query_indices {
                 let query_vec = &vectors[qi].1;
 
-                // Phase 1: quantize query + HNSW search
                 let t_search = Instant::now();
                 let compressed_query = quantizer.quantize(query_vec);
                 let packed_query = compressed_query.pack();
@@ -2743,9 +2192,9 @@ mod tests {
                 let search_us = t_search.elapsed().as_secs_f64() * 1_000_000.0;
                 total_search_us += search_us;
 
-                // Phase 2: asymmetric reranking (zero-copy)
                 let t_rerank = Instant::now();
                 let query_state = quantizer.prepare_query(query_vec);
+                let q_norm = query_state.query_norm;
                 let mut get_buf = vec![0i8; packed_dim];
                 let mut reranked: Vec<(u64, f32)> = Vec::with_capacity(candidates.keys.len());
 
@@ -2755,8 +2204,15 @@ mod tests {
                         && found > 0
                     {
                         let buf_u8 = bytemuck::cast_slice::<i8, u8>(&get_buf);
-                        let ip = quantizer.inner_product_packed(&query_state, buf_u8, dim);
-                        reranked.push((id, ip));
+                        let raw_ip = quantizer.inner_product_packed(&query_state, buf_u8, dim);
+                        let x_norm = tq4_packed_norm(buf_u8, norm_offset);
+                        let denom = q_norm * x_norm;
+                        let cosine = if denom > 0.0 {
+                            (raw_ip / denom).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        reranked.push((id, cosine));
                     }
                 }
 
@@ -2766,7 +2222,6 @@ mod tests {
                 total_rerank_us += rerank_us;
 
                 let result_ids: Vec<u64> = reranked.iter().map(|(id, _)| *id).collect();
-
                 let gt = exact_cosine_search(&vectors, query_vec, k);
                 let gt_ids: Vec<u64> = gt.iter().map(|(id, _)| *id).collect();
                 total_recall += recall_at_k(&result_ids, &gt_ids, k);
@@ -2777,7 +2232,7 @@ mod tests {
             let avg_rerank_us = total_rerank_us / query_indices.len() as f64;
 
             eprintln!(
-                "\n=== PolarQuant DBpedia Benchmark (d={dim}, n={}) ===",
+                "\n=== TQ4 DBpedia Benchmark (d={dim}, n={}) ===",
                 vectors.len()
             );
             eprintln!(
@@ -2796,8 +2251,8 @@ mod tests {
             eprintln!("Recall@{k}:  {recall:.3}");
 
             assert!(
-                recall >= 0.30,
-                "PolarQuant DBpedia recall@10 too low: {recall:.3} (expected >= 0.30)"
+                recall >= 0.80,
+                "TQ4 DBpedia recall@10 too low: {recall:.3} (expected >= 0.80)"
             );
 
             Ok(())

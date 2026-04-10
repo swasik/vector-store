@@ -37,8 +37,6 @@
 
 pub mod codebook;
 pub mod distance;
-pub mod polar;
-pub mod polar_quantize;
 pub mod qjl;
 pub mod quantize;
 pub mod rotation;

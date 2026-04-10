@@ -100,6 +100,74 @@ impl Tq4Quantizer {
         compressed.norm * (mse_ip + qjl_ip)
     }
 
+    /// Compute inner product estimate directly from a packed TQ4 byte slice.
+    ///
+    /// This avoids unpacking into an owned `Tq4CompressedVector` during
+    /// reranking and reuses a thread-local centroid buffer for the SIMD MSE dot.
+    pub fn inner_product_packed(
+        &self,
+        query_state: &Tq4QueryState,
+        packed: &[u8],
+        dimension: usize,
+    ) -> f32 {
+        let d_pad = dimension.next_power_of_two();
+        debug_assert_eq!(d_pad, self.padded_dim());
+
+        let mse_len = (d_pad * 3).div_ceil(8);
+        let qjl_len = d_pad.div_ceil(8);
+        let mse_indices = &packed[..mse_len];
+        let qjl_signs = &packed[mse_len..mse_len + qjl_len];
+        let gamma = f32::from_le_bytes(
+            packed[mse_len + qjl_len..mse_len + qjl_len + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let norm = f32::from_le_bytes(
+            packed[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                .try_into()
+                .unwrap(),
+        );
+
+        let inv_sqrt_d = self.inv_sqrt_d();
+        let full_groups = d_pad / 8;
+        let remainder = d_pad % 8;
+
+        thread_local! {
+            static CENTROIDS: std::cell::RefCell<Vec<f32>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+
+        CENTROIDS.with(|cell| {
+            let mut centroids = cell.borrow_mut();
+            if centroids.len() < d_pad {
+                centroids.resize(d_pad, 0.0);
+            }
+
+            for g in 0..full_groups {
+                let indices = codebook::extract_8_3bit_indices(mse_indices, g);
+                let base = g * 8;
+                for k in 0..8 {
+                    centroids[base + k] = CENTROIDS_3BIT[indices[k] as usize] * inv_sqrt_d;
+                }
+            }
+
+            let base = full_groups * 8;
+            for j in 0..remainder {
+                let idx = codebook::extract_3bit_index(mse_indices, base + j);
+                centroids[base + j] = CENTROIDS_3BIT[idx as usize] * inv_sqrt_d;
+            }
+
+            let mse_ip = f32::dot(&centroids[..d_pad], &query_state.rotated_query[..d_pad])
+                .unwrap_or(0.0) as f32;
+            let qjl_ip =
+                self.qjl()
+                    .inner_product_term(qjl_signs, &query_state.projected_query, gamma);
+
+            norm * (mse_ip + qjl_ip)
+        })
+    }
+
     /// Batch compute inner product estimates for multiple TQ4 candidates.
     ///
     /// Gathers centroid values into a reusable buffer and uses SIMD dot product
