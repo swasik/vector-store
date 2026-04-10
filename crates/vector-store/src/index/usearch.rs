@@ -56,7 +56,7 @@ use crate::turbo_quant::Tq4CompressedVector;
 use crate::turbo_quant::Tq4Config;
 use crate::turbo_quant::Tq4Quantizer;
 use crate::turbo_quant::codebook::cross_product_table_3bit;
-use crate::turbo_quant::distance::tq4_symmetric_distance;
+use crate::turbo_quant::distance::{precompute_cos_table, tq4_symmetric_distance};
 
 pub struct UsearchIndexFactory {
     tokio_semaphore: Arc<Semaphore>,
@@ -274,6 +274,7 @@ impl ThreadedUsearchIndex {
         let norm_offset = packed_dim - 4;
         let metric_kind = metric_kind(Quantization::TQ4, space_type)?;
         let cross_table = cross_product_table_3bit(quantizer.inv_sqrt_d());
+        let cos_table = precompute_cos_table(padded_dim);
 
         let options = IndexOptions {
             dimensions: packed_dim,
@@ -291,7 +292,7 @@ impl ThreadedUsearchIndex {
 
             let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
             let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-            let raw_ip = tq4_symmetric_distance(a, b, padded_dim, &cross_table);
+            let raw_ip = tq4_symmetric_distance(a, b, padded_dim, &cross_table, &cos_table);
             let a_norm = tq4_packed_norm(a, norm_offset);
             let b_norm = tq4_packed_norm(b, norm_offset);
             let distance = tq4_distance_from_ip(space_type, raw_ip, a_norm, b_norm);
@@ -1874,6 +1875,7 @@ mod tests {
             let padded_dim = quantizer.padded_dim();
             let norm_offset = packed_dim - 4;
             let cross_table = cross_product_table_3bit(quantizer.inv_sqrt_d());
+            let cos_table = precompute_cos_table(padded_dim);
 
             let options = IndexOptions {
                 dimensions: packed_dim,
@@ -1892,7 +1894,7 @@ mod tests {
 
                 let a = unsafe { std::slice::from_raw_parts(a_ptr as *const u8, packed_dim) };
                 let b = unsafe { std::slice::from_raw_parts(b_ptr as *const u8, packed_dim) };
-                let raw_ip = tq4_symmetric_distance(a, b, padded_dim, &cross_table);
+                let raw_ip = tq4_symmetric_distance(a, b, padded_dim, &cross_table, &cos_table);
                 let a_norm = tq4_packed_norm(a, norm_offset);
                 let b_norm = tq4_packed_norm(b, norm_offset);
                 let distance = tq4_distance_from_ip(SpaceType::Cosine, raw_ip, a_norm, b_norm);

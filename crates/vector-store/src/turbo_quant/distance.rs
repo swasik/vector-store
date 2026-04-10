@@ -235,6 +235,16 @@ impl Tq4Quantizer {
     }
 }
 
+/// Precompute cos(π·k/d) for k ∈ [0, d].
+///
+/// Eliminates the `f32::cos()` call from every symmetric distance evaluation.
+/// The table has d+1 entries and fits comfortably in L1 cache (~8 KB for d=2048).
+pub fn precompute_cos_table(dim: usize) -> Vec<f32> {
+    (0..=dim)
+        .map(|k| f32::cos(std::f32::consts::PI * k as f32 / dim as f32))
+        .collect()
+}
+
 /// TQ4-to-TQ4 symmetric distance for USearch custom metric.
 ///
 /// Computes approximate inner product from two packed TQ4 representations:
@@ -245,11 +255,18 @@ impl Tq4Quantizer {
 ///
 /// # Arguments
 /// - `a`, `b`: packed TQ4 byte arrays (layout: [mse | qjl | gamma | norm])
-/// - `dim`: original vector dimension d
+/// - `dim`: padded dimension d_pad
 /// - `cross_table`: precomputed 8×8 cross-product table
+/// - `cos_table`: precomputed cos(π·k/d) for k ∈ [0, d] (from `precompute_cos_table`)
 ///
 /// Returns the approximate inner product (not a distance).
-pub fn tq4_symmetric_distance(a: &[u8], b: &[u8], dim: usize, cross_table: &[[f32; 8]; 8]) -> f32 {
+pub fn tq4_symmetric_distance(
+    a: &[u8],
+    b: &[u8],
+    dim: usize,
+    cross_table: &[[f32; 8]; 8],
+    cos_table: &[f32],
+) -> f32 {
     let mse_len = (dim * 3).div_ceil(8);
     let qjl_len = dim.div_ceil(8);
 
@@ -289,9 +306,8 @@ pub fn tq4_symmetric_distance(a: &[u8], b: &[u8], dim: usize, cross_table: &[[f3
         unsafe { std::slice::from_raw_parts(b_qjl.as_ptr().cast::<u1x8>(), qjl_len) };
     let hamming_bits = u1x8::hamming(a_bits, b_bits).unwrap_or(0);
 
-    // cos(π · hamming / d) is the sign-based inner product estimator
-    let qjl_term =
-        a_gamma * b_gamma * f32::cos(std::f32::consts::PI * hamming_bits as f32 / dim as f32);
+    // cos(π · hamming / d) via precomputed table lookup (zero trig at runtime)
+    let qjl_term = a_gamma * b_gamma * cos_table[hamming_bits as usize];
 
     a_norm * b_norm * (mse_term + qjl_term)
 }
@@ -412,6 +428,7 @@ mod tests {
         let d_pad = quantizer.padded_dim();
         let inv_sqrt_d = quantizer.inv_sqrt_d();
         let cross_table = cross_product_table_3bit(inv_sqrt_d);
+        let cos_table = precompute_cos_table(d_pad);
 
         let mut rng = StdRng::seed_from_u64(42);
         let mut v = vec![0.0f32; d];
@@ -422,7 +439,7 @@ mod tests {
         let packed = compressed.pack();
 
         // Self-distance should approximate ‖x‖²
-        let ip = tq4_symmetric_distance(&packed, &packed, d_pad, &cross_table);
+        let ip = tq4_symmetric_distance(&packed, &packed, d_pad, &cross_table, &cos_table);
         let expected = norm * norm;
         let rel_err = (ip - expected).abs() / expected;
         assert!(
@@ -493,5 +510,62 @@ mod tests {
                 "Cosine similarity out of range: {cos}"
             );
         }
+    }
+
+    #[test]
+    #[ignore] // Microbenchmark, run with --ignored
+    fn bench_tq4_symmetric_distance() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let d = 1536;
+        let quantizer = Tq4Quantizer::new(d, 42, 137);
+        let d_pad = quantizer.padded_dim();
+        let inv_sqrt_d = quantizer.inv_sqrt_d();
+        let cross_table = cross_product_table_3bit(inv_sqrt_d);
+        let cos_table = precompute_cos_table(d_pad);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let n_vecs = 200;
+        let packed_vecs: Vec<Vec<u8>> = (0..n_vecs)
+            .map(|_| {
+                let mut v = vec![0.0f32; d];
+                fill_standard_normal(&mut rng, &mut v);
+                quantizer.quantize(&v).pack()
+            })
+            .collect();
+
+        numkong::configure_thread();
+
+        // Warmup
+        for _ in 0..1000 {
+            black_box(tq4_symmetric_distance(
+                &packed_vecs[0],
+                &packed_vecs[1],
+                d_pad,
+                &cross_table,
+                &cos_table,
+            ));
+        }
+
+        // Benchmark
+        let n_iters = 100_000;
+        let t0 = Instant::now();
+        for i in 0..n_iters {
+            let a = &packed_vecs[i % n_vecs];
+            let b = &packed_vecs[(i + 1) % n_vecs];
+            black_box(tq4_symmetric_distance(a, b, d_pad, &cross_table, &cos_table));
+        }
+        let elapsed = t0.elapsed();
+        let ns_per_call = elapsed.as_nanos() as f64 / n_iters as f64;
+        let us_per_call = ns_per_call / 1000.0;
+        eprintln!(
+            "\n=== tq4_symmetric_distance (d={d}, d_pad={d_pad}) ===\n\
+             {n_iters} iterations in {:.1}ms\n\
+             {ns_per_call:.0} ns/call ({us_per_call:.2} µs/call)\n\
+             Throughput: {:.1}M distances/sec",
+            elapsed.as_secs_f64() * 1000.0,
+            1e9 / ns_per_call / 1e6,
+        );
     }
 }
