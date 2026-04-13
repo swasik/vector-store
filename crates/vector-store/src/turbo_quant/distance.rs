@@ -229,6 +229,10 @@ pub fn precompute_cos_table(dim: usize) -> Vec<f32> {
 /// - MSE term: cross-product table lookup over 3-bit index pairs (nibble & 0x07)
 /// - QJL term: Hamming on interleaved sign bits (nibble bit 3) → cosine correction
 ///
+/// On x86-64 with AVX2, dispatches to a SIMD implementation that uses `vpshufb`
+/// as a 4-bit LUT for centroid lookups and integer multiply-accumulate.
+/// Falls back to scalar cross-product table lookups on other architectures.
+///
 /// # Arguments
 /// - `a`, `b`: packed TQ4 byte arrays (layout: [nibbles | gamma | norm])
 /// - `dim`: padded dimension d_pad
@@ -237,6 +241,30 @@ pub fn precompute_cos_table(dim: usize) -> Vec<f32> {
 ///
 /// Returns the approximate inner product (not a distance).
 pub fn tq4_symmetric_distance(
+    a: &[u8],
+    b: &[u8],
+    dim: usize,
+    cross_table: &[[f32; 8]; 8],
+    cos_table: &[f32],
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // Derive inv_sqrt_d² from cross_table:
+            // cross_table[7][7] = CENTROIDS[7]² × inv_sqrt_d² = 1.224² × inv_sqrt_d²
+            let inv_sqrt_d_sq = cross_table[7][7] / (CENTROIDS_3BIT[7] * CENTROIDS_3BIT[7]);
+            // SAFETY: AVX2 feature checked above.
+            return unsafe { tq4_symmetric_distance_avx2(a, b, dim, inv_sqrt_d_sq, cos_table) };
+        }
+    }
+    tq4_symmetric_distance_scalar(a, b, dim, cross_table, cos_table)
+}
+
+/// Scalar fallback for `tq4_symmetric_distance`.
+///
+/// Fused single pass: MSE cross-product lookups and u64-wide QJL Hamming are
+/// computed together in one traversal over the nibble arrays.
+fn tq4_symmetric_distance_scalar(
     a: &[u8],
     b: &[u8],
     dim: usize,
@@ -252,43 +280,182 @@ pub fn tq4_symmetric_distance(
     let a_norm = f32::from_le_bytes(a[nibble_len + 4..nibble_len + 8].try_into().unwrap());
     let b_norm = f32::from_le_bytes(b[nibble_len + 4..nibble_len + 8].try_into().unwrap());
 
-    // MSE term: cross-product table lookup from nibble indices
-    let mse_term = accumulate_cross_products_nibble(a_nibbles, b_nibbles, cross_table);
-
-    // QJL term: Hamming on interleaved sign bits (bit 3 of each nibble)
-    // 0x88 mask selects bits 7 and 3 — the QJL sign bits of the two nibbles per byte.
+    // Fused MSE + Hamming in a single pass over nibble arrays.
+    // Process 8 bytes at a time: u64-wide Hamming + byte-level MSE lookups.
+    let mut mse_sum = 0.0f32;
     let mut hamming_bits: u32 = 0;
-    for k in 0..nibble_len {
-        let xor = a_nibbles[k] ^ b_nibbles[k];
-        hamming_bits += (xor & 0x88).count_ones();
+
+    let chunks = nibble_len / 8;
+    for chunk_idx in 0..chunks {
+        let offset = chunk_idx * 8;
+
+        // u64-wide Hamming: XOR, mask QJL sign bits (0x88 per byte), popcount
+        let a_word = u64::from_ne_bytes(a_nibbles[offset..offset + 8].try_into().unwrap());
+        let b_word = u64::from_ne_bytes(b_nibbles[offset..offset + 8].try_into().unwrap());
+        hamming_bits += ((a_word ^ b_word) & 0x8888_8888_8888_8888u64).count_ones();
+
+        // Byte-level MSE cross-product lookups within same chunk
+        for i in 0..8 {
+            let a_byte = a_nibbles[offset + i];
+            let b_byte = b_nibbles[offset + i];
+            let a_hi = ((a_byte >> 4) & 0x07) as usize;
+            let a_lo = (a_byte & 0x07) as usize;
+            let b_hi = ((b_byte >> 4) & 0x07) as usize;
+            let b_lo = (b_byte & 0x07) as usize;
+            mse_sum += cross_table[a_hi][b_hi] + cross_table[a_lo][b_lo];
+        }
+    }
+
+    // Handle remainder bytes (nibble_len not divisible by 8)
+    let rem_offset = chunks * 8;
+    for i in rem_offset..nibble_len {
+        let a_byte = a_nibbles[i];
+        let b_byte = b_nibbles[i];
+        hamming_bits += ((a_byte ^ b_byte) & 0x88).count_ones();
+        let a_hi = ((a_byte >> 4) & 0x07) as usize;
+        let a_lo = (a_byte & 0x07) as usize;
+        let b_hi = ((b_byte >> 4) & 0x07) as usize;
+        let b_lo = (b_byte & 0x07) as usize;
+        mse_sum += cross_table[a_hi][b_hi] + cross_table[a_lo][b_lo];
     }
 
     // cos(π · hamming / d) via precomputed table lookup (zero trig at runtime)
     let qjl_term = a_gamma * b_gamma * cos_table[hamming_bits as usize];
 
-    a_norm * b_norm * (mse_term + qjl_term)
+    a_norm * b_norm * (mse_sum + qjl_term)
 }
 
-/// Accumulate cross-product lookups over pairs of nibble-packed MSE indices.
+/// AVX2-accelerated TQ4-to-TQ4 symmetric distance for USearch custom metric.
 ///
-/// Each byte contains two 4-bit nibbles; bits 2-0 of each nibble are the
-/// 3-bit MSE index. Two table lookups per byte, zero heap allocation.
-fn accumulate_cross_products_nibble(
-    a_nibbles: &[u8],
-    b_nibbles: &[u8],
-    cross_table: &[[f32; 8]; 8],
+/// Uses `vpshufb` as a 4-bit LUT to map 3-bit centroid indices to quantized i8
+/// values, then `vpmaddwd` for i16×i16 → i32 multiply-accumulate. Processes
+/// 32 bytes (64 dimensions) per SIMD iteration. Hamming uses u64-wide popcount.
+///
+/// The 8 centroids are quantized to i8 with scale = 127/1.224 ≈ 103.76.
+/// The integer sum is converted back to f32 and multiplied by (inv_sqrt_d² / scale²).
+///
+/// Requires AVX2 + POPCNT (available on all x86-64 CPUs since Haswell).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn tq4_symmetric_distance_avx2(
+    a: &[u8],
+    b: &[u8],
+    dim: usize,
+    inv_sqrt_d_sq: f32,
+    cos_table: &[f32],
 ) -> f32 {
-    let mut sum = 0.0f32;
-    for k in 0..a_nibbles.len() {
-        let a_byte = a_nibbles[k];
-        let b_byte = b_nibbles[k];
-        let a_hi = ((a_byte >> 4) & 0x07) as usize;
-        let a_lo = (a_byte & 0x07) as usize;
-        let b_hi = ((b_byte >> 4) & 0x07) as usize;
-        let b_lo = (b_byte & 0x07) as usize;
-        sum += cross_table[a_hi][b_hi] + cross_table[a_lo][b_lo];
+    use std::arch::x86_64::*;
+
+    let nibble_len = dim / 2;
+    let a_nibbles = &a[..nibble_len];
+    let b_nibbles = &b[..nibble_len];
+    let a_gamma = f32::from_le_bytes(a[nibble_len..nibble_len + 4].try_into().unwrap());
+    let b_gamma = f32::from_le_bytes(b[nibble_len..nibble_len + 4].try_into().unwrap());
+    let a_norm = f32::from_le_bytes(a[nibble_len + 4..nibble_len + 8].try_into().unwrap());
+    let b_norm = f32::from_le_bytes(b[nibble_len + 4..nibble_len + 8].try_into().unwrap());
+
+    // SAFETY: All intrinsics below require AVX2, ensured by #[target_feature].
+    unsafe {
+        // Quantized centroids as i8: round(centroid * 127 / 1.224)
+        // [-127, -82, -47, -16, 16, 47, 82, 127]
+        // Entries 8-15 duplicate 0-7 so that nibble bit 3 (QJL sign) is ignored.
+        let centroid_lut = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            -127, -82, -47, -16, 16, 47, 82, 127, // indices 0-7
+            -127, -82, -47, -16, 16, 47, 82, 127, // indices 8-15 (bit3 ignored)
+        ));
+
+        let mask_0f = _mm256_set1_epi8(0x0F);
+        let zero = _mm256_setzero_si256();
+        let mut acc_i32 = zero;
+        let mut hamming_bits: u32 = 0;
+
+        let simd_chunks = nibble_len / 32;
+        for chunk_idx in 0..simd_chunks {
+            let offset = chunk_idx * 32;
+
+            // u64-wide Hamming over 32 bytes (4 × u64)
+            for w in 0..4 {
+                let wo = offset + w * 8;
+                let aw = u64::from_ne_bytes(a_nibbles[wo..wo + 8].try_into().unwrap());
+                let bw = u64::from_ne_bytes(b_nibbles[wo..wo + 8].try_into().unwrap());
+                hamming_bits += ((aw ^ bw) & 0x8888_8888_8888_8888u64).count_ones();
+            }
+
+            // Load 32 nibble bytes
+            let a_raw = _mm256_loadu_si256(a_nibbles[offset..].as_ptr() as *const __m256i);
+            let b_raw = _mm256_loadu_si256(b_nibbles[offset..].as_ptr() as *const __m256i);
+
+            // Extract low nibbles (odd dimensions): byte & 0x0F
+            let a_lo = _mm256_and_si256(a_raw, mask_0f);
+            let b_lo = _mm256_and_si256(b_raw, mask_0f);
+
+            // Extract high nibbles (even dimensions): byte >> 4
+            let a_hi = _mm256_and_si256(_mm256_srli_epi16(a_raw, 4), mask_0f);
+            let b_hi = _mm256_and_si256(_mm256_srli_epi16(b_raw, 4), mask_0f);
+
+            // vpshufb: map 4-bit index → i8 centroid value
+            let ca_lo = _mm256_shuffle_epi8(centroid_lut, a_lo);
+            let cb_lo = _mm256_shuffle_epi8(centroid_lut, b_lo);
+            let ca_hi = _mm256_shuffle_epi8(centroid_lut, a_hi);
+            let cb_hi = _mm256_shuffle_epi8(centroid_lut, b_hi);
+
+            // Sign-extend i8 → i16 and multiply-accumulate to i32.
+            // unpacklo/hi interleave bytes with sign extension bytes.
+            // vpmaddwd: i16 × i16 → i32, adding adjacent pairs.
+
+            // Low nibbles (odd dimensions):
+            let ca_lo_sign = _mm256_cmpgt_epi8(zero, ca_lo);
+            let cb_lo_sign = _mm256_cmpgt_epi8(zero, cb_lo);
+            let lo_a_lo16 = _mm256_unpacklo_epi8(ca_lo, ca_lo_sign);
+            let lo_b_lo16 = _mm256_unpacklo_epi8(cb_lo, cb_lo_sign);
+            let lo_a_hi16 = _mm256_unpackhi_epi8(ca_lo, ca_lo_sign);
+            let lo_b_hi16 = _mm256_unpackhi_epi8(cb_lo, cb_lo_sign);
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_madd_epi16(lo_a_lo16, lo_b_lo16));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_madd_epi16(lo_a_hi16, lo_b_hi16));
+
+            // High nibbles (even dimensions):
+            let ca_hi_sign = _mm256_cmpgt_epi8(zero, ca_hi);
+            let cb_hi_sign = _mm256_cmpgt_epi8(zero, cb_hi);
+            let hi_a_lo16 = _mm256_unpacklo_epi8(ca_hi, ca_hi_sign);
+            let hi_b_lo16 = _mm256_unpacklo_epi8(cb_hi, cb_hi_sign);
+            let hi_a_hi16 = _mm256_unpackhi_epi8(ca_hi, ca_hi_sign);
+            let hi_b_hi16 = _mm256_unpackhi_epi8(cb_hi, cb_hi_sign);
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_madd_epi16(hi_a_lo16, hi_b_lo16));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_madd_epi16(hi_a_hi16, hi_b_hi16));
+        }
+
+        // Horizontal sum of 8 × i32 lanes
+        let hi128 = _mm256_extracti128_si256(acc_i32, 1);
+        let sum128 = _mm_add_epi32(_mm256_castsi256_si128(acc_i32), hi128);
+        let sum64 = _mm_add_epi32(sum128, _mm_srli_si128(sum128, 8));
+        let sum32 = _mm_add_epi32(sum64, _mm_srli_si128(sum64, 4));
+        let int_sum = _mm_cvtsi128_si32(sum32);
+
+        // Scale: integer_sum × (1/scale²) × inv_sqrt_d²
+        // where scale = 127/1.224 ≈ 103.758. scale² ≈ 10765.72.
+        const SCALE: f32 = 127.0 / 1.224;
+        const INV_SCALE_SQ: f32 = 1.0 / (SCALE * SCALE);
+        let mse_sum = int_sum as f32 * (INV_SCALE_SQ * inv_sqrt_d_sq);
+
+        // Handle remainder bytes with scalar fallback
+        let rem_offset = simd_chunks * 32;
+        let mut mse_remainder = 0.0f32;
+        for i in rem_offset..nibble_len {
+            let a_byte = a_nibbles[i];
+            let b_byte = b_nibbles[i];
+            hamming_bits += ((a_byte ^ b_byte) & 0x88).count_ones();
+            let a_hi_idx = ((a_byte >> 4) & 0x07) as usize;
+            let a_lo_idx = (a_byte & 0x07) as usize;
+            let b_hi_idx = ((b_byte >> 4) & 0x07) as usize;
+            let b_lo_idx = (b_byte & 0x07) as usize;
+            mse_remainder += CENTROIDS_3BIT[a_hi_idx] * CENTROIDS_3BIT[b_hi_idx]
+                + CENTROIDS_3BIT[a_lo_idx] * CENTROIDS_3BIT[b_lo_idx];
+        }
+        let mse_term = mse_sum + mse_remainder * inv_sqrt_d_sq;
+
+        let qjl_term = a_gamma * b_gamma * cos_table[hamming_bits as usize];
+        a_norm * b_norm * (mse_term + qjl_term)
     }
-    sum
 }
 
 /// Asymmetric float-vs-TQ4 inner product from packed bytes. Zero allocation.
