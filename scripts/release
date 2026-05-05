@@ -1,0 +1,115 @@
+#!/bin/bash
+
+set -e
+
+repo=$(dirname "${BASH_SOURCE[0]}")
+repo=$(realpath $repo/..)
+
+cd $repo
+
+usage() {
+    echo "Usage: $0 <version> [--version-override]"
+    echo ""
+    echo "  <version>           Release version (e.g. 1.6.0)"
+    echo "  --version-override  Pass version explicitly to build and upload scripts"
+    echo "                      instead of relying on git tag detection"
+    exit 1
+}
+
+# Parse arguments.
+version=""
+version_override=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --version-override)
+            version_override=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            if [[ -z $version ]]; then
+                version=$1
+            else
+                echo "error: unexpected argument: $1"
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+[[ -n $version ]] || { echo "error: version argument is required"; usage; }
+
+step=0
+total_steps=6
+
+step_header() {
+    step=$((step + 1))
+    echo ""
+    echo "==> [$step/$total_steps] $1"
+    echo ""
+}
+
+step_header "Validating dependencies"
+
+missing=()
+command -v docker > /dev/null 2>&1 || missing+=("docker")
+command -v cargo > /dev/null 2>&1 || missing+=("cargo")
+command -v cargo-cyclonedx > /dev/null 2>&1 || missing+=("cargo-cyclonedx (cargo install cargo-cyclonedx)")
+command -v syft > /dev/null 2>&1 || missing+=("syft (https://github.com/anchore/syft)")
+command -v gh > /dev/null 2>&1 || missing+=("gh (https://cli.github.com/)")
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "error: missing required tools:"
+    for tool in "${missing[@]}"; do
+        echo "  - $tool"
+    done
+    exit 1
+fi
+echo "  All dependencies available."
+
+step_header "Preparing Docker QEMU for multi-platform builds"
+
+./scripts/prepare-docker-qemu
+echo "  QEMU handlers registered."
+
+step_header "Creating and pushing annotated tag $version"
+
+if git rev-parse "$version" > /dev/null 2>&1; then
+    echo "  Tag $version already exists, skipping creation."
+else
+    git tag -a "$version" -m "Release version $version"
+    echo "  Created annotated tag: $version"
+fi
+
+git push origin "$version"
+echo "  Pushed tag $version to origin."
+
+step_header "Building release"
+
+if [[ $version_override == true ]]; then
+    ./scripts/build-release "$version"
+else
+    ./scripts/build-release
+fi
+
+step_header "Uploading release"
+
+if [[ $version_override == true ]]; then
+    ./scripts/upload-release "$version"
+else
+    ./scripts/upload-release
+fi
+
+step_header "Done"
+
+echo ""
+echo "========================================"
+echo " RELEASE COMPLETE: vector-store $version"
+echo "========================================"
+echo ""
+echo "Checklist:"
+echo "  - [ ] Review auto-generated release notes: https://github.com/scylladb/vector-store/releases/tag/$version"

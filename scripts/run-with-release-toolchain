@@ -24,7 +24,11 @@ cat $repo/Cargo.toml | sed -e "s/version = \"0.0.0-dev\"/version = \"$version\"/
 tmp_rust_toolchain=$(mktemp /tmp/rust-toolchain.XXXXXX)
 grep -v components $repo/rust-toolchain.toml > $tmp_rust_toolchain
 
+docker_tty=""
+[[ -t 1 ]] && docker_tty="-t"
+
 docker run --rm \
+    $docker_tty \
     --platform linux/$TARGETARCH \
     --user "$(id -u)":"$(id -g)" \
     -e CARGO_TARGET_DIR="./target/$TARGETARCH" \

@@ -7,9 +7,26 @@ repo=$(realpath $repo/..)
 
 cd $repo
 
-vector_store_version=$(./scripts/run-with-release-toolchain cargo info vector-store | grep ^version: | cut -d ' ' -f 2)
+step=0
+total_steps=5
 
-# ensure the git repository is clean
+step_header() {
+    step=$((step + 1))
+    echo ""
+    echo "  --> [build $step/$total_steps] $1"
+    echo ""
+}
+
+step_header "Resolving version and verifying repository state"
+
+if [[ -n $1 ]]; then
+    vector_store_version=$1
+    echo "  Version (override): $vector_store_version"
+else
+    vector_store_version=$(./scripts/run-with-release-toolchain cargo info vector-store | grep ^version: | cut -d ' ' -f 2)
+    echo "  Version: $vector_store_version"
+fi
+
 if git status --porcelain | grep -q . ; then
     echo "error: git repository is not clean. Dirty files:"
     git status --porcelain
@@ -18,37 +35,49 @@ if git status --porcelain | grep -q . ; then
     echo "To discard all changes: git checkout -- ."
     exit 1
 fi
+echo "  Repository is clean."
+
+# Restore Cargo.toml and Cargo.lock from git if any build step fails.
+restore_cargo_files() {
+    git checkout -- Cargo.toml Cargo.lock 2>/dev/null && echo "  Restored Cargo.toml and Cargo.lock from git."
+}
+trap restore_cargo_files EXIT
+trap 'echo ""; echo "  Interrupted."; exit 130' INT TERM
 
 archs="amd64 arm64"
 
-for arch in $archs ; do
-    echo rebuild the release version $vector_store_version for $arch
-    TARGETARCH=$arch ./scripts/run-with-release-toolchain cargo clean --release
-    TARGETARCH=$arch ./scripts/run-with-release-toolchain cargo build --release
-done
+step_header "Building release binaries"
 
 for arch in $archs ; do
-    echo build the tar archive for $arch
+    echo "  Building vector-store $vector_store_version for $arch..."
+    TARGETARCH=$arch ./scripts/run-with-release-toolchain cargo clean --release
+    TARGETARCH=$arch ./scripts/run-with-release-toolchain cargo build --release
+    echo "  Built: target/$arch/release/vector-store"
+done
+
+step_header "Creating release archives"
+
+for arch in $archs ; do
     vector_store_dir=vector-store-$vector_store_version-$arch
     vector_store_tarball=$vector_store_dir.tar.gz
     (cd target/$arch/release && tar -czf $vector_store_tarball --transform "s,^,$vector_store_dir/," vector-store)
-    ls -lh target/$arch/release/$vector_store_tarball
+    echo "  Created: target/$arch/release/$vector_store_tarball ($(du -h target/$arch/release/$vector_store_tarball | cut -f1))"
 done
 
-echo generate Cargo SBOM for version $vector_store_version
-cp Cargo.toml Cargo.toml.bak
-trap 'mv Cargo.toml.bak Cargo.toml' EXIT
+step_header "Generating Cargo SBOM"
+
 sed -i "s/version = \"0.0.0-dev\"/version = \"$vector_store_version\"/" Cargo.toml
 cargo cyclonedx --manifest-path crates/vector-store/Cargo.toml --format json
-mv Cargo.toml.bak Cargo.toml
-trap - EXIT
+git checkout -- Cargo.toml Cargo.lock
 cargo_sbom=crates/vector-store/vector-store.cdx.json
 [[ -f $cargo_sbom ]] || { echo "error: SBOM was not generated at $cargo_sbom"; exit 1; }
 mv $cargo_sbom vector-store-$vector_store_version.cdx.json
-echo "Cargo SBOM: vector-store-$vector_store_version.cdx.json"
+echo "  Created: vector-store-$vector_store_version.cdx.json"
+
+step_header "Building Docker images and generating Docker SBOMs"
 
 for arch in $archs ; do
-    echo build the docker image for linux/$arch
+    echo "  Building docker image for linux/$arch..."
     docker_tag=scylladb/vector-store:$vector_store_version-$arch
     docker build --platform linux/$arch --tag $docker_tag -f- . <<EOF
 FROM redhat/ubi9-minimal
@@ -57,19 +86,33 @@ RUN mkdir /opt/vector-store
 COPY target/\$TARGETARCH/release/vector-store /opt/vector-store
 CMD ["/opt/vector-store/vector-store"]
 EOF
+    echo "  Built: $docker_tag"
 
-    echo generate Docker image SBOM for $arch using syft
+    echo "  Generating Docker SBOM for $arch..."
     docker_sbom=vector-store-docker-$vector_store_version-$arch.cdx.json
     syft $docker_tag -o cyclonedx-json > $docker_sbom
     [[ -s $docker_sbom ]] || { echo "error: Docker SBOM is empty at $docker_sbom"; exit 1; }
-    echo "Docker SBOM: $docker_sbom"
+    echo "  Created: $docker_sbom"
 done
 
-echo create multi-platform docker manifest
-docker_manifest=scylladb/vector-store:$vector_store_version
-docker_arch_tags=()
+echo ""
+echo "========================================"
+echo " BUILD COMPLETE: vector-store $vector_store_version"
+echo "========================================"
+echo ""
+echo "Artifacts:"
 for arch in $archs ; do
-    docker_arch_tags+=("scylladb/vector-store:$vector_store_version-$arch")
+    echo "  - target/$arch/release/vector-store-$vector_store_version-$arch.tar.gz"
 done
-docker manifest create $docker_manifest "${docker_arch_tags[@]}"
-echo "Docker manifest: $docker_manifest"
+echo "  - vector-store-$vector_store_version.cdx.json"
+for arch in $archs ; do
+    echo "  - vector-store-docker-$vector_store_version-$arch.cdx.json"
+    echo "  - scylladb/vector-store:$vector_store_version-$arch (local docker image)"
+done
+echo ""
+echo "Next step: run ./scripts/upload-release to publish."
+
+# Success — disarm the trap.
+trap - EXIT
+
+
