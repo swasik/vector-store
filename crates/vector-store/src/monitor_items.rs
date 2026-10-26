@@ -246,14 +246,18 @@ async fn upsert<I: IndexDispatch>(
     metrics: &Metrics,
     index_key: &IndexKey,
 ) -> IndexStatus {
-    let Ok(operations) = table
-        .write()
-        .unwrap()
-        .upsert(index_key, primary_key, values)
-        .inspect_err(|err| {
-            error!("failed to upsert values to a table: {err}");
-        })
-    else {
+    let result = {
+        let lock_start = std::time::Instant::now();
+        let mut guard = table.write().unwrap();
+        crate::diag::observe("monitor_table_write_lock", lock_start);
+        let hold_start = std::time::Instant::now();
+        let result = guard.upsert(index_key, primary_key, values);
+        crate::diag::observe("monitor_table_write_hold", hold_start);
+        result
+    };
+    let Ok(operations) = result.inspect_err(|err| {
+        error!("failed to upsert values to a table: {err}");
+    }) else {
         return IndexStatus::Live;
     };
     process_operations(operations, index, in_progress, metrics, index_key).await
@@ -268,14 +272,15 @@ async fn delete<I: IndexDispatch>(
     metrics: &Metrics,
     index_key: &IndexKey,
 ) -> IndexStatus {
-    let Ok(operations) = table
-        .write()
-        .unwrap()
-        .delete(index_key, primary_key, timestamp)
-        .inspect_err(|err| {
-            error!("failed to delete row from a table: {err}");
-        })
-    else {
+    let result = {
+        let lock_start = std::time::Instant::now();
+        let mut guard = table.write().unwrap();
+        crate::diag::observe("monitor_table_write_lock", lock_start);
+        guard.delete(index_key, primary_key, timestamp)
+    };
+    let Ok(operations) = result.inspect_err(|err| {
+        error!("failed to delete row from a table: {err}");
+    }) else {
         return IndexStatus::Live;
     };
     process_operations(operations, index, in_progress, metrics, index_key).await
@@ -298,11 +303,12 @@ async fn process_operations<I: IndexDispatch>(
                 is_update,
             } => {
                 let op_label = if is_update { OP_UPDATE } else { OP_INSERT };
-                if index
+                let send_start = std::time::Instant::now();
+                let status = index
                     .add_vector(partition_id, primary_id, vector, in_progress.take())
-                    .await
-                    .is_dead()
-                {
+                    .await;
+                crate::diag::observe("monitor_index_send_add", send_start);
+                if status.is_dead() {
                     return IndexStatus::Dead;
                 }
                 metrics
@@ -341,11 +347,12 @@ async fn process_operations<I: IndexDispatch>(
                 primary_id,
                 partition_id,
             } => {
-                if index
+                let send_start = std::time::Instant::now();
+                let status = index
                     .remove_value(partition_id, primary_id, AsyncInProgress::None)
-                    .await
-                    .is_dead()
-                {
+                    .await;
+                crate::diag::observe("monitor_index_send_remove", send_start);
+                if status.is_dead() {
                     return IndexStatus::Dead;
                 }
             }
@@ -353,11 +360,12 @@ async fn process_operations<I: IndexDispatch>(
                 primary_id,
                 partition_id,
             } => {
-                if index
+                let send_start = std::time::Instant::now();
+                let status = index
                     .remove_value(partition_id, primary_id, in_progress.take())
-                    .await
-                    .is_dead()
-                {
+                    .await;
+                crate::diag::observe("monitor_index_send_remove", send_start);
+                if status.is_dead() {
                     return IndexStatus::Dead;
                 }
                 metrics

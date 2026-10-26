@@ -12,6 +12,7 @@ mod db_cdc;
 mod db_driver;
 pub mod db_index;
 mod db_value;
+mod diag;
 mod distance;
 mod engine;
 mod file_monitor;
@@ -966,6 +967,7 @@ pub async fn run(
     };
 
     let metrics = Arc::new(Metrics::new());
+    diag::spawn_runtime_probe();
     let db_actor = if let Some(db_actor) = db_actor {
         db_actor
     } else {

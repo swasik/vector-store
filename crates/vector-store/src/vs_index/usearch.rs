@@ -589,6 +589,15 @@ mod operation {
     }
 
     impl Mode {
+        fn switch_event(&self) -> &'static str {
+            match self {
+                Mode::Reserve => "actor_switch_to_reserve",
+                Mode::Insert => "actor_switch_to_insert",
+                Mode::Remove => "actor_switch_to_remove",
+                Mode::Search => "actor_switch_to_search",
+            }
+        }
+
         fn is_exclusive(&self) -> bool {
             match self {
                 Mode::Insert | Mode::Search => false,
@@ -639,6 +648,7 @@ mod operation {
                     // it is safe to switch to the operation because there are no spawned tasks
                     // and self.counter won't be changed
                     self.mode = mode;
+                    crate::diag::event(mode.switch_event());
                     break;
                 }
                 self.notify.notified().await;
@@ -777,6 +787,12 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
                 let allocate_rx = memory.subscribe_allocate().await;
 
                 while let Some(msg) = vs_index::recv(&mut rx_search, &mut rx_modify).await {
+                    crate::diag::event(match &msg {
+                        Message::Search(_) => "actor_recv_search",
+                        Message::Modify(_) => "actor_recv_modify",
+                    });
+                    crate::diag::queue("actor_search", rx_search.len());
+                    crate::diag::queue("actor_modify", rx_modify.len());
                     if !check_memory_allocation(&msg, &allocate_rx, &mut allocate_prev, &index_key)
                     {
                         continue;
@@ -982,38 +998,60 @@ async fn dispatch_task<I, T>(
     if let Message::Modify(VsIndexModify::AddVector { .. }) = &msg
         && partition.needs_more_capacity().is_some()
     {
+        let permit_start = std::time::Instant::now();
         let operation_permit = state.operation.permit_for_reserve().await;
+        crate::diag::observe("actor_permit_reserve", permit_start);
         if let Some(capacity) = partition.needs_more_capacity() {
             let partiton = Arc::clone(&partition);
             worker
                 .spawn_blocking(move || {
+                    let exec_start = std::time::Instant::now();
                     reserve(&partiton, capacity);
+                    crate::diag::observe("worker_exec_reserve", exec_start);
                     drop(operation_permit);
                 })
                 .await;
         }
     }
 
+    let (permit_stage, queue_stage, exec_stage) = match &msg {
+        Message::Modify(VsIndexModify::AddVector { .. }) => {
+            ("actor_permit_insert", "worker_queue_add", "worker_exec_add")
+        }
+        Message::Modify(_) => (
+            "actor_permit_remove",
+            "worker_queue_remove",
+            "worker_exec_remove",
+        ),
+        Message::Search(_) => (
+            "actor_permit_search",
+            "worker_queue_search",
+            "worker_exec_search",
+        ),
+    };
+    let permit_start = std::time::Instant::now();
     let operation_permit = state.operation.permit_for_message(&msg).await;
+    crate::diag::observe(permit_stage, permit_start);
 
     let table = Arc::clone(table);
     let dimensions = state.dimensions;
     let size = Arc::clone(&state.size);
-    if is_non_blocking(&msg) {
-        worker
-            .spawn_non_blocking(move || {
-                process(&partition, table, dimensions, size, msg);
-                drop(operation_permit);
-            })
-            .await;
-        return;
+    crate::diag::queue("worker", worker.len());
+    let non_blocking = is_non_blocking(&msg);
+    let queued = std::time::Instant::now();
+    let task = move || {
+        crate::diag::observe(queue_stage, queued);
+        let exec_start = std::time::Instant::now();
+        process(&partition, table, dimensions, size, msg);
+        crate::diag::observe(exec_stage, exec_start);
+        drop(operation_permit);
+    };
+    if non_blocking {
+        worker.spawn_non_blocking(task).await;
+    } else {
+        worker.spawn_blocking(task).await;
     }
-    worker
-        .spawn_blocking(move || {
-            process(&partition, table, dimensions, size, msg);
-            drop(operation_permit);
-        })
-        .await;
+    crate::diag::observe("actor_worker_send", queued);
 }
 
 #[hotpath::measure]
@@ -1176,7 +1214,9 @@ where
     I: UsearchIndex + Send + Sync + 'static,
 {
     let (primary_keys, distances, mut column_values, target_column, target_primary_ids) = {
+        let lock_start = std::time::Instant::now();
         let table = table.read().unwrap();
+        crate::diag::observe("search_table_read_lock", lock_start);
         // The index's target column isn't one of the table's filtering
         // columns: if asked for, it is reconstructed from the index itself,
         // below, once the table's lock is no longer held.
