@@ -164,6 +164,7 @@ impl Metrics {
         )
         .unwrap();
 
+        crate::diag::register(&registry);
         registry.register(Box::new(latency.clone())).unwrap();
         registry.register(Box::new(size.clone())).unwrap();
         registry.register(Box::new(modified.clone())).unwrap();

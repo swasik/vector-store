@@ -63,10 +63,13 @@ impl<T: DbDriver> CdcConsumerData<T> {
         timestamp: Timestamp,
     ) -> anyhow::Result<()> {
         let primary_key = PrimaryKey::from(primary_key.iter().cloned());
+        let fetch_start = std::time::Instant::now();
         let rows_result = self
             .db_driver
             .execute_fetch_row(&self.session, &self.st_select_values, &primary_key)
-            .await?;
+            .await;
+        crate::diag::observe("cdc_fetch_row", fetch_start);
+        let rows_result = rows_result?;
 
         let async_in_progress = AsyncInProgress::cdc(
             self.metrics.indexing_lag.with_label_values(&[
@@ -112,6 +115,8 @@ impl<T: DbDriver> CdcConsumerData<T> {
             &self.kind,
             &self.alternator_decode_types,
         )?;
+        crate::diag::queue("embeddings", self.tx.max_capacity() - self.tx.capacity());
+        let send_start = std::time::Instant::now();
         _ = self
             .tx
             .send((
@@ -122,6 +127,7 @@ impl<T: DbDriver> CdcConsumerData<T> {
                 async_in_progress,
             ))
             .await;
+        crate::diag::observe("cdc_embeddings_send", send_start);
         Ok(())
     }
 }
@@ -143,10 +149,17 @@ impl<T: DbDriver> CdcConsumer<T> {
     }
 
     async fn process_upsert(&self) {
+        crate::diag::queue(
+            "cdc_permits_available",
+            self.consumer_data.semaphore.available_permits(),
+        );
+        let permit_start = std::time::Instant::now();
         let permit = Arc::clone(&self.consumer_data.semaphore)
             .acquire_owned()
             .await
             .unwrap();
+        crate::diag::observe("cdc_permit", permit_start);
+        crate::diag::event("cdc_upsert");
         let primary_key = Arc::clone(&self.primary_key);
         let timestamp = self.timestamp;
         let consumer_data = Arc::clone(&self.consumer_data);
@@ -159,6 +172,7 @@ impl<T: DbDriver> CdcConsumer<T> {
     }
 
     async fn process_delete(&self) {
+        crate::diag::event("cdc_delete");
         let _ = self
             .consumer_data
             .tx
@@ -182,6 +196,7 @@ impl<T: DbDriver> CdcConsumer<T> {
 #[async_trait]
 impl<T: DbDriver> Consumer for CdcConsumer<T> {
     async fn consume_cdc(&mut self, mut row: CDCRow<'_>) -> anyhow::Result<()> {
+        crate::diag::event("cdc_row");
         if self.consumer_data.tx.is_closed() {
             // a consumer should be closed now, some concurrent tasks could stay in a pipeline
             return Ok(());
@@ -225,6 +240,7 @@ impl<T: DbDriver> Consumer for CdcConsumer<T> {
             && operation == self.operation
         {
             // Skip duplicate rows with the same primary key and timestamp.
+            crate::diag::event("cdc_row_duplicate");
             return Ok(());
         }
         self.primary_key = Arc::new(primary_key);
