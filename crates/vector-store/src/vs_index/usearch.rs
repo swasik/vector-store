@@ -786,7 +786,25 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
                 let mut allocate_prev = Allocate::Can;
                 let allocate_rx = memory.subscribe_allocate().await;
 
-                while let Some(msg) = vs_index::recv(&mut rx_search, &mut rx_modify).await {
+                let max_burst = modify_burst();
+                let mut burst = 0;
+                loop {
+                    let msg = if burst > 0
+                        && let Ok(msg) = rx_modify.try_recv()
+                    {
+                        burst -= 1;
+                        Message::Modify(msg)
+                    } else {
+                        let Some(msg) = vs_index::recv(&mut rx_search, &mut rx_modify).await else {
+                            break;
+                        };
+                        burst = if matches!(msg, Message::Modify(_)) {
+                            max_burst
+                        } else {
+                            0
+                        };
+                        msg
+                    };
                     crate::diag::event(match &msg {
                         Message::Search(_) => "actor_recv_search",
                         Message::Modify(_) => "actor_recv_modify",
@@ -823,6 +841,15 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
     ));
 
     Ok((tx_modify, tx_search))
+}
+
+/// VECTOR-951 experiment: once a modify is admitted, take up to this many more
+/// queued modifies before searches are polled again. 0 keeps master's behaviour.
+fn modify_burst() -> usize {
+    std::env::var("VSDIAG_MODIFY_BURST")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 #[hotpath::measure]
