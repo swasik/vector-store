@@ -224,6 +224,7 @@ pub struct Config {
     pub opensearch_addr: Option<String>,
     pub credentials: Option<Credentials>,
     pub usearch_simulator: Option<Vec<Duration>>,
+    pub modify_admission: ModifyAdmission,
     pub diskann_alpha: Option<DiskannAlpha>,
     pub diskann_max_points: Option<NonZeroUsize>,
     pub diskann_backend: Option<DiskannBackendKind>,
@@ -259,6 +260,7 @@ impl Default for Config {
             opensearch_addr: None,
             credentials: None,
             usearch_simulator: None,
+            modify_admission: ModifyAdmission::default(),
             diskann_alpha: None,
             diskann_max_points: None,
             diskann_backend: None,
@@ -283,6 +285,23 @@ impl Default for Config {
             engine_status_update_interval: None,
         }
     }
+}
+
+/// How a usearch index admits modifications while searches wait.
+///
+/// Searches go first: the index takes a modification only when no search is queued. Under a
+/// saturating search load that happens about a hundred times a second whatever the machine, so with
+/// one modification per such gap ingest falls to ~100 rows/s (VECTOR-951). A batch lets more through
+/// each time: after a modification, up to `batch_size` more queued ones follow (no limit when 0 and
+/// `batch_time` is set), until the batch has lasted `batch_time`. With `max_wait`, a modification is
+/// taken even while searches are queued once none was taken for that long, so ingest does not depend
+/// on the search queue ever running empty. The default is one modification per gap; a zero
+/// duration turns its limit off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModifyAdmission {
+    pub batch_size: usize,
+    pub batch_time: Option<Duration>,
+    pub max_wait: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]

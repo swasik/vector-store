@@ -542,6 +542,28 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         .transpose()?
         .map(|v| v.into());
 
+    if let Some(batch_size) = env("VECTOR_STORE_MODIFY_BATCH_SIZE")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()?
+    {
+        config.modify_admission.batch_size = batch_size;
+    }
+
+    config.modify_admission.batch_time = env("VECTOR_STORE_MODIFY_BATCH_TIME")
+        .ok()
+        .map(|v| v.parse::<humantime::Duration>())
+        .transpose()?
+        .map(Duration::from)
+        .filter(|duration| !duration.is_zero()); // a reload cannot unset a variable: 0 turns it off
+
+    config.modify_admission.max_wait = env("VECTOR_STORE_MODIFY_MAX_WAIT")
+        .ok()
+        .map(|v| v.parse::<humantime::Duration>())
+        .transpose()?
+        .map(Duration::from)
+        .filter(|duration| !duration.is_zero()); // a reload cannot unset a variable: 0 turns it off
+
     config.cdc_fine_sleep_interval = env("VECTOR_STORE_CDC_FINE_SLEEP_INTERVAL")
         .ok()
         .map(|v| v.parse::<humantime::Duration>())
